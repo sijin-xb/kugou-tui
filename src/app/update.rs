@@ -2166,38 +2166,52 @@ impl App {
         }
         self.state.busy = Some(format!("载入歌单《{}》", playlist.name));
 
+        let first_page =
+            first_screen_page(self.state.sort_descending, playlist.song_count, PAGE_LIMIT);
+
         self.runtime.spawn(async move {
             // 自建/收藏歌单走新版接口（按数字 listid），公开歌单走 global_collection_id
             let is_own = playlist.list_id.filter(|_| playlist.is_own);
 
-            // ---- 首屏：先只取第一页，让界面立刻有内容 ----
+            // ---- 首屏：先只取一页，让界面立刻有内容 ----
             //
             // 大歌单（几百首）即使并发翻页也要好几秒，这段时间界面只有一个"载入中"，
             // 体验很差。学 MoeKoeMusic 的做法：先给首屏，剩下的后台继续取。
             // 它那边是滚动到底再加载；我们一次性取完，但**先让用户看到东西**。
-            let first = {
-                // 走 `active_source` 而不是 `api`：分页同样是音源相关的——酷狗那两个
-                // 端点（参数是 `page` + `pagesize`）网易云根本没有，直接调 `ApiClient`
-                // 会让网易云下打开歌单必然 404；而首屏失败会 return，连下面的后台
-                // 补全都走不到，表现就是「歌单里的歌一直 404」。
-                let target = match is_own {
-                    Some(list_id) => PlaylistRef::Own(list_id),
-                    None => PlaylistRef::Public(&playlist.id),
-                };
-                active_source
-                    .playlist_tracks_page(&api, target, 1, PAGE_LIMIT, fresh)
-                    .await
+            //
+            // 取哪一页见 [`first_screen_page`]：倒序显示时取的是**最后一页**，
+            // 这样首屏出现的就是最终列表的头部，后面整表到位时画面不会整体翻一次。
+            //
+            // 走 `active_source` 而不是 `api`：分页同样是音源相关的——酷狗那两个
+            // 端点（参数是 `page` + `pagesize`）网易云根本没有，直接调 `ApiClient`
+            // 会让网易云下打开歌单必然 404；而首屏失败会 return，连下面的后台
+            // 补全都走不到，表现就是「歌单里的歌一直 404」。
+            let target = match is_own {
+                Some(list_id) => PlaylistRef::Own(list_id),
+                None => PlaylistRef::Public(&playlist.id),
             };
+            let mut fetched_page = first_page;
+            let mut first = active_source
+                .playlist_tracks_page(&api, target, fetched_page, PAGE_LIMIT, fresh)
+                .await;
+            // 曲数过期（歌单被删过歌）时算出来的那一页可能是空的。宁可闪一屏
+            // 最老的歌，也不能让用户对着一个空列表——退回第 1 页重取。
+            if fetched_page > 1 && first.as_ref().is_ok_and(|songs| songs.is_empty()) {
+                fetched_page = 1;
+                first = active_source
+                    .playlist_tracks_page(&api, target, fetched_page, PAGE_LIMIT, fresh)
+                    .await;
+            }
 
             match first {
                 Ok(songs) => {
-                    let has_more = songs.len() >= PAGE_LIMIT as usize;
+                    let has_more = needs_full_fetch(fetched_page, songs.len(), PAGE_LIMIT);
                     bus.emit(Loaded::PlaylistTracks {
                         playlist: playlist.clone(),
                         songs,
                         source,
                     });
-                    // 不足一页说明这首页就是全部，没必要再取
+                    // 这一页就是全部，没必要再取
                     if !has_more {
                         return;
                     }
@@ -4407,4 +4421,76 @@ pub fn rank_subtitle(board: &RankBoard) -> String {
         .update_frequency
         .clone()
         .unwrap_or_else(|| format!("#{}", board.id))
+}
+
+/// 打开歌单时，首屏先取哪一页。
+///
+/// 列表**倒序**显示时（默认如此，`o` 键可切），出现在最上面的是歌单的**最后一页**。
+/// 所以首屏也要从末尾取：否则用户一进歌单先看到的是一屏最老的歌，几秒后整表到位、
+/// 画面整体翻一次，才变成他心里的"第一首"。实测就是这么反馈的——进「我喜欢」先看到
+/// 歌单开头的歌，而最上面最终变成的是最后加进去的那首。
+///
+/// 总页数由歌单元数据里的曲数算；曲数拿不到（有的接口不给）就算不出来，只能退回
+/// 第 1 页（老行为）。
+fn first_screen_page(sort_descending: bool, song_count: u32, page_limit: u32) -> u32 {
+    if sort_descending && song_count > page_limit {
+        song_count.div_ceil(page_limit)
+    } else {
+        1
+    }
+}
+
+/// 首屏拿到那一页之后，还要不要继续把整表取回来。
+///
+/// 「这一页不满 ⇒ 这就是全部」**只在第 1 页成立**。首屏改从末尾取之后（见
+/// [`first_screen_page`]），末页不满页是常态——414 首 = 13×30 + 24，末页就是 24 首。
+/// 照搬老判据会让「整表补齐」永不出门，界面从此只显示那 24 首。
+fn needs_full_fetch(fetched_page: u32, received: usize, page_limit: u32) -> bool {
+    fetched_page > 1 || received >= page_limit as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 倒序（默认）时首屏取最后一页——这是「进歌单先看到最老的歌」那个问题的正解。
+    #[test]
+    fn descending_playlist_opens_at_the_last_page() {
+        // 414 首、每页 30：最后一页是第 14 页（391–414）
+        assert_eq!(first_screen_page(true, 414, 30), 14);
+        // 正好整页时不要多取一页
+        assert_eq!(first_screen_page(true, 60, 30), 2);
+    }
+
+    /// 正序显示时首屏仍然是第 1 页（这时它才真的是列表头部）。
+    #[test]
+    fn ascending_playlist_opens_at_the_first_page() {
+        assert_eq!(first_screen_page(false, 414, 30), 1);
+    }
+
+    /// 一页装得下的歌单（以及曲数未知的）照旧取第 1 页：
+    /// 只有一页时"最后一页"就是第 1 页，多绕一步没意义。
+    #[test]
+    fn small_or_unknown_playlists_stay_on_page_one() {
+        assert_eq!(first_screen_page(true, 30, 30), 1);
+        assert_eq!(first_screen_page(true, 4, 30), 1);
+        assert_eq!(first_screen_page(true, 0, 30), 1);
+    }
+
+    /// 首屏取的是末页（不满页）时，**仍然**要把整表取回来。
+    ///
+    /// 这条钉的是一次差点踩进去的坑：老的「不满页 ⇒ 没有更多」判据搬到末页上，
+    /// 会让 414 首的歌单永远只显示最后那 24 首。
+    #[test]
+    fn an_underfull_last_page_still_needs_the_full_fetch() {
+        assert!(needs_full_fetch(14, 24, 30), "末页不满也要补齐整表");
+        assert!(needs_full_fetch(2, 30, 30), "末页正好满也要");
+    }
+
+    /// 第 1 页时的老判据保持不变：不满页就是全部。
+    #[test]
+    fn a_short_first_page_is_the_whole_playlist() {
+        assert!(!needs_full_fetch(1, 12, 30));
+        assert!(needs_full_fetch(1, 30, 30));
+    }
 }
