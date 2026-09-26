@@ -17,6 +17,7 @@
 #   - 标签固定为 `vX.Y.Z`，**附注 tag**（`git tag -a`），注释里带版本说明
 #   - 标签必须尚不存在（本地与远端都查），已存在就中止——发版不可重来
 #   - `CHANGELOG.md` 里必须有 `## [X.Y.Z]` 一节，否则中止
+#   - **发行说明取该节正文**，tag 注释与 GitHub Release 正文都用它（不写「见 CHANGELOG」）
 #   - AUR 的 `pkgver` 必须等于同一个版本号
 #
 # # 推送边界
@@ -197,11 +198,26 @@ step "将要执行的外部动作"
 
 release_sha=$(sha256sum "$tarball" | cut -d' ' -f1)
 
+# 发行说明 = CHANGELOG 里这一节的**正文**。
+#
+# 早先 tag 注释和 Release 正文写的都是「见 CHANGELOG.md 的 [X.Y.Z] 一节」——对
+# 打开下载页面的人来说那等于没写：他要在这里看到「改了什么」，而不是一个还要自己
+# 点进仓库去找的链接。（release notes 是发布页的门面，正文得在这儿。）
+#
+# 抽出来的正文同时给两处用：附注 tag 的注释、Release 的正文。
+release_notes=$(awk -v version="$version" '
+  $0 ~ "^## \\[" version "\\]" { inside = 1; next }
+  inside && /^## \[/ { exit }
+  inside { print }
+' CHANGELOG.md)
+[ -n "$release_notes" ] ||
+  die "CHANGELOG 的 [$version] 一节是空的——发行说明不能是空的，那是给用户看的门面"
+
 # 清单必须**跟着 --no-aur 变**。这个脚本存在的意义就是让人在按下回车之前看清
 # 「将要发生什么」——列了 AUR 却跳过它，清单本身就是假的，正是它要防的那类事。
 plan=(
   "git push origin main"
-  "git tag -a $tag  &&  git push origin $tag"
+  "git tag -a $tag（注释 = CHANGELOG 的 [$version] 一节正文）  &&  git push origin $tag"
 )
 if [ "$skip_aur" -eq 0 ]; then
   plan+=(
@@ -211,8 +227,8 @@ if [ "$skip_aur" -eq 0 ]; then
   )
 fi
 plan+=(
-  "gh release create $tag（挂 dist/$pkgname-$version-x86_64-unknown-linux-gnu.tar.gz
-         sha256 $release_sha）"
+  "gh release create $tag（发行说明 = 同一节正文，直接写进 Release；挂
+         dist/$pkgname-$version-x86_64-unknown-linux-gnu.tar.gz sha256 $release_sha）"
   "把 Release 资产下载回来核对内容"
 )
 if [ "$skip_aur" -eq 0 ]; then
@@ -229,6 +245,16 @@ if [ "$skip_aur" -eq 1 ]; then
   printf '\n    已用 --no-aur：跳过 AUR 的更新与推送，PKGBUILD 与 .SRCINFO 不会被改动。\n'
 fi
 
+# 发布的是给人看的门面，按回车之前先把正文摆出来（太长就只展示开头）。
+notes_lines=$(printf '%s\n' "$release_notes" | wc -l)
+printf '\n    将发布的发行说明（CHANGELOG 的 [%s] 一节，共 %s 行）：\n\n' "$version" "$notes_lines"
+if [ "$notes_lines" -le 24 ]; then
+  printf '%s\n' "$release_notes" | sed 's/^/      │ /'
+else
+  printf '%s\n' "$release_notes" | head -20 | sed 's/^/      │ /'
+  printf '      │ ……（其余 %s 行同样会写进 Release）\n' "$((notes_lines - 20))"
+fi
+
 if [ "$assume_yes" -ne 1 ]; then
   printf '\n    继续？[y/N] '
   read -r reply
@@ -240,9 +266,8 @@ fi
 
 step "推送 main 与 tag"
 retry git push origin main
-git tag -a "$tag" -m "版本 $version
-
-见 CHANGELOG.md 的 [$version] 一节。"
+# 附注 tag 里的注释 = 发行说明正文（`git show vX.Y.Z` 与 Releases 页看到的是同一份）
+git tag -a "$tag" -m "$release_notes"
 retry git push origin "$tag"
 ok "已推送 $tag"
 
@@ -307,15 +332,16 @@ fi
 step "创建 GitHub Release"
 # 做成幂等的：`gh release create` 本身不幂等——如果上次「Release 建好了但资产没传
 # 上去」，重跑会直接报「已存在」，人就卡住了。所以先看有没有，有就补传资产。
+#
+# 正文用 `--notes` 直接给（不是 `--notes-file -` 的 heredoc，也不是链接）：
+# 这里要的就是"改了什么、为什么改"写在下载页面上，而不是把人甩去仓库里找。
 if gh release view "$tag" > /dev/null 2>&1; then
   warn "$tag 的 Release 已存在，改为补传资产（--clobber）"
   gh release upload "$tag" "$tarball" --clobber
+  # 正文也跟着更新：重跑发版时通常正是为了修文案或补遗漏
+  gh release edit "$tag" --notes "$release_notes"
 else
-  gh release create "$tag" --title "$tag" --notes-file - "$tarball" <<EOF
-版本 $version
-
-见 [CHANGELOG.md](CHANGELOG.md) 的 [$version] 一节。
-EOF
+  gh release create "$tag" --title "$tag" --notes "$release_notes" "$tarball"
 fi
 ok "已创建 $tag"
 
