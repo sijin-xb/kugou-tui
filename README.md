@@ -87,9 +87,9 @@ cd kugou-tui && cargo build --release
 > 四个场景 14.2–16.9 MiB，方法与明细见 [docs/DESIGN.md](docs/DESIGN.md)）；
 > cmus 与 mpd 两行是**社区常见量级，未在本机实测**，仅供数量级参考。
 >
-> ⚠️ 这几个数是在**播放小体积曲目**时测的。边下边播的字节缓冲只追加不回收，
-> 所以放几十 MB 的 Hi-Res 时内存会按曲目体积线性上涨（实测 1:1，原因见
-> [docs/DESIGN.md](docs/DESIGN.md#边下边播)）。
+> 边下边播的字节缓冲**不保留整首**：下载先落盘，内存里只留一个 4 MiB 的尾部窗口，
+> 窗口之外的字节从落盘文件读回来。所以放几十 MB 的 Hi-Res 也不会让内存按曲目体积涨
+> （实测 64 MiB 的曲子占 12.5 MiB；切歌时还会主动取消上一首的下载）。
 >
 > 一句话：**cmus / mpd 是「放你有的」，kugou-tui 是「放你想听的」。**
 
@@ -103,6 +103,7 @@ cd kugou-tui && cargo build --release
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | 命令行参数、配置文件每一项、会话持久化 |
 | [docs/FAQ.md](docs/FAQ.md) | 常见问题与排查 |
 | [docs/DESIGN.md](docs/DESIGN.md) | 线程模型、边下边播原理、低资源占用、接口适配 |
+| [docs/MAINTENANCE.md](docs/MAINTENANCE.md) | 维护与排障手册：模块地图、风险点、已知坑、改完怎么验 |
 | [docs/LICENSES.md](docs/LICENSES.md) | 第三方依赖许可分析 |
 | [docs/RELEASE.md](docs/RELEASE.md) | 发版流程与依赖顺序、发行版产物清单、版本与标签规则、回收逻辑 |
 | [CHANGELOG.md](CHANGELOG.md) | 更新日志 |

@@ -165,6 +165,12 @@ impl AudioCache {
     /// 列出缓存目录下的文件及其大小、修改时间。
     ///
     /// 目录不存在时返回空列表——首次运行还没播过歌，这是正常状态而非错误。
+    ///
+    /// **跳过 `.part`**：那是流式下载正在写的半成品（见
+    /// [`crate::audio::download`]）。把它当缓存条目看待有两个坏处：
+    /// 回收会在下载中途把文件删掉（这次就白下了），"清空缓存"也会踩到它。
+    /// 代价是崩溃留下的 `.part` 不参与回收——它最多一首歌那么大，而且那首歌
+    /// 下次播放时会被 `File::create` 截断重用。
     fn entries(&self) -> Vec<CacheEntry> {
         let directory = match std::fs::read_dir(&self.root) {
             Ok(directory) => directory,
@@ -181,6 +187,7 @@ impl AudioCache {
 
         directory
             .filter_map(std::result::Result::ok)
+            .filter(|entry| !is_partial(entry.path().as_path()))
             .filter_map(|dir_entry| {
                 let metadata = dir_entry.metadata().ok()?;
                 if !metadata.is_file() {
@@ -201,6 +208,15 @@ struct CacheEntry {
     path: PathBuf,
     size_bytes: u64,
     modified: SystemTime,
+}
+
+/// 是不是流式下载还没写完的半成品（`xxx.mp3.part`）。
+///
+/// 判据用后缀而不是"名字里有没有点"：缓存文件名本身带扩展名
+/// （`{hash}-{quality}.mp3`），只有 `.part` 结尾的才是半成品。
+fn is_partial(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "part")
 }
 
 #[cfg(test)]
@@ -279,6 +295,41 @@ mod tests {
         let tiny = AudioCache::new(root.clone(), 0);
         let report = tiny.enforce_limit().expect("回收");
         assert_eq!(report.removed_files, 0, "上限为 0 表示不限制");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 流式下载正在写的 `.part` 不能被当成缓存条目。
+    ///
+    /// 被回收或"清空缓存"顺手删掉的话，这次下载就白下了（`.part` 没了，
+    /// 改名成正式缓存文件那一步会失败）。而它本来也不是"缓存"，是半成品。
+    #[test]
+    fn partial_downloads_are_not_cache_entries() {
+        let root = temp_dir("partial");
+        let cache = AudioCache::new(root.clone(), 1);
+        std::fs::create_dir_all(&root).expect("创建缓存目录");
+
+        // 一个半成品（正在下）+ 两个真正的缓存文件，总量必然超限。
+        // 体量取小：这条测的是「谁会被删」，不是「能删多少」——`/tmp` 可能是
+        // 个小 tmpfs（实测有的机器只有 10 MiB），别让测试挑磁盘。
+        let partial = cache
+            .path_for("streaming", "mp3")
+            .with_extension("mp3.part");
+        std::fs::write(&partial, vec![0u8; 64 * 1024]).expect("写入半成品");
+        for index in 0..2 {
+            std::fs::write(
+                cache.path_for(&format!("song{index}"), "mp3"),
+                vec![0u8; 600 * 1024],
+            )
+            .expect("写入");
+        }
+
+        let report = cache.enforce_limit().expect("回收");
+        assert!(report.removed_files > 0, "应当回收真正的缓存文件");
+        assert!(partial.is_file(), "半成品不参与回收");
+
+        cache.clear().expect("清空缓存");
+        assert!(partial.is_file(), "清空缓存也不该动半成品");
 
         let _ = std::fs::remove_dir_all(&root);
     }

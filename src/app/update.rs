@@ -14,7 +14,7 @@ use ratatui::crossterm::event::MouseEvent;
 
 use crate::api::catalog::PAGE_LIMIT;
 use crate::api::cloud::QrStatus;
-use crate::api::model::{Artist, Playlist, RankBoard, Song};
+use crate::api::model::{Artist, Playlist, RankBoard, Song, format_duration_ms};
 use crate::app::App;
 use crate::app::state::{
     ConfirmAction, Connection, CoverArt, EntryList, Focus, HitTarget, HitZone, LoginPicker,
@@ -27,7 +27,7 @@ use crate::config::{Config, SUPPORTED_QUALITIES};
 use crate::error::AppError;
 use crate::source::{PlaylistRef, SourceKind};
 
-use crate::audio::download::{Downloader, PREROLL_BYTES};
+use crate::audio::download::{Downloader, PREROLL_BYTES, StreamOutcome};
 use crate::audio::engine::{AudioEvent, PlaybackState, SEEK_STEP_MS, VOLUME_STEP};
 use crate::audio::spectrum::BAND_COUNT;
 use crate::event::{Event, Loaded, LoadingTarget, PlaylistSource, VipClaimOutcome};
@@ -1761,8 +1761,46 @@ impl App {
         self.state.info(format!("歌词偏移 {offset:+} ms"));
     }
 
+    /// 把「当前这首听到哪儿了」记进 `state.resume`，供非正常收场之后续播。
+    ///
+    /// 断流、下载失败都会让歌停下来，但听到的位置是有效的：用户按播放
+    /// （Space）就该从这儿接着听，而不是从头。`state.resume` 本来就只对
+    /// hash 相同的曲目生效、换歌即作废，语义正好，不必再造一套。
+    fn mark_resume_point(&mut self) {
+        let Some(song) = self.state.current.as_ref() else {
+            return;
+        };
+        if self.state.position_ms == 0 {
+            return;
+        }
+        self.state.resume = Some((song.hash.clone(), self.state.position_ms));
+    }
+
+    /// 停止播放，并把还在下的那条流一起叫停。
+    ///
+    /// 光调 `audio.stop()` 会漏掉流式下载：音频线程停了，后台任务还在把整首
+    /// 往缓冲和 `.part` 文件里灌，谁也不回收它。
+    fn stop_playback(&mut self) {
+        if let Some(stream) = self.active_stream.take() {
+            stream.cancel();
+        }
+        self.stream_retried = None;
+        self.audio.stop();
+    }
+
     /// 起播一首歌：先查缓存，未命中则解析直链 → 下载 → 播放。
     fn start_playback(&mut self, song: Song, start_at_ms: u64) {
+        // 上一首如果还在边下边播，通知后台任务收工：任务退出、内存窗口和
+        // 文件句柄一起释放。频繁切歌时这一步很关键——否则每个被丢下的下载
+        // 任务都会继续把数据往它的缓冲里堆，谁也回收不了。
+        if let Some(stream) = self.active_stream.take() {
+            stream.cancel();
+        }
+        // 「已自动兜过一次」的记号按曲目算：换了歌就清掉，同一次断流不重复兜。
+        if self.stream_retried.as_deref() != Some(song.hash.as_str()) {
+            self.stream_retried = None;
+        }
+
         self.state.current = Some(song.clone());
         self.state.duration_ms = song.duration_ms;
         self.state.position_ms = start_at_ms;
@@ -3113,7 +3151,7 @@ impl App {
         }
 
         let count = self.state.queue.len();
-        self.audio.stop();
+        self.stop_playback();
         self.state.queue.clear();
         self.state.queue_cursor.select(None);
         self.state.current = None;
@@ -3564,11 +3602,16 @@ impl App {
                 start_at_ms,
             } => {
                 if !self.is_current(&song) {
+                    // 用户已经切走了：这次下载没人会听，通知它收工，别再占着
+                    // 带宽和磁盘；缓冲里的窗口和文件句柄也随之释放。
+                    buffer.cancel();
                     return;
                 }
                 // 攒够开头就开播——不用等整首下完（边下边播）
                 self.state.download_progress = None;
                 self.state.busy = None;
+                // 留一份句柄：切歌/停止时要靠它通知后台任务别再下了
+                self.active_stream = Some(buffer.clone());
                 self.audio
                     .load(AudioSource::Stream(buffer), start_at_ms, song.duration_ms);
             }
@@ -3599,28 +3642,27 @@ impl App {
                 self.audio
                     .load(AudioSource::File(path), start_at_ms, song.duration_ms);
 
-                // 当前这首已经在放了——趁这会儿把**下一首**悄悄下下来。
-                //
-                // 高音质（Hi-Res 那档实测 65 MB）首次播放要等完整下载，几十秒起步；
-                // 切歌时再下就是「每首都等一遍」。预取之后切到下一首直接命中缓存，
-                // 体验上的差别是「秒开」和「转圈半分钟」。
-                self.prefetch_next();
+                self.after_download_landed();
+            }
 
-                // 缓存回收是同步目录扫描，扔到阻塞线程池，别卡住 UI
-                let cache = self.cache.clone();
-                self.runtime
-                    .spawn_blocking(move || match cache.enforce_limit() {
-                        Ok(report) if report.removed_files > 0 => tlog!(
-                            crate::logger::LEVEL_INFO,
-                            "缓存回收：删除 {} 个文件，释放 {} 字节",
-                            report.removed_files,
-                            report.freed_bytes
-                        ),
-                        Ok(_) => {}
-                        Err(error) => {
-                            tlog!(crate::logger::LEVEL_WARN, "缓存回收失败：{error}")
-                        }
-                    });
+            Loaded::StreamCompleted { song, path } => {
+                // 不是当前这首就别管：收尾是给"正在听的那首"做的
+                if !self.is_current(&song) {
+                    return;
+                }
+                // **这里绝不能 `audio.load()`**。歌已经在放了，缓冲里（和刚落盘
+                // 的文件里）数据都是全的，重新装载只会把播放位置冲回 0。
+                // 前端那句「放着放着从头开始」就是这条路径造成的。
+                tlog!(
+                    crate::logger::LEVEL_DEBUG,
+                    "《{}》边下边播已下完：{}",
+                    song.name,
+                    path.display()
+                );
+                self.state.download_progress = None;
+                self.state.busy = None;
+                self.active_stream = None;
+                self.after_download_landed();
             }
 
             Loaded::DeviceFingerprint(dfid) => {
@@ -3923,20 +3965,30 @@ impl App {
             let bus_for_done = bus.clone();
             let song_for_done = song.clone();
             let target_for_done = target.clone();
-            let start_for_done = start_at_ms;
             let label_for_done = label.clone();
 
-            let buffer = downloader.start_streaming(&url, target, move |result| match result {
-                Ok(()) => bus_for_done.emit(Loaded::StreamCached {
-                    song: Box::new(song_for_done),
-                    path: target_for_done,
-                    start_at_ms: start_for_done,
-                }),
-                Err(message) => bus_for_done.fail(
-                    format!("下载《{label_for_done}》失败"),
-                    AppError::Audio(message),
-                ),
-            });
+            let buffer =
+                match downloader.start_streaming(&url, target, move |outcome| match outcome {
+                    // 下完了只做收尾。**不能**在这里 `audio.load` 换成本地文件：
+                    // 这首已经在放了，再装载一次会把位置冲回 0——用户听到的就是
+                    // 「放着放着从头开始」（`StreamCompleted` 的注释里写了缘由）。
+                    StreamOutcome::Completed => bus_for_done.emit(Loaded::StreamCompleted {
+                        song: Box::new(song_for_done),
+                        path: target_for_done,
+                    }),
+                    StreamOutcome::Failed(message) => bus_for_done.fail(
+                        format!("下载《{label_for_done}》失败"),
+                        AppError::Audio(message),
+                    ),
+                    // 用户已经切歌/停止，安静收尾：不报错、不提示
+                    StreamOutcome::Cancelled => {}
+                }) {
+                    Ok(buffer) => buffer,
+                    Err(error) => {
+                        bus.fail(format!("下载《{label}》失败"), error);
+                        return;
+                    }
+                };
 
             // 等攒够开头再开播。轮询而不是阻塞等——这是 async 任务，
             // 阻塞会把 runtime 的线程占住。
@@ -3945,7 +3997,9 @@ impl App {
                 let got = preroll.buffered_bytes();
                 // 流式拿不到总长度，只能报已收到的字节——进度条照常工作
                 progress(got, None);
-                if got >= PREROLL_BYTES || preroll.is_complete() {
+                // 用 `is_finished` 而不是 `is_complete`：下载**失败**也是收工，
+                // 失败时再等下去只会白转（而这正是"下不到就不开播"该有的样子）
+                if got >= PREROLL_BYTES || preroll.is_finished() {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -3960,6 +4014,35 @@ impl App {
                 });
             }
         });
+    }
+
+    /// 一首歌下载落盘之后的收尾：预取下一首 + 回收缓存。
+    ///
+    /// 两条下载路径共用它（续播的 `StreamCached`、边下边播的 `StreamCompleted`）
+    /// ——"文件已经在盘上"这件事对两者是一样的，区别只在要不要动播放器。
+    fn after_download_landed(&mut self) {
+        // 当前这首已经在放了——趁这会儿把**下一首**悄悄下下来。
+        //
+        // 高音质（Hi-Res 那档实测 65 MB）首次播放要等完整下载，几十秒起步；
+        // 切歌时再下就是「每首都等一遍」。预取之后切到下一首直接命中缓存，
+        // 体验上的差别是「秒开」和「转圈半分钟」。
+        self.prefetch_next();
+
+        // 缓存回收是同步目录扫描，扔到阻塞线程池，别卡住 UI
+        let cache = self.cache.clone();
+        self.runtime
+            .spawn_blocking(move || match cache.enforce_limit() {
+                Ok(report) if report.removed_files > 0 => tlog!(
+                    crate::logger::LEVEL_INFO,
+                    "缓存回收：删除 {} 个文件，释放 {} 字节",
+                    report.removed_files,
+                    report.freed_bytes
+                ),
+                Ok(_) => {}
+                Err(error) => {
+                    tlog!(crate::logger::LEVEL_WARN, "缓存回收失败：{error}")
+                }
+            });
     }
 
     /// 为当前歌曲取封面（异步）：下载 → 解码 → 生成字符画。
@@ -4064,6 +4147,9 @@ impl App {
                 self.state.busy = None;
                 self.state.download_progress = None;
                 self.state.playback = PlaybackState::Playing;
+                // 曲目真的起来了，之前记的"续播点"已经兑现（或者早就过期了），
+                // 留着只会让下次按 Space 莫名回到某个中间位置
+                self.state.resume = None;
                 let title = self
                     .state
                     .current
@@ -4087,6 +4173,7 @@ impl App {
             }
             AudioEvent::TrackFinished => {
                 self.state.position_ms = 0;
+                self.active_stream = None;
 
                 // 试听片段播完 ≠ 整首播完。这里不能走自动切歌：用户会以为是
                 // 「会员没生效、听了几十秒就跳歌」，而实际是没拿到完整版。
@@ -4102,6 +4189,49 @@ impl App {
                 // 自然播完：顺序模式到底就停，单曲循环原地重播
                 self.next_track(false);
             }
+            // 边下边播时数据没跟上（读超时），歌**没放完**。
+            //
+            // 这里唯一不能做的事就是"当成播完了"：那会触发切歌，单曲循环下
+            // 就是从头再放一遍——用户看到的就是「进度回到开头」。正确做法是
+            // 留住位置，然后从这个位置把这首重新拾起来（`start_at_ms > 0`
+            // 会自动走"整首下完再播"那条路，不再依赖流式缓冲）。
+            AudioEvent::StreamInterrupted { position_ms } => {
+                // 落一条日志：这个现象在界面上只是"卡了一下"，而排查时最需要的
+                // 恰恰是「几点断的、断在哪」，光看现场看不出来
+                tlog!(
+                    crate::logger::LEVEL_INFO,
+                    "边下边播缓冲中断，停在 {} ms，准备从该位置续播",
+                    position_ms
+                );
+                self.state.busy = None;
+                self.state.download_progress = None;
+                self.state.playback = PlaybackState::Stopped;
+                // 位置必须留着：界面停在断流的地方，按 Space 也能从这儿继续
+                self.state.position_ms = position_ms;
+
+                let Some(song) = self.state.current.clone() else {
+                    self.state.warn("缓冲中断");
+                    return;
+                };
+
+                // 每首歌只自动兜一次：网络真断了的话，反复重试只会刷屏
+                if self.stream_retried.as_deref() == Some(song.hash.as_str()) {
+                    self.state.warn(format!(
+                        "《{}》缓冲中断在 {}，按 Space 或 Enter 重试",
+                        song.name,
+                        format_duration_ms(position_ms)
+                    ));
+                    return;
+                }
+
+                self.stream_retried = Some(song.hash.clone());
+                self.state.warn(format!(
+                    "《{}》缓冲中断，正从 {} 继续…",
+                    song.name,
+                    format_duration_ms(position_ms)
+                ));
+                self.start_playback(song, position_ms);
+            }
             // 换设备失败：旧设备照旧在播，只提示，不动播放状态
             AudioEvent::DeviceSwitchFailed(message) => {
                 self.pending_device_resume = None;
@@ -4112,7 +4242,11 @@ impl App {
                 self.state.download_progress = None;
                 // 换设备失败时旧设备还活着，刚才那首也还在播，别再排队续播了
                 self.pending_device_resume = None;
+                // 这次失败可能就来自这条流，句柄留着没用了
+                self.active_stream = None;
                 self.state.playback = PlaybackState::Stopped;
+                // 位置留着：用户按 Space 能从停住的地方再来一次，而不是从头
+                self.mark_resume_point();
                 self.state.error(message);
             }
         }

@@ -147,10 +147,23 @@ pub enum Loaded {
         total: Option<u64>,
     },
     /// 音频已落盘，可以交给音频线程播放。
+    ///
+    /// 只有**续播**那条路会发它：要跳到中间时不能边下边播（缓冲里只有开头那点
+    /// 数据），所以先整首下完，再从这个位置开始放。
     StreamCached {
         song: Box<Song>,
         path: PathBuf,
         start_at_ms: u64,
+    },
+    /// 边下边播的那首**已经下完**了（内存缓冲用不上了，数据都在盘上）。
+    ///
+    /// 它和 [`Self::StreamCached`] 必须分开：那条路要 `audio.load()` 才会出声，
+    /// 而这条路上歌**已经在放了**——再 load 一次等于把播放位置冲回 0，
+    /// 用户听到的就是「放着放着突然从头开始」。所以它只做收尾（进度、预取、
+    /// 缓存回收），绝不碰播放器。
+    StreamCompleted {
+        song: Box<Song>,
+        path: PathBuf,
     },
     /// 自动探测到的设备指纹，需要回写配置。
     DeviceFingerprint(String),

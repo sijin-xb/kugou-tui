@@ -108,6 +108,17 @@ pub enum AudioEvent {
     DeviceOpened { name: String },
     /// 当前曲目自然播放结束，主循环据此切下一首。
     TrackFinished,
+    /// 边下边播的**流断了**：读数据超时（下载跟不上 / 网络抖了一下），
+    /// 播放器因此空掉。
+    ///
+    /// **绝不能当成 [`Self::TrackFinished`]**——歌并没放完。混为一谈的后果很
+    /// 具体：单曲循环（或队列里只有一首）下会"从头再放一遍"，用户看到的就是
+    /// 「播放进度回到开头」。所以单独一个变体，并且带着断流时的位置，
+    /// 让主线程能从这个位置续播，而不是从 0 重来。
+    StreamInterrupted {
+        /// 断流那一刻的播放位置（毫秒）。0 说明还没真正开始播。
+        position_ms: u64,
+    },
     /// 换输出设备没换成。**旧设备还活着、还在播**，所以它不是 [`Self::Failed`]：
     /// 只提示一句，不把播放状态改成「已停止」。
     DeviceSwitchFailed(String),
@@ -568,6 +579,8 @@ fn run(
                 shared,
                 levels,
                 bus,
+                stream: None,
+                last_position_ms: 0,
                 loaded: false,
                 finished_reported: true,
             }
@@ -610,6 +623,17 @@ struct Runtime {
     /// 电平采集。包在解码器外面，采样透传的同时记下峰值。
     levels: AudioLevels,
     bus: EventBus,
+    /// 当前音源如果是边下边播的流，这里留一份句柄。
+    ///
+    /// 播放器"变空"时要用它判断到底是**放完了**还是**数据断了**：
+    /// 前者该切歌，后者该留住位置续播（见 [`Runtime::sync`]）。
+    stream: Option<crate::audio::streaming::StreamingBuffer>,
+    /// 上一次**还在正常播放**时读到的位置（毫秒）。
+    ///
+    /// 曲目结束的那一帧不能读 `Player::get_pos()`：源都没了，rodio 报的是 0。
+    /// 那个 0 一旦写进共享快照，断流时就"没有位置可续"——用户看到进度条突然
+    /// 跳回 00:00，按播放也只能从头听。所以位置只在这一帧之外更新。
+    last_position_ms: u64,
     /// 是否已经装载了音源。
     loaded: bool,
     /// 本曲是否已上报过结束，防止同一首歌反复触发切歌。
@@ -678,6 +702,7 @@ impl Runtime {
                 let name = output.name.clone();
                 self.bus
                     .send(Event::Audio(AudioEvent::DeviceOpened { name }));
+                self.stream = None;
                 self.loaded = false;
                 self.finished_reported = true;
                 self.levels.clear();
@@ -692,6 +717,17 @@ impl Runtime {
     }
 
     fn load(&mut self, source: AudioSource, start_at_ms: u64, expected_duration_ms: u64) {
+        // 先记住这条源是不是流式：它被 move 进解码器之后就问不出来了，
+        // 而"播放器空了"时正是靠它判断该切歌还是该续播。
+        //
+        // 这一步要放在可能提前 return 的路径**之前**：设备不可用时函数会直接返回，
+        // 那也该把上一首的句柄放掉，别攥着它不放。
+        self.stream = match &source {
+            AudioSource::Stream(buffer) => Some(buffer.clone()),
+            AudioSource::File(_) => None,
+        };
+        self.last_position_ms = start_at_ms;
+
         // 解码器先建好：它跟设备无关，且失败时不用去动设备借用
         let decoder = match build_decoder(source) {
             Ok(decoder) => decoder,
@@ -773,6 +809,8 @@ impl Runtime {
         }
         // 清掉残留的柱子，否则会定格在最后一帧，看着像卡住了
         self.levels.clear();
+        self.stream = None;
+        self.last_position_ms = 0;
         self.loaded = false;
         self.finished_reported = true;
         self.shared.position_ms.store(0, Ordering::Relaxed);
@@ -797,6 +835,7 @@ impl Runtime {
 
         match output.player.try_seek(Duration::from_millis(target)) {
             Ok(()) => {
+                self.last_position_ms = target;
                 self.shared.position_ms.store(target, Ordering::Relaxed);
                 // 跳转后重新允许上报结束
                 self.finished_reported = false;
@@ -814,11 +853,6 @@ impl Runtime {
             return;
         };
 
-        self.shared.position_ms.store(
-            output.player.get_pos().as_millis() as u64,
-            Ordering::Relaxed,
-        );
-
         let paused = output.player.is_paused();
         let drained = output.player.empty();
 
@@ -827,10 +861,43 @@ impl Runtime {
                 self.finished_reported = true;
                 self.loaded = false;
                 self.shared.set_state(PlaybackState::Stopped);
-                self.bus.send(Event::Audio(AudioEvent::TrackFinished));
+
+                // 位置用**上一帧还在播时**记下的那个，绝不在这里读 `get_pos()`：
+                // 源已经结束，rodio 报 0，写进快照就等于把用户听到的位置抹掉。
+                // 断流后要"从断点续播"全靠它。
+                let position_ms = self.last_position_ms;
+
+                // 「播放器空了」不等于「这首放完了」。
+                //
+                // rodio 的解码器把**任何**读错误都吞成 EOF（symphonia 的
+                // `format.next_packet().ok()?`），所以流断了、下载失败了，
+                // 表现出来和自然播完一模一样。照单全收的后果很具体：
+                // 单曲循环（或队列里就一首）会"从头再放一遍"——用户看到的就是
+                // 「播放进度回到开头」；顺序播放则会把这首没听完的歌跳过。
+                let outcome = classify_drain(self.stream.as_ref());
+                self.stream = None;
+                match outcome {
+                    // 用户切歌 / 停止，这是我们自己取消的，安静收场
+                    DrainOutcome::Silent => {}
+                    DrainOutcome::Failed(message) => {
+                        self.bus.send(Event::Audio(AudioEvent::Failed(message)))
+                    }
+                    DrainOutcome::Interrupted => self
+                        .bus
+                        .send(Event::Audio(AudioEvent::StreamInterrupted { position_ms })),
+                    DrainOutcome::Finished => {
+                        self.bus.send(Event::Audio(AudioEvent::TrackFinished))
+                    }
+                }
             }
             return;
         }
+
+        let position_ms = output.player.get_pos().as_millis() as u64;
+        self.last_position_ms = position_ms;
+        self.shared
+            .position_ms
+            .store(position_ms, Ordering::Relaxed);
 
         let state = if paused {
             PlaybackState::Paused
@@ -848,10 +915,43 @@ impl Runtime {
     /// 坏歌连成片时会瞬间刷掉整个队列。让用户看到错误后自己决定下一步。
     fn report_failure(&mut self, message: String) {
         tlog!(crate::logger::LEVEL_ERROR, "{message}");
+        self.stream = None;
         self.loaded = false;
         self.finished_reported = true;
         self.shared.set_state(PlaybackState::Stopped);
         self.bus.send(Event::Audio(AudioEvent::Failed(message)));
+    }
+}
+
+/// 播放器空掉之后的处置方式。
+///
+/// 抽成「枚举 + 自由函数」是为了**能直接测**：这条分支出错的表现是「网络抖一下
+/// 歌就从头再放」或者「坏文件把整条队列刷掉」，两者都不会让编译失败，只会在
+/// 用户那儿变成一句「怎么又回到开头了」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DrainOutcome {
+    /// 不吭声：这条流是我们自己取消的（用户切歌 / 停止）。
+    Silent,
+    /// 流没能放完，且下载**失败**了——报错，但不切歌、不重播。
+    Failed(String),
+    /// 流只是断了（数据没跟上），歌没放完——留住位置续播。
+    Interrupted,
+    /// 真的放完了：本地文件，或者流已经完整下完。
+    Finished,
+}
+
+/// 播放器空掉之后该上报什么。
+///
+/// 判据全在流自己身上（取消 / 失败 / 完整），不看"播放器空了"这个现象——
+/// 因为 rodio 把读错误和正常结束都表现为"源结束"。
+fn classify_drain(stream: Option<&crate::audio::streaming::StreamingBuffer>) -> DrainOutcome {
+    match stream {
+        Some(stream) if stream.is_cancelled() => DrainOutcome::Silent,
+        Some(stream) if !stream.is_complete() => match stream.error() {
+            Some(message) => DrainOutcome::Failed(message),
+            None => DrainOutcome::Interrupted,
+        },
+        _ => DrainOutcome::Finished,
     }
 }
 
@@ -887,6 +987,7 @@ fn build_decoder(source: AudioSource) -> Result<Box<dyn Source<Item = f32> + Sen
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::streaming::StreamingBuffer;
 
     #[test]
     fn playback_state_code_round_trips() {
@@ -912,5 +1013,61 @@ mod tests {
 
         shared.set_volume(-1.0);
         assert!(shared.volume().abs() < f32::EPSILON);
+    }
+
+    /// 本地文件放完 = 真的放完了，照常切歌。
+    #[test]
+    fn file_source_drain_is_a_finished_track() {
+        assert_eq!(classify_drain(None), DrainOutcome::Finished);
+    }
+
+    /// 流**完整**下完再空掉 = 真的放完了。
+    #[test]
+    fn completed_stream_drain_is_a_finished_track() {
+        let stream = StreamingBuffer::new(Some(4));
+        stream.push(b"abcd");
+        stream.finish(None);
+        assert_eq!(classify_drain(Some(&stream)), DrainOutcome::Finished);
+    }
+
+    /// 流还在下、播放器却空了 —— 这是**断流**，不是放完。
+    ///
+    /// 这条是「进度回到开头」那个 bug 的核心：把它当成 `Finished`，主线程就会
+    /// 走切歌流程，单曲循环下等于从头再放一遍。
+    #[test]
+    fn starving_stream_drain_is_an_interruption() {
+        let stream = StreamingBuffer::new(None);
+        stream.push(b"abcd");
+        // 只下了 4 字节，既没 finish 也没取消
+        assert_eq!(classify_drain(Some(&stream)), DrainOutcome::Interrupted);
+    }
+
+    /// 下载失败：如实报错，不当成播完（否则坏文件会连锁切歌）。
+    #[test]
+    fn failed_stream_drain_reports_the_reason() {
+        let stream = StreamingBuffer::new(None);
+        stream.finish(Some("连接被重置".to_string()));
+        assert_eq!(
+            classify_drain(Some(&stream)),
+            DrainOutcome::Failed("连接被重置".to_string())
+        );
+    }
+
+    /// 用户切歌导致的空掉要**安静**：不弹错误、也不切下一首。
+    #[test]
+    fn cancelled_stream_drain_is_silent() {
+        let stream = StreamingBuffer::new(None);
+        stream.push(b"abcd");
+        stream.cancel();
+        assert_eq!(classify_drain(Some(&stream)), DrainOutcome::Silent);
+    }
+
+    /// 取消优先于失败：网络断和用户切歌可能同时发生，那时候该安静收场
+    /// ——用户已经换歌了，再弹一条"下载失败"只会让人以为新歌出了问题。
+    #[test]
+    fn cancellation_takes_precedence_over_error() {
+        let stream = StreamingBuffer::new(None);
+        stream.cancel();
+        assert_eq!(classify_drain(Some(&stream)), DrainOutcome::Silent);
     }
 }

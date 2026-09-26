@@ -121,6 +121,18 @@ pub struct App {
     /// 按原位置重新装载——用户侧看不出中断。
     pending_device_resume: Option<(crate::api::model::Song, u64)>,
 
+    /// 当前边下边播的流。切歌 / 停止 / 退出时用它通知后台下载任务收工。
+    ///
+    /// 不握住它也能播放（音频线程自己有一份），但那样就没人能叫停下载了：
+    /// 用户连着切几首，好几个任务的缓冲会一起留在内存里。
+    active_stream: Option<crate::audio::streaming::StreamingBuffer>,
+
+    /// 已经自动兜过续播的曲目 hash。
+    ///
+    /// 边下边播断流时我们会从断点重来一次；这个记号保证同一首只自动兜一次，
+    /// 免得网络真的断了还反复重试。按曲目存放：换了歌就重新允许。
+    stream_retried: Option<String>,
+
     /// MPRIS 句柄。没有 D-Bus 时为 `None`（不影响播放，只是桌面集成不可用）。
     mpris: Option<crate::mpris::MprisHandle>,
 
@@ -212,6 +224,8 @@ impl App {
             last_frame_at: Instant::now(),
             last_session_save: Instant::now(),
             pending_device_resume: None,
+            active_stream: None,
+            stream_retried: None,
             mpris,
             tray: tray_handle,
         };
@@ -379,6 +393,11 @@ impl App {
         } else {
             self.persist_config();
             self.persist_session();
+        }
+        // 先把还在下的那条流叫停，再关音频线程：否则音频线程会在
+        // `Player::clear()` 里等那个阻塞在 read() 里的解码器（最长 15 秒）
+        if let Some(stream) = self.active_stream.take() {
+            stream.cancel();
         }
         self.audio.shutdown();
     }

@@ -21,6 +21,14 @@
 //! * 拖进度条是真正的随机访问，没有「跳不过去」的区域；
 //! * 重复播放零网络开销；
 //! * 断点续传、失败重试都变成简单的文件操作。
+//!
+//! # 流式下载写的是 `.part`
+//!
+//! 两条路径都先写同目录下的 `.part`，**全部写完才改名**成正式缓存文件。
+//! 流式那条尤其重要：它一边下一边播，中途失败/被取消是常态，若直接写正式
+//! 文件名，磁盘上就会留下一个「看起来完整、其实只有半首」的文件，下次播放
+//! 命中它就会在中间莫名其妙地结束（而且 `cache.find` 是按文件存在与否判断的，
+//! 它看不出长短）。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -422,41 +430,104 @@ fn temp_path_for(target: &Path) -> PathBuf {
 /// 128 KB ≈ 8 秒音频，够解码器稳定跑起来，等待又不明显。
 pub const PREROLL_BYTES: u64 = 128 * 1024;
 
+/// 一次流式下载的结局。
+///
+/// 三种情况在界面上的待遇完全不同，所以不能只用一个 `Result`：取消不是错误
+/// （用户自己切了歌，不该弹红字），失败要如实说，成功只做收尾（**不能**顺手
+/// 把音源换成本地文件——那会把正在放的位置冲回 0）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamOutcome {
+    /// 整首下完，并已改名为正式缓存文件。
+    Completed,
+    /// 下载失败，原因见内层字符串。
+    Failed(String),
+    /// 用户切歌 / 停止，主动取消；中途文件已清理，不算错误。
+    Cancelled,
+}
+
 impl Downloader {
     /// 开始流式下载，**立即返回**缓冲。
     ///
-    /// 后台任务一边灌 buffer 一边写 `cache_path`：这次播完缓存就在了，
-    /// 下次直接走本地文件，不用再下。
+    /// 后台任务一边灌 buffer 一边写 `cache_path` 对应的 `.part` 文件：这次播完
+    /// 缓存就在了，下次直接走本地文件，不用再下。
     ///
     /// 返回的 buffer 可直接交给 `AudioEngine::load`——读指针跑到还没下载到的
     /// 位置时会在 `read()` 里阻塞等数据，表现是声音停一下，而不是提前结束。
+    ///
+    /// 缓冲只在内存里留一个窗口，其余落在 `.part` 上（见
+    /// [`crate::audio::streaming`]），所以这里必须**先**把文件建好并把句柄交给它。
     pub fn start_streaming(
         &self,
         url: &str,
         cache_path: PathBuf,
-        on_done: impl FnOnce(std::result::Result<(), String>) + Send + 'static,
-    ) -> StreamingBuffer {
-        let buffer = StreamingBuffer::new(None);
+        on_done: impl FnOnce(StreamOutcome) + Send + 'static,
+    ) -> Result<StreamingBuffer> {
+        let part_path = temp_path_for(&cache_path);
+        if let Some(parent) = part_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| AppError::io_at(parent.display().to_string(), error))?;
+        }
+        // 必须是**读写**打开的：缓冲要靠这个句柄 `pread` 把回收掉的字节读回来，
+        // 而 `File::create` 只给 `O_WRONLY`（对这种句柄 `pread` 直接 EBADF）。
+        // `truncate` 顺手把上一次留下的同名 `.part` 清掉重用。
+        let file = Arc::new(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&part_path)
+                .map_err(|error| AppError::io_at(part_path.display().to_string(), error))?,
+        );
+
+        let buffer = StreamingBuffer::with_spill(None, Arc::clone(&file));
         let writer = buffer.clone();
         let http = self.http.clone();
         let url = url.to_string();
 
         tokio::spawn(async move {
-            match stream_into(&http, &url, &writer, &cache_path).await {
+            let outcome = match stream_into(&http, &url, &writer, &file).await {
+                Ok(()) if writer.is_cancelled() => {
+                    // 用户在下载中途切了歌：删掉半成品，不留痕、不报错
+                    let _ = tokio::fs::remove_file(&part_path).await;
+                    StreamOutcome::Cancelled
+                }
                 Ok(()) => {
                     writer.finish(None);
-                    on_done(Ok(()));
+                    match tokio::fs::rename(&part_path, &cache_path).await {
+                        Ok(()) => StreamOutcome::Completed,
+                        Err(error) => {
+                            // 数据是完整的，能照常播完；只是这次没进缓存，
+                            // 下次播放要重下一次。不值得惊动用户。
+                            tlog!(
+                                crate::logger::LEVEL_WARN,
+                                "音频改名到 {} 失败：{error}",
+                                cache_path.display()
+                            );
+                            StreamOutcome::Completed
+                        }
+                    }
                 }
                 Err(error) => {
-                    tlog!(crate::logger::LEVEL_WARN, "流式下载 {url} 失败：{error}");
-                    let message = error.to_string();
-                    writer.finish(Some(message.clone()));
-                    on_done(Err(message));
+                    let _ = tokio::fs::remove_file(&part_path).await;
+                    if writer.is_cancelled() {
+                        // 取消的收尾在 `cancel()` 里已经做完了（标志位 + 唤醒
+                        // 阻塞的读线程），别再记一条假错误
+                        StreamOutcome::Cancelled
+                    } else {
+                        let message = error.to_string();
+                        tlog!(crate::logger::LEVEL_WARN, "流式下载 {url} 失败：{message}");
+                        // 先把失败写进缓冲再回调：正阻塞在 read() 的解码线程要能
+                        // 立刻醒过来（并知道是为什么），不能干等到超时。
+                        writer.finish(Some(message.clone()));
+                        StreamOutcome::Failed(message)
+                    }
                 }
-            }
+            };
+            on_done(outcome);
         });
 
-        buffer
+        Ok(buffer)
     }
 }
 
@@ -464,7 +535,7 @@ async fn stream_into(
     http: &reqwest::Client,
     url: &str,
     buffer: &StreamingBuffer,
-    cache_path: &Path,
+    file: &std::fs::File,
 ) -> Result<()> {
     let mut response = http
         .get(url)
@@ -476,25 +547,23 @@ async fn stream_into(
             status: error.status().map(|status| status.as_u16()).unwrap_or(0),
         })?;
 
-    // 边收边写：缓存文件同步落盘，即使没播完下次也能接着用
-    let mut file = std::fs::File::create(cache_path).map_err(|error| AppError::IoAt {
-        path: cache_path.display().to_string(),
-        source: error,
-    })?;
-
     // 用 reqwest 自带的 chunk()，不引 futures_util——为一个循环加依赖不值当
+    // `&File` 也实现了 Write，写的是同一个 fd（不共享偏移，pread 不受影响）
+    let mut sink = file;
     while let Some(chunk) = response.chunk().await? {
+        if buffer.is_cancelled() {
+            return Ok(());
+        }
+        // **顺序不能反**：先落盘再进内存。缓冲只保留尾部窗口，窗口之外的字节
+        // 靠 `pread(this file)` 读回来——先 push 后写文件的话，读指针跑到
+        // 窗口外面时会从文件里读到还没写入的空洞（听感是噪音）。
+        sink.write_all(&chunk)
+            .map_err(|error| AppError::io_at(url.to_string(), error))?;
         buffer.push(&chunk);
-        file.write_all(&chunk).map_err(|error| AppError::IoAt {
-            path: cache_path.display().to_string(),
-            source: error,
-        })?;
     }
 
-    file.flush().map_err(|error| AppError::IoAt {
-        path: cache_path.display().to_string(),
-        source: error,
-    })?;
+    sink.flush()
+        .map_err(|error| AppError::io_at(url.to_string(), error))?;
 
     Ok(())
 }
