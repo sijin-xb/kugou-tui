@@ -351,11 +351,29 @@ impl AudioHandle {
     }
 
     /// 停止播放并回收音频线程。
+    ///
+    /// 对 join 是**有界等待**：音频线程正常情况下一个轮询周期（200ms）内就会
+    /// 退出，但万一卡在驱动层面的阻塞操作上（`snd_pcm_*` 系列不受我们控制），
+    /// 无限等 join 会把整个进程拖在「半死」状态——进程活着，设备就一直被占，
+    /// 其它应用全部打不开声音。等不到就放弃：进程照常退出，内核回收音频线程
+    /// 持有的全部 fd，设备立即释放。
     pub fn shutdown(&mut self) {
         // 线程已经退出时 send 会失败，这是预期情况，忽略即可
         let _ = self.command_tx.send(AudioCmd::Shutdown);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            const JOIN_TIMEOUT: Duration = Duration::from_secs(3);
+            let deadline = std::time::Instant::now() + JOIN_TIMEOUT;
+            while !thread.is_finished() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(20));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            } else {
+                tlog!(
+                    crate::logger::LEVEL_WARN,
+                    "音频线程 {JOIN_TIMEOUT:?} 内未退出，放弃等待（进程退出时由系统回收设备）"
+                );
+            }
         }
     }
 
@@ -423,11 +441,38 @@ impl Output {
 
     /// 系统默认设备。
     ///
-    /// 直接交给 rodio 的 `open_default_sink`：它先试 cpal 认的默认设备（ALSA 的
-    /// `default`），失败才按设备列表回退、并跳过 `null`。**不自己遍历设备列表**——
-    /// 那会先碰上一堆打不开的 ALSA 插件（lavrate / jack / oss …），实测能把后端
-    /// 搅到后面全部打不开（ALSA 在失败的 `snd_pcm_open` 后不保证清理干净）。
+    /// **有声音服务器（PipeWire/PulseAudio）时只开 PCM `default`**——它由
+    /// `/usr/share/alsa/alsa.conf.d/99-*-default.conf` 重定向进服务器，和其它
+    /// 应用共享声卡。**绝不借用 rodio 的 `open_default_sink` 兜底**：那玩意儿
+    /// 在 `default` 打不开时会遍历设备列表、抓第一个能开的——在服务器系统上
+    /// 就是直连硬件（独占声卡，挤死所有人）。打不开就报错，让用户看到原因。
+    ///
+    /// 没有声音服务器（headless 的裸 ALSA 系统）时维持 rodio 原行为：那种
+    /// 环境里 `default` 打不开就该试别的设备，直连也没有「挤死别人」的问题。
     fn open_default() -> Result<Self, String> {
+        if sound_server_present() {
+            return Self::open_server_default();
+        }
+        Self::open_bare_alsa_default()
+    }
+
+    /// 有声音服务器时的默认设备：PCM `default`，经服务器路由。
+    fn open_server_default() -> Result<Self, String> {
+        use rodio::cpal::traits::HostTrait;
+
+        // cpal 在 ALSA host 上返回的就是 PCM `default`（名字被硬编码成
+        // "Default Audio Device"，显示名用 `default_label()` 另取）。
+        let device = rodio::cpal::default_host()
+            .default_output_device()
+            .ok_or_else(|| "找不到系统默认音频设备".to_string())?;
+        Self::from_device(device, default_label())
+    }
+
+    /// 没有声音服务器时的默认设备：交给 rodio 处理（含设备列表回退）。
+    ///
+    /// 它先试 cpal 认的默认设备（ALSA 的 `default`），失败才按设备列表回退、
+    /// 并跳过 `null`。
+    fn open_bare_alsa_default() -> Result<Self, String> {
         let mut stream = rodio::DeviceSinkBuilder::open_default_sink().map_err(open_failed)?;
 
         // rodio 默认会在 DeviceSink 析构时往 stdout 打一行 "Dropping DeviceSink..."，
@@ -469,14 +514,14 @@ fn open_failed(error: rodio::DeviceSinkError) -> String {
 /// 可用的输出设备：能打开、能出声、名字不重复。
 ///
 /// ALSA 会把自己定义的**所有 PCM** 都报成设备——实测这台机器上有 52 项，其中
-/// 大多数是插件（`lavrate` / `samplerate` / `jack` / `oss` / `speexrate`…），
-/// 还有被 PipeWire 占着、直连必失败的硬件条目。把它们摆进设置页，用户选中一个
-/// 打不开的就会把播放弄哑。两道过滤：
+/// 大多数是插件（`lavrate` / `samplerate` / `jack` / `oss` / `speexrate`…）。
+/// 把它们摆进设置页，用户选中一个打不开的就会把播放弄哑。三道过滤：
 ///
 /// * **能给出默认输出配置**——这是「真的能播」的判据，插件和已被独占的设备都过不了；
 /// * **排除 `null`**（"Discard all samples"）。它能打开、能「正常播放」，只是把所有
 ///   采样丢掉，从外面看毫无异常——正是「播放中却没声音」的另一种成因。它偏偏还能
-///   给出配置，所以必须单独判掉。
+///   给出配置，所以必须单独判掉；
+/// * **有声音服务器时只留服务器路由的 PCM**（见 [`sound_server_present`]）。
 ///
 /// 最后按名字去重：同一张卡会以 `hw:` / `plughw:` / `front:` / `surround*:` 等
 /// 十几种形态出现，全列出来只会让人没法选。
@@ -494,9 +539,54 @@ fn output_devices() -> Vec<rodio::cpal::Device> {
     let mut seen = std::collections::HashSet::new();
     devices
         .filter(|device| !is_null_device(device))
+        // 直连硬件的 PCM（hw: / plughw: / front: / sysdefault …）是独占语义：
+        // 拿走一个，声音服务器（以及它代理的麦克风、浏览器、通话……）就再也
+        // 打不开那张卡。有服务器在场时全部剔除，只留共享的服务器入口。
+        // **这是真实事故**：设置页里「Default Audio Device」这个名字看着无害，
+        // 实际是 `sysdefault`——`plughw:0` 的别名（见
+        // /usr/share/alsa/pcm/default.conf），选中后程序直连 USB 声卡，
+        // 把麦克风和扬声器一起挤哑，PipeWire 日志里全是
+        // "playback open failed: 设备或资源忙"。
+        //
+        // 没有声音服务器（headless 裸 ALSA）时不滤——那种环境直连没有
+        // 「挤死别人」的问题，维持原有行为。非 Linux 平台拿不到 PCM 名，
+        // `sound_server_present` 恒为 false，同样不受影响。
+        .filter(|device| {
+            !sound_server_present() || driver_of(device).is_some_and(|driver| is_server_routed(&driver))
+        })
         .filter(|device| device.default_output_config().is_ok())
         .filter(|device| seen.insert(device_name(device).unwrap_or_default()))
         .collect()
+}
+
+/// 声音服务器（PipeWire / PulseAudio）是否在场。
+///
+/// 判据：服务器会往 ALSA 里注册自己的 PCM 插件（`pipewire` / `pulse`），
+/// 枚举里出现任意一个就算在场。只看 PCM 名、不查询配置，开销可忽略。
+fn sound_server_present() -> bool {
+    use rodio::cpal::traits::HostTrait;
+
+    rodio::cpal::default_host()
+        .output_devices()
+        .map(|devices| {
+            devices
+                .into_iter()
+                .any(|device| driver_of(&device).is_some_and(|driver| is_sound_server_pcm(&driver)))
+        })
+        .unwrap_or(false)
+}
+
+/// PCM 是否由声音服务器自己提供（服务器的 ALSA 插件）。
+fn is_sound_server_pcm(driver: &str) -> bool {
+    matches!(driver, "pipewire" | "pulse")
+}
+
+/// PCM 是否经声音服务器路由（共享使用硬件，不会独占）。
+///
+/// `default` 在装有 pipewire-alsa / pulseaudio-alsa 的系统上被重定向进
+/// 服务器；`pipewire` / `pulse` 是服务器入口本身。三者都安全。
+fn is_server_routed(driver: &str) -> bool {
+    matches!(driver, "default" | "pipewire" | "pulse")
 }
 
 /// 是不是那个「丢弃所有采样」的空设备。
@@ -1069,5 +1159,41 @@ mod tests {
         let stream = StreamingBuffer::new(None);
         stream.cancel();
         assert_eq!(classify_drain(Some(&stream)), DrainOutcome::Silent);
+    }
+
+    /// 服务器 PCM 的判定：`pipewire` / `pulse` 是服务器自己，`default` 只是
+    /// 被重定向进服务器的入口——提供方不是服务器，但路由进去。
+    #[test]
+    fn sound_server_pcm_detection() {
+        assert!(is_sound_server_pcm("pipewire"));
+        assert!(is_sound_server_pcm("pulse"));
+        // default / sysdefault / 直连硬件都不是服务器本体
+        for driver in ["default", "sysdefault", "hw:CARD=Device,DEV=0", "null"] {
+            assert!(!is_sound_server_pcm(driver), "{driver} 不该被认成服务器本体");
+        }
+    }
+
+    /// 「经服务器路由」的判定：有服务器时**只有**这三个 PCM 允许出现在
+    /// 可选列表里。`sysdefault` 是这条规则存在的理由——它叫
+    /// "Default Audio Device"，实际是 `plughw:0` 的直连别名，选中即独占声卡。
+    #[test]
+    fn server_routed_devices_are_safe_to_share() {
+        for driver in ["default", "pipewire", "pulse"] {
+            assert!(is_server_routed(driver), "{driver} 应当被视为可共享");
+        }
+        // 直连硬件的（含那条骗人的 sysdefault）全部拒绝
+        for driver in [
+            "sysdefault",
+            "sysdefault:CARD=Device,DEV=0",
+            "hw:CARD=Device,DEV=0",
+            "plughw:CARD=0,DEV=0",
+            "front:CARD=Device,DEV=0",
+            "surround51:CARD=Device,DEV=0",
+            "iec958:CARD=Device,DEV=0",
+            "dmix",
+            "null",
+        ] {
+            assert!(!is_server_routed(driver), "{driver} 直连硬件，必须被过滤");
+        }
     }
 }

@@ -4,6 +4,41 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.1] - 2026-09-26
+
+### 修复
+
+- **程序一运行就独占声卡，麦克风和扬声器全被挤哑；退出后声音也回不来**。
+  这是一条把整个系统音频搞瘫的 bug，根因是「绕过声音服务器直连硬件」：
+
+  1. **设置页里有个叫「Default Audio Device」的设备，名字看着最像"系统默认"，
+     实际是 ALSA 的 `sysdefault`——`plughw:0` 的直连别名**（见
+     `/usr/share/alsa/pcm/default.conf`；而真正的默认设备叫
+     「Default ALSA Output (currently PipeWire Media Server)」）。选中它之后
+     程序直连 USB 声卡，PipeWire 再想打开那张卡就是「设备或资源忙」——
+     麦克风、扬声器、其它应用的声音一起没了。
+  2. 就算没选它，`open_default_sink()` 在默认设备打不开时还会**遍历设备列表
+     抓第一个能开的**——在服务器系统上那同样是抢占硬件。
+
+  现在引擎先探测声音服务器（PipeWire / PulseAudio）是否在场：
+
+  - **在场时，可选设备只剩经服务器路由的三种 PCM**（`default` / `pipewire` /
+    `pulse`），直连硬件的（`sysdefault`、`hw:`、`plughw:`、`front:`、
+    `surround*:`、`iec958:`、`hdmi:` …）一律不进列表——ALSA 硬件设备是独占语义，
+    抓走一个就挤死服务器上的所有其它客户端；
+  - **默认设备只开 PCM `default`**，打不开就如实报错，不再回退到裸硬件；
+  - 没有声音服务器（headless 的裸 ALSA 系统）时行为不变，直连没有
+    「挤死别人」的问题。
+
+  配置里遗留的 `audio_device = "Default Audio Device"` 不会让程序起不来：
+  找不到就记一条日志、回退系统默认（界面会显示实际打开的设备）。
+
+- **音频线程卡住时退出会僵住，设备一直不释放**。收尾对音频线程的 `join` 改成
+  **有界等待**（3 秒）：正常情况它一个轮询周期（200ms）内就退出；万一卡在驱动
+  层面的阻塞操作上，等不到就放弃——进程照常退出，内核回收它持有的全部 fd，
+  设备立即释放。`panic`（release 构建 `panic = "abort"`）与被 `kill -9` 时
+  同样由内核回收，不需要额外处理。
+
 ## [0.4.0] - 2026-09-26
 
 ### 修复

@@ -67,6 +67,11 @@ pub struct Config {
     /// 而用户在听 USB 声卡 —— 表现是「进度在走、完全没声音」，而且因为是直连
     /// 硬件（绕过了 PipeWire），`pactl list sink-inputs` 里连这个程序都看不到。
     /// 能在界面上改设备，这类问题就不用去翻系统配置了。
+    ///
+    /// 注意：有声音服务器（PipeWire/PulseAudio）时，可选列表里只剩经服务器
+    /// 路由的设备（`default` / `pipewire` / `pulse`）——直连硬件的 PCM 会被
+    /// 引擎过滤掉，因为 ALSA 硬件设备是独占语义，抓走一张卡就会挤死服务器上
+    /// 的其它所有应用（详见 `audio::engine` 里 `output_devices` 的注释）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_device: Option<String>,
 
