@@ -1,6 +1,6 @@
 [package]
 name = "kugou-tui"
-version = "0.3.10"
+version = "0.4.0"
 edition = "2024"
 # 1.86 是 ratatui-image 11.x 的下限：它要 ratatui 0.30，而支持 ratatui 0.30 的
 # ratatui-image 最低是 10.0.0，MSRV 就是 1.86。不能退回 8.x——8.x 只认

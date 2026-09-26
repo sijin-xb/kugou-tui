@@ -61,8 +61,8 @@ paru -S kugou-tui          # 或 yay -S kugou-tui
 不想装 Rust 工具链的话，直接下 Release 里的 tarball（x86_64 Linux）：
 
 ```bash
-tar xzf kugou-tui-0.3.10-x86_64-unknown-linux-gnu.tar.gz
-cd kugou-tui-0.3.10-x86_64-unknown-linux-gnu
+tar xzf kugou-tui-0.4.0-x86_64-unknown-linux-gnu.tar.gz
+cd kugou-tui-0.4.0-x86_64-unknown-linux-gnu
 
 # 二进制与三个脚本都链进 PATH。
 # `scripts/kugou-tui` 与二进制同名，所以链过去要改名（同 AUR 包的做法）。
