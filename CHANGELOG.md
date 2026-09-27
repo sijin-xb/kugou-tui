@@ -4,6 +4,25 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 变更
+
+- **Linux 发行包也由 CI 产出**。此前只有 Windows 与 macOS 交给 CI，Linux 那份由本地
+  `scripts/release` 编好上传——那意味着**开发机不在手边就发不出 Linux 包**：换机器、
+  重装，或者只想给一个已经发过的版本补资产，都得先把 Rust 工具链与整棵依赖树重建一遍。
+  现在 `release.yml` 增加 `ubuntu-latest` 一栏，推 `v*` tag 时三个平台统一出包，
+  产物不依赖任何一台具体的机器。
+
+  本地 `scripts/release` 的打包与上传**保持不变**：两边同名，靠
+  `upload-release-asset` 的 `--clobber` 覆盖，谁后到谁生效。因此两边的 sha256
+  **不保证相同**（rustc 小版本、目标机器上的 C 工具链都会影响 `aws-lc-sys` 的编译
+  结果），本地记下的哈希事后对不上是正常的。
+
+- **CI 的 Linux 栏会传一份二进制 artifact**（`kugou-tui-linux-x86_64`，保留 14 天）。
+  此前每次 push 都会 `cargo build --release`，但产物用完即弃——想拿一份能跑的二进制
+  只能等发版，或者在本机重编一次（`lto = "fat"` + `codegen-units = 1`，要好几分钟）。
+
 ## [0.4.3] - 2026-09-27
 
 ### 新增

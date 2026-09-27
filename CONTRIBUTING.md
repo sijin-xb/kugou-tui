@@ -45,8 +45,11 @@ cargo test
 
 CI（`.github/workflows/ci.yml`）在 **Linux / Windows / macOS** 三个平台各跑一遍
 `clippy + test + build`（`cargo fmt --check` 只在 Linux 那一栏跑，格式化与平台无关），
-Windows 那一栏还会跑一次打包脚本。Windows 与 macOS 两栏不是摆设：路径展开、
-配置目录、缓存文件命名、音频后端这些差异只有真跑起来才露出来，而开发机通常是 Linux。
+Windows 那一栏还会跑一次打包脚本，Linux 那一栏会把编出来的二进制传成 artifact
+（`kugou-tui-linux-x86_64`，保留 14 天）——想拿一份能跑的二进制不必等发版，
+也不必在本机重编（`lto = "fat"` + `codegen-units = 1` 要跑好几分钟）。
+Windows 与 macOS 两栏不是摆设：路径展开、配置目录、缓存文件命名、音频后端这些差异
+只有真跑起来才露出来，而开发机通常是 Linux。
 
 改到平台相关代码时，另外确认一下 Windows 目标能编：
 

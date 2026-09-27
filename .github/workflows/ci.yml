@@ -64,6 +64,23 @@ jobs:
       - run: cargo test
       - run: cargo build --release
 
+      # 把编好的二进制传成 artifact，这样**任何一次 push** 都能直接下载来用，
+      # 不必等发版、也不必在本机重编一遍（`lto = "fat"` + `codegen-units = 1`
+      # 的 release 构建在这台机器上要跑好几分钟）。
+      #
+      # 只传 Linux 这一份：Windows / macOS 的包由 release.yml 在打 tag 时产出，
+      # 平时没人从 CI 下它们，传了只是白占存储。要别的平台就从 Release 页取。
+      #
+      # `if-no-files-found: error`：路径写错时宁可让这一步红掉，
+      # 也不要「上传了 0 个文件然后成功退出」——那种绿是最难查的。
+      - name: 上传二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: kugou-tui-linux-x86_64
+          path: target/release/kugou-tui
+          if-no-files-found: error
+          retention-days: 14
+
   windows:
     name: Windows
     runs-on: windows-latest

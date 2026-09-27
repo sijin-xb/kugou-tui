@@ -1,14 +1,26 @@
-# 发行资产：在打 tag 时把 Windows 与 macOS 的二进制挂到 GitHub Release 上。
+# 发行资产：在打 tag 时把三个平台的二进制挂到 GitHub Release 上。
 #
 # # 为什么需要它
 #
-# 发版流程（`scripts/release`）跑在开发机上，而那是 Linux——它只能产出
-# `x86_64-unknown-linux-gnu` 的 tarball。Windows 的 `.exe` 必须在 Windows 上编
-# （MSVC 工具链），macOS 的二进制必须在 macOS 上编（Apple SDK）。所以这两个平台
-# 的包只能交给 CI。这个工作流就是干这件事的。
+# 发版流程（`scripts/release`）跑在开发机上。Windows 的 `.exe` 必须在 Windows 上编
+# （MSVC 工具链），macOS 的二进制必须在 macOS 上编（Apple SDK）——**这不是漏了，
+# 是物理限制**。所以它们只能交给 CI，这个工作流就是干这件事的。
 #
-# Linux 不在这里重复构建：`scripts/release` 已经在本地编好、验好、传上去了
-# （它还会核对资产内容）。这里只补开发机产不出来的那两个。
+# # Linux 为什么也进了 CI
+#
+# 早先 Linux 只由本地 `scripts/release` 产出（开发机就是 Linux，顺手编了）。
+# 但那意味着**开发机不在手边就发不出 Linux 包**：换机器、重装、或者只想补一个
+# 已经发过的版本的资产，都得先把 Rust 工具链和一整棵依赖树重建一遍。
+#
+# 现在三平台统一由 CI 出包：推 tag 就有，产物不依赖任何一台具体的机器。
+# 本地 `scripts/release` 仍然照常上传它的那份——两边同名，靠 `upload-release-asset`
+# 的 `--clobber` 覆盖，谁后到谁生效，不会报错。
+#
+# > **注意**：CI 的产物与本地产物的 sha256 **不一定相同**（rustc 小版本、目标
+# > 机器上的 C 工具链都会影响 aws-lc-sys 的编译结果）。如果本地发版时核对过哈希，
+# > 事后从 Release 下载回来对不上是正常的，不是文件被换了。
+# > 想让哈希只有一个来源，就把 `scripts/release` 里的 Linux 打包与上传去掉，
+# > 完全交给这里——那属于发版流程的改动，单独做。
 #
 # # 触发
 #
@@ -42,6 +54,52 @@ env:
   TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  linux:
+    name: Linux 包
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      # cpal 在 Linux 上走 ALSA，`alsa-sys` 的构建脚本要靠 pkg-config 找到
+      # alsa-lib 的开发头文件。开发机上这两个是现成的，干净的 runner 里不是。
+      # 与 ci.yml 的 Linux 那一栏同一个理由，少一个都编不过。
+      - name: 装音频后端依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config
+
+      # **不需要**装 CMake / NASM / OpenSSL：非 Windows 的 TLS 走 rustls +
+      # aws-lc-rs，ubuntu runner 镜像里 clang 与 cmake 本来就有，那坨 C 代码编得过。
+      # 见 Cargo.toml 里 `cfg(not(windows))` 那段注释。
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --release
+
+      # 校验编出来的确实是要发的那个版本——checkout 错了 ref 时这条能拦住。
+      # 三个平台各查一遍：Windows 那边用的是 pwsh，这里与 macOS 共用同一段 bash。
+      - name: 校验版本号
+        run: |
+          expected="${TAG#v}"
+          actual=$(./target/release/kugou-tui --version | awk '{print $NF}')
+          [ "$actual" = "$expected" ] ||
+            { echo "二进制自报 $actual，tag 是 $expected —— checkout 的 ref 不对" >&2; exit 1; }
+          echo "版本核对通过：$actual"
+
+      # 用仓库里那个脚本，不在这里现拼目录：发行包必须同时带上三个 bash 脚本与
+      # docs/，手工拼很容易漏（0.3.7 那版就漏了）。它不传参数时按 `rustc -vV` 的
+      # host 取三元组，在 ubuntu runner 上就是 `x86_64-unknown-linux-gnu`，
+      # 与本地 `scripts/release` 产出的名字一致。
+      - name: 打包
+        run: ./scripts/make-release-tarball
+
+      - name: 挂到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/upload-release-asset "$TAG" 'dist/*.tar.gz'
+
   windows:
     name: Windows 包
     runs-on: windows-latest
