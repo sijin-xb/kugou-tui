@@ -66,10 +66,11 @@ jobs:
 
       # 把编好的二进制传成 artifact，这样**任何一次 push** 都能直接下载来用，
       # 不必等发版、也不必在本机重编一遍（`lto = "fat"` + `codegen-units = 1`
-      # 的 release 构建在这台机器上要跑好几分钟）。
+      # 的 release 构建要跑好几分钟）。
       #
-      # 只传 Linux 这一份：Windows / macOS 的包由 release.yml 在打 tag 时产出，
-      # 平时没人从 CI 下它们，传了只是白占存储。要别的平台就从 Release 页取。
+      # 三栏都传。早先只传了 Linux 这一份，理由是「Windows / macOS 的包由
+      # release.yml 在打 tag 时产出」——但那意味着平时想拿一份别的平台的二进制
+      # 只能等发版。多传两份的代价只是几 MB 存储（14 天过期），比「拿不到」划算。
       #
       # `if-no-files-found: error`：路径写错时宁可让这一步红掉，
       # 也不要「上传了 0 个文件然后成功退出」——那种绿是最难查的。
@@ -100,6 +101,17 @@ jobs:
       - run: cargo test
       - run: cargo build --release
 
+      # 与 Linux 那一栏同一个理由，见那边的注释。
+      # 路径带 `.exe`：MSVC 目标产出的就是这个名字；写错会被
+      # `if-no-files-found: error` 当场拦住，而不是悄悄上传一个空包。
+      - name: 上传二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: kugou-tui-windows-x86_64
+          path: target/release/kugou-tui.exe
+          if-no-files-found: error
+          retention-days: 14
+
       # 顺带验证打包脚本本身：它只能在这边跑（依赖 MSVC 工具链的产物），
       # 而「打包漏文件」是这个项目真实踩过的坑（0.3.7 那版漏了脚本）。
       - name: 打包
@@ -123,3 +135,14 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
+
+      # 与 Linux 那一栏同一个理由，见那边的注释。
+      # `macos-latest` 是 arm64 机器，所以这份是 aarch64 二进制，在 Intel Mac 上跑不了
+      # —— 与 Release 页的产物是同一个限制，见 docs/RELEASE.md。
+      - name: 上传二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: kugou-tui-macos-arm64
+          path: target/release/kugou-tui
+          if-no-files-found: error
+          retention-days: 14
