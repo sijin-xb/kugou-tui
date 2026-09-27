@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     kugou-tui —— Windows 启动器：确保 KuGouMusicApi 在跑，然后进入播放器。
 
@@ -158,6 +158,13 @@ if (-not $bin) {
     exit 1
 }
 
+# 路径存在也要确认一次。`KUGOU_TUI_BIN` 指错（或指到一个已删的目录）时，
+# 之前会一路走到最后才由 CreateProcess 抛一句 Win32 错误，看不出是哪里配错了。
+if (-not (Test-Path -LiteralPath $bin -PathType Leaf)) {
+    Write-Host "KUGOU_TUI_BIN 指向的文件不存在：$bin" -ForegroundColor Red
+    exit 1
+}
+
 # ==================================================================
 # 当前音源 → 服务目录 / 端口 / platform
 # ==================================================================
@@ -167,6 +174,12 @@ if (-not $activeSource) { $activeSource = 'kugou' }
 $isNetease = $activeSource -eq 'netease'
 $serviceName = if ($isNetease) { 'NeteaseCloudMusicApi' } else { 'KuGouMusicApi' }
 $defaultApiDirName = if ($isNetease) { 'NeteaseCloudMusicApi' } else { 'KuGouMusicApi' }
+
+# 实例名（standard / lite）——与 `kugou-api`（bash 版与 kugou-api.ps1）的实例名、
+# PID 文件命名保持一致。这样启动器拉起来的服务，`kugou-api.ps1 status` 看得见、
+# `kugou-api.ps1 stop` 停得掉；否则就只能靠任务管理器手杀 node。
+$instanceName = if ($activeSource -eq 'kugou_concept') { 'lite' } else { 'standard' }
+$pidFile = Join-Path $cacheDir "api-$instanceName.pid"
 
 # 服务目录按**当前音源**选择。写死 KuGouMusicApi 会导致：当前音源是网易云时，
 # 启动器拿酷狗的代码去监听 :3002，而真正的网易云服务已经占用了这个端口 ——
@@ -225,6 +238,7 @@ if ($dryRun) {
     Write-Host '--- dry-run：只打印决策，不启动任何东西 ---' -ForegroundColor Cyan
     Write-Host "配置        : $configFile"
     Write-Host "当前音源    : $activeSource"
+    Write-Host "实例        : $instanceName（PID 文件 $pidFile）"
     Write-Host "探测地址    : $checkBase（端口 $apiPort$platformNote）"
     Write-Host "服务目录    : $apiDir"
     Write-Host "服务日志    : $apiLog"
@@ -287,11 +301,21 @@ if (-not (Test-ApiAlive $checkBase)) {
     if ($env:OS -eq 'Windows_NT') { $startArgs['WindowStyle'] = 'Hidden' }
 
     try {
-        Start-Process @startArgs | Out-Null
+        $proc = Start-Process @startArgs
     }
     finally {
         $env:PORT = $previousPort
     }
+
+    # 记下 PID 与端口，格式与 Unix 侧一致（`<PID> <端口>`，空格分隔）。
+    # 只记 PID 不够：端口改了以后单看进程是否还活着，会以为「还是那个实例」。
+    #
+    # 先确保缓存目录在：上面建的是**日志**的目录，而 KUGOU_API_LOG 指到别处时
+    # 两者不是同一个，PID 文件会因为父目录不存在而写失败。
+    if (-not (Test-Path -LiteralPath $cacheDir)) {
+        New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+    }
+    Set-Content -LiteralPath $pidFile -Value "$($proc.Id) $apiPort" -NoNewline -Encoding ascii
 
     for ($attempt = 0; $attempt -lt 40; $attempt++) {
         Start-Sleep -Milliseconds 500
@@ -306,9 +330,12 @@ if (-not (Test-ApiAlive $checkBase)) {
                 Get-Content -Tail 15 $log | ForEach-Object { Write-Host "  $_" }
             }
         }
+        Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+        Write-Host ''
+        Write-Host "排查：$PSCommandPath --dry-run 会打印它到底在探哪个地址。"
         exit 1
     }
-    Write-Host "服务已就绪：$checkBase" -ForegroundColor Green
+    Write-Host "服务已就绪：$checkBase（PID $($proc.Id)，停止用 kugou-api.ps1 stop）" -ForegroundColor Green
 }
 
 # ==================================================================

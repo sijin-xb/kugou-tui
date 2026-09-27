@@ -91,6 +91,11 @@ cd kugou-tui && cargo build --release
 >
 > 为什么 Windows 上不需要 CMake / NASM：TLS 走系统自带的 SChannel 而不是 rustls，
 > 于是 `aws-lc-sys` 那坨 C 代码根本不参与编译。见 `Cargo.toml` 里 `cfg(windows)` 的注释。
+>
+> **启动器三个平台都是同一套行为**：探活 → 没起就拉起 → 等就绪 → 进播放器，拉起时
+> 记下 PID 与端口，所以 `kugou-api stop` / `kugou-api.ps1 stop` 停得掉它。
+> 排查「为什么它说服务没起」用 `kugou-tui --dry-run`：只打印它解析到的配置、音源、
+> 探测地址与服务目录，不启动任何东西。
 
 ### 功能总览
 

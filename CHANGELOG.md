@@ -8,6 +8,221 @@
 
 ### 变更
 
+- **拆 `app/update.rs`**（4728 → 4144 行）。它是全程序唯一改状态的地方，长期膨胀到
+  4700 行，改一处要读的上下文太多。已切出三块，**全部是纯搬移、逻辑零改动**，
+  搬完归一化可见性后逐字节比对过（`search` / `playback` 的 `diff` 输出为空，
+  `navigation` 只差一个尾随空行）：
+
+  | 新模块 | 行数 | 内容 |
+  |---|---|---|
+  | `app/navigation.rs` | 237 | 切页、焦点、选择移动、`go_back` |
+  | `app/playback.rs` | 320 | 起播 / 切歌 / 进度 / 音量 / 静音 / 歌词偏移 |
+  | `app/search.rs` | 142 | 提交搜索、加载更多（含 `SEARCH_MAX_PAGES`） |
+
+  **边界比标题重要。**「播放控制」那一节里挤着五个不属于播放的方法，没有跟着搬走：
+  `sync_mpris` / `sync_tray`（由 `tick()` 每拍调的输出适配器）、`toggle_window`
+  （niri 的 compositor IPC）、`client_for`（全文件共用的客户端构造辅助，6 处调用）、
+  `request_lyric`（结果处理在 `handle_loaded` 里，请求与处理同文件才省上下文）。
+  判断标准是「调用方在哪、结果谁处理」，不是「它写在哪个标题下面」——宁可模块小一点、
+  边界干净，也不为了凑体积把邻居一起搬走。
+
+  **切完之后复查依赖，发现并修掉了一处叶子互依。** `activate()`（Enter 键按
+  `(Tab, Focus)` 决定该搜索、该播放还是该打开）原本跟着「导航」切进了
+  `navigation.rs`，于是 navigation 去调 search 与 playback，`navigation ↔ search`
+  变成双向。`startup_search()`（`--search` 的启动胶水）同理让 search 反向依赖
+  navigation。两者搬回 `update.rs` 的分派层后，依赖变成星形：`update` 单向调用三个
+  模块，`navigation` / `playback` 只回调 `update`，`search` 谁也不调。
+  **搬移等价不代表边界正确——边界错了不报错，只是把耦合从文件里挪到模块之间**，
+  所以每切完一块都要重新数一遍模块调用图。
+
+  代价说明白：Rust 的方法私有性按「写 `impl` 块的模块」算，不是按类型——方法搬走后
+  另一侧调用会报 `E0624`，得逐个改成 `pub(super)`，且**两个方向都要改**。
+  这是拆分的固有成本，不是设计缺陷；编译器会把清单列全。
+
+  剩下的 `cloud.rs` / `settings.rs` 按同样粒度继续，一次一块。规矩与进度记在
+  `docs/MAINTENANCE.md` §1.8。
+
+- **拆 `app/update.rs` 第二轮**（4144 → 2958 行），把上面说的 `cloud.rs` /
+  `settings.rs` 切完了，另加一块 `desktop.rs`。同样是纯搬移：116 个函数逐个比对
+  签名 + 函数体（空白折叠、`pub(super)` 归一化）**全部逐字符存活**，唯一被删的
+  是一份重复的实现（见下面「修复」第一条）。
+
+  | 新模块 | 行数 | 内容 |
+  |---|---|---|
+  | `app/cloud.rs` | 937 | 登录 / 音源切换 / VIP / 云端歌单 / 账号资料 |
+  | `app/settings.rs` | 728 | 设置页：候选值 + 显示文本 + 三个交互 |
+  | `app/desktop.rs` | 106 | MPRIS / 系统托盘 / 窗口控制 |
+  | `app/navigation.rs` | 275 | 另接了数字键与 `v` 键打开音源页 |
+
+  依赖仍是**星形**且没有互相调用的一对：`update` 指向 6 个模块，模块只回指
+  `update` / `mod`。一处**故意接受**的跨模块调用：`navigation` 调 `settings`
+  的 `move_settings`（设置页的光标移动归设置页，理由记在 MAINTENANCE §1.8）。
+
+- **修四处错位的文档注释**。它们的共同症状是「一段注释紧贴在另一个函数的文档
+  前面，被 Rust 并成同一个文档」，于是 `fetch_user_info` 的文档开头讲的是 VIP、
+  `handle_digit` 的文档开头讲的是 `v` 键切换音源、`open_quality_picker` 的开头
+  讲的是下载歌曲、`describe_song` 的开头讲的是音质标签。四处各自归位。
+
+### 新增
+
+- **`scripts/kugou-api.ps1`：Windows 侧的服务管理**（start / stop / restart / status / logs）。
+  此前 Windows 上没有任何办法停掉后台的 node：启动器只做「探活 → 没起就拉起」，
+  想停只能去任务管理器按名字猜着杀，而猜错会把别的 Node 项目一起带走。现在两个平台
+  共用同一套 PID 文件约定（`<PID> <端口>`，空格分隔，落在缓存目录的 `api-<实例>.pid`），
+  启动器拉起的实例，`kugou-api.ps1 stop` 停得掉。
+
+- **`kugou-api logs`**：直接跟随日志（`logs lite` 跟概念版）。此前要看日志得先
+  `status` 拿到路径，再自己 `tail`。
+
+- **启动器补 `--dry-run`**（bash 侧；PowerShell 侧本来就有）：只打印解析到的配置、
+  音源、实例、探测地址、服务目录与二进制路径，不启动任何东西。排查「为什么它说服务
+  没起」时不用再靠猜。
+
+- 启动器在拉起服务前**先查 `node`**。此前没装 Node 要等满 20 秒，再从日志尾部那句
+  `ENOENT` 里推断原因。
+
+- 启动器在 macOS 上会检查二进制的 `com.apple.quarantine` 属性，并给出 `xattr -d`
+  那条命令。签名缺失的二进制被 Gatekeeper 杀掉时终端只显示 `Killed: 9`，看起来像
+  程序自己的 bug。
+
+### 修复
+
+- **歌词译文会整体串位一行**（`api/lyric.rs`）。`parse_lrc` 与 `attach_translations`
+  各写了一份「这一行算不算歌词」的判据：前者看 `parse_krc_words` 的返回值是否为空，
+  后者看 `clean_krc_markup` 是否为空。两者在「`<` 之前有字、却没有配对的 `>`」的行上
+  分道扬镳（歌里写了 `宝贝<3` 这种），于是 `attach_translations` 算出来的行号多出一项，
+  **之后每一行的译文都往后串一位**——用户看到「译文和原文对不上」，没有任何报错。
+
+  现在判据只有一处（`has_lyric_content`），两边都调它。顺带修掉同源的另一个症状：
+  `parse_krc_words` 只输出标记**之后**的字符，所以那一行以前会被整行丢掉——
+  `<` 之前的字也是正文，现在收下（这些字没有逐字时间，于是退回整行高亮）。
+
+  回归测试 `a_line_with_a_stray_angle_bracket_does_not_shift_translations`：
+  去掉修复后它会报 `left: [译1, 译2, 译3]` / `right: [译1, 译3, 译4]`。
+
+- **封面「不变形」模式在一段退化区域上会 panic**（`ui/views/player.rs::fit_box`）。
+  `rows.clamp(1, area.height)` 在 `area.height == 0` 时直接炸——`Ord::clamp` 要求
+  `min <= max`，而 `clamp(1, 0)` 会 `assert!(min <= max)`。
+
+  现在**没有**可复现的触发路径（实测 `render_home` 的布局在 4~24 行之间最低给封面栏
+  4 行，`Min(6)` 优先于 `Length(8)`），但这是布局的巧合而不是这里的保证——
+  封面区的布局本身就改过一次（见那段「之前让封面框按图片比例自己算高度」的注释）。
+  现在退化区域直接返回空矩形：既不 panic，也不会把框撑到区域外面去
+  （硬凑 1×1 会让 `area.width - columns` 当场下溢）。回归测试同时钉住
+  「零尺寸不 panic」与「算出来的框永远不超出区域」。
+
+- **Windows 上的 PowerShell 脚本会满屏乱码**（`scripts/*.ps1`）。四个 `.ps1` 都没有
+  UTF-8 BOM，而 Windows 自带的 Windows PowerShell 5.1 在文件没有 BOM 时**按当前
+  ANSI 代码页解码**——中文 Windows 上是 GBK，于是脚本里那几十条面向用户的中文提示
+  （「找不到 node」「已在运行」……）全变成乱码。
+
+  为什么一直没发现：CI 的 Windows 那栏用的是 `shell: pwsh`，也就是 PowerShell 7，
+  而 7.x 默认按 UTF-8 读——**CI 绿了不代表用户那边正常**。现在四个文件都加上 BOM
+  （只改解码方式，逐字节确认过除开头 3 字节外内容完全没动），并把这条写进
+  `docs/MAINTENANCE.md` §1.7。
+
+- **并发翻页的整表顺序是随机的**（`api/catalog.rs`）。`collect_all_pages` 一批页
+  同时发出去，然后在 `JoinSet::join_next()` 里直接 `all.extend(songs)`——而
+  `join_next()` 给的是**任务完成顺序**，不是页码顺序。于是打开任何超过 6 页
+  （>180 首）的歌单 / 榜单 / 歌手页，整表的页序都是乱的。榜单尤其致命：它的
+  「顺序」就是榜单内容本身，TOP500 被随机排列等于榜单没了。
+
+  现在一批的结果先按页码收进 `collected`，排好序再拼。回归测试用手写的假服务端
+  让页码**必然倒序返回**（第 N 页等 `60ms × (7 - N)`），所以这条不是靠运气过的：
+  去掉排序后它稳定地给出 `h1, h7, h6, h5, h4, h3, h2`。
+
+- **同一首歌上会同时跑两条流式下载**（`audio/download.rs`）。连按两次 Enter 就是
+  两条 `start_streaming` 落在同一个目标上（`App::active_stream` 要等到攒够开头才
+  被握住，中间那段窗口谁也拦不住第二条）。两条流会互相破坏：后开的那次
+  `truncate(true)` 把先写的字节从盘上抹掉（而缓冲窗口之外的数据正是靠 `pread`
+  这个文件读回来，读回空洞就是噪音），失败 / 取消时的 `remove_file` 还会删掉
+  对方的文件，让它改名失败、白下一整首。
+
+  现在 `Downloader` 按临时文件路径登记在跑的流，第二条直接复用第一条的缓冲、
+  不再起任务。顺带把整首下载和流式下载的临时文件分开（`x.mp3.part` 与
+  `x.mp3.stream.part`）——后台预取下一首时，用户完全可能正好切到那一首。
+
+- **音质档位有两种说法**。`app/update.rs` 里另有一份私有的 `quality_label`，只认
+  6 档，比 `app/settings::quality_label` 少了 `viper_atmos` 与 `viper_tape`。于是
+  按快捷键切到那两档时状态栏显示原始串 `viper_atmos`，而设置页同一项显示
+  「蝰蛇全景声」。现在只有一份实现，并加了一条测试：每个可选音质都必须有中文名，
+  不许退回原始串。
+
+- **网易云歌手页的「N 首」是专辑数**。`source/netease.rs` 把 `/top/artists` 的
+  `albumSize` 填进了 `song_count`，而它是专辑数，歌曲数是 `musicSize`。类型正确、
+  语义错误，界面上每个歌手后面都挂着一个错数字且不会有任何异常。改成 `musicSize`，
+  拿不到就不显示（比显示错的强）。
+
+- **分块并发下载会写出内容损坏的缓存文件**（`audio/download.rs`）。分块下载只检查
+  `status.is_success()`，于是服务端（或中间 CDN / 代理）忽略 `Range`、回 `200 OK`
+  加整首内容时也会照写：四个任务各自 `seek(自己的起点)` 再写整首，互相覆盖，得到一个
+  「长度对、内容全错」的文件，还照常改名进缓存——之后每次播放都命中它。
+
+  现在要求三件事同时成立才继续写：状态码必须是 `206`、`Content-Range` 必须能解析、
+  解析出的范围必须**逐字节等于**请求的范围（顺带核对总长度与 HEAD 一致）。任何一条
+  不满足就退回单连接重下——宁可慢一次，不能坏一个缓存文件。
+
+- **不完整的下载会被当成成功**。完成条件此前是「写入的字节数大于 0」，而 `.part`
+  已经 `set_len(total)` 预分配过，文件大小本身就证明不了完整性。现在要求每个块写满
+  自己那一段、总和等于总长度，并在改名之前 `sync_all`；单连接路径在服务端给了
+  `Content-Length` 时也要求收满。
+
+  回归测试用 std 的 `TcpListener` 起了一个最小的 HTTP 服务端（不引新依赖），覆盖
+  正常 206、服务端忽略 Range 回 200、`Content-Range` 与请求不符、传输中断四种情况。
+  把三处防护逐个去掉后，「服务端忽略 Range」那条会返回 4 MiB（真实长度 1 MiB）——
+  也就是修复前那个坏文件。
+
+- **Windows 的发行 zip 里没有 PowerShell 脚本**。`build-windows.ps1` 只拷了三个 bash
+  脚本，而 README 与 `docs/INSTALL.md` 让 Windows 用户跑的正是
+  `.\scripts\kugou-tui.ps1` / `.\scripts\kugou-api-install.ps1`——解压后这些文件不存在，
+  第一步就卡住。现在按「文档提到过的都必须在包里」为准，六份脚本一起带。
+
+- **三个 bash 脚本在 macOS 上跑不起来**。逐条列出，因为每一处都会直接中断脚本：
+
+  - `declare -A`（`kugou-api`、`kugou-api-install`）需要 bash 4，而 macOS 自带的
+    `/bin/bash` 是 3.2——报 `declare: -A: invalid option`，一行都跑不了。改成
+    `case` 分派 + 间接展开。
+  - `readlink -f`（三个脚本）是 GNU 扩展，macOS 的 `readlink` 报
+    `illegal option -- f`。改成逐层解软链（`make-release-tarball` 里早就是这么做的）。
+  - 配置与缓存目录在 macOS 上找错了地方：`dirs` 给的是
+    `~/Library/Application Support` 与 `~/Library/Caches`，而脚本读的是 `~/.config`
+    与 `~/.cache`。后果是启动器永远找不到 `config.toml`，于是永远按默认值（`:3000`、
+    标准版）探活——用概念版音源的人只会看到「服务启动失败」。
+  - `setsid`（util-linux 专有）与 `ss`（iproute2）在 macOS 上不存在，分别退回
+    `nohup` 与 `lsof`。
+  - `seq` 换成 `while` 计数循环。
+
+  > 顺带把「配置根目录」统一到 `KUGOU_TUI_CONFIG_DIR`：PowerShell 侧一直认它，
+  > bash 侧此前只认 XDG 变量。
+
+- 启动器拉起的服务现在会写 PID 文件，`kugou-api stop` / `status` 因此管得到它。
+  此前它是个「孤儿进程」：端口占着，但按 PID 文件停不掉，`status` 只会说
+  「端口有响应，但不是本脚本起的」。
+
+- **迟到的异步结果会污染界面**（`app/update.rs`）。所有请求都是 `tokio::spawn`
+  出去的，回来顺序不保证，而此前只有「播放」那一侧判了身份（`is_current`、
+  歌词/封面比 `hash`）。剩下的路径照单全收，于是：
+
+  - 搜「A」→ 结果还在路上 → 改搜「B」→ A 的结果先到，**把 B 的结果整体覆盖**；
+    点 `M` 加载更多时更糟：A 的歌被追加进 B 的列表，而标题还写着 B。
+  - 打开歌单 A → 用户改开 B → A 的结果先到，右侧变成「标题写着 B、内容是 A」。
+  - 歌手与榜单同理（左列高亮 B、右列是 A 的歌）。
+  - 切歌单广场分类 / 歌手地区筛选时，旧分类的结果会顶掉新分类的列表。
+
+  现在每条结果回来都要先自证身份，不一致直接丢弃；判据抽成 `accepts_search_result`
+  与 `accepts_open_item` 两个自由函数并加了测试（`App` 构造需要音频引擎与运行时，
+  单测里搭不出来，所以判据必须留在能单独测的地方）。
+
+  顺带修掉两个同源的小问题：过期结果不再把正在进行的搜索的「正在搜索…」抹掉
+  （清 `busy` 挪到判据之后）；连按 `M` 不再基于同一个 `page` 各发一次请求
+  （两次结果都追加就是重复的一页，晚到的那条还会让顺序倒过来）。
+
+  身份字段一律在 `spawn` **之前**写进状态（`open_playlist` / `open_artist` /
+  `open_board`），写在结果里就晚了——那条结果永远对不上。判据与清单记在
+  `docs/MAINTENANCE.md` §4 的第 11 条。
+
+### 变更
+
 - **只推 tag 就能发版**。`release.yml` 增加第一个 job `prepare`，由它调用新的
   `scripts/release-notes` 从 `CHANGELOG.md` 取出该版本正文、建好 Release；三个平台
   job 都 `needs: prepare`。

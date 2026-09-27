@@ -67,7 +67,12 @@ fn detect_image_picker() -> ratatui_image::picker::Picker {
     picker
 }
 
+pub mod cloud;
+pub mod desktop;
+pub mod navigation;
+pub mod playback;
 pub mod queue;
+pub mod search;
 pub mod session;
 pub mod settings;
 pub mod state;

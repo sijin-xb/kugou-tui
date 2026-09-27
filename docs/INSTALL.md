@@ -125,18 +125,31 @@ cd kugou-tui-0.4.3-aarch64-apple-darwin
 ## 在 Windows 上构建与运行
 
 Windows 走的是「自己编一份」，但**日常使用已经不用手动起服务了**：
-`scripts/` 下补了三个 PowerShell 脚本，对应 Unix 侧的三个 bash 脚本。
+`scripts/` 下有一套 PowerShell 脚本，对应 Unix 侧的 bash 脚本。
 
 | Windows | Unix 侧对应 | 干什么 |
 |---|---|---|
 | `scripts/kugou-api-install.ps1` | `kugou-api-install` | 拉取接口服务 + 装依赖（只需一次） |
 | `scripts/kugou-tui.ps1` | `kugou-tui` | 启动器：确保服务在跑，然后进播放器 |
+| `scripts/kugou-api.ps1` | `kugou-api` | 服务的启停管理：`start` / `stop` / `restart` / `status` / `logs` |
 | `scripts/build-windows.ps1` | `make-release-tarball` | 构建 + 打包 zip |
 
-> 启动和安装**分开了**（bash 侧是 `kugou-api-install` 顺手把服务拉起来）。
-> 这样「怎么起服务」只有启动器一处实现，两边不会各自漂移。
+> 安装脚本**只做安装**（bash 侧是 `kugou-api-install` 顺手把服务拉起来）：起服务交给
+> 启动器，它每次开播前都会探活、没起就自己拉。这样「日常怎么起服务」只有一处实现。
 >
-> 三个脚本都**只依赖 PowerShell 5.1**（Windows 自带的那版），不需要额外装 pwsh 7。
+> 想手动管服务——停掉后台的 node、看日志、重启——用 `kugou-api.ps1`：
+>
+> ```powershell
+> .\scripts\kugou-api.ps1 status
+> .\scripts\kugou-api.ps1 logs lite
+> .\scripts\kugou-api.ps1 restart
+> ```
+>
+> 它和启动器共用同一套 PID 文件（缓存目录里的 `api-<实例>.pid`，内容是 `<PID> <端口>`），
+> 所以启动器拉起来的实例，它认得出、停得掉。此前 Windows 上想停掉后台的 node 只能去
+> 任务管理器按名字猜着杀，猜错会把别的 Node 项目一起带走。
+>
+> 这几个脚本都**只依赖 PowerShell 5.1**（Windows 自带的那版），不需要额外装 pwsh 7。
 
 ### 1. 装工具链
 
@@ -287,6 +300,22 @@ ALSA 那套依赖，也不需要额外装 CMake（构建脚本在没有 cmake �
 ./scripts/kugou-tui
 ```
 
+> **这些脚本刻意避开了 GNU 专有的东西**，因为 macOS 自带的是 BSD 工具链加 bash 3.2：
+> 不用 `readlink -f`、`dirname --`、`seq`、`setsid`、`ss`、`declare -A`。每一处的
+> 替代写法和原因都写在脚本文件头的「可移植性」一节里，改脚本前先读那段。
+>
+> 目录也对齐了 `dirs` 在 macOS 上的取值（`~/Library/Application Support` 与
+> `~/Library/Caches`，**不是** `~/.config` / `~/.cache`）——不这样对齐的话，启动器会去
+> 找一个永远不存在的 `config.toml`，于是永远按默认端口和默认音源探活。
+>
+> 如果二进制是从浏览器下载的 tar 包里解出来的，它会带 `com.apple.quarantine` 属性，
+> 而包里没有签名——直接跑会被 Gatekeeper 杀掉，终端上只显示 `Killed: 9`，看起来像
+> 程序自己的 bug。启动器会检测到并打印该怎么做；手动来一遍是：
+>
+> ```bash
+> xattr -d com.apple.quarantine ./kugou-tui
+> ```
+
 ### 与 Linux 的差异
 
 | 项目 | macOS 上的表现 |
@@ -384,10 +413,16 @@ ln -s "$PWD/scripts/kugou-tui" "$PWD/scripts/kugou-api" ~/.local/bin/
 ```bash
 kugou-api start     # 启动两个实例（已在跑的会跳过），打印 PID / 日志路径 / 访问地址
 kugou-api status    # 查看状态（运行中会显示 PID；端口被别人占着也会如实说明）
+kugou-api logs      # 跟随日志（默认标准版，`kugou-api logs lite` 跟概念版）
 kugou-api restart   # 先停再起（改了端口/配置后用它）
 kugou-api stop      # 停止（按 PID 精确停止）
 kugou-api help      # 完整说明
 ```
+
+启动器（`kugou-tui`）在服务没起时会自己拉起，并把 PID 写进
+`<缓存目录>/kugou-tui/api-<实例>.pid`（内容 `<PID> <端口>`）——所以它拉起来的实例，
+上面这几条命令也管得到。想先看清楚「它到底在探哪个地址、用哪个配置、找哪个目录」，
+用 `kugou-tui --dry-run`：只打印决策，不启动任何东西。
 
 `start` 之前会做一轮预检，缺什么补什么：`node`、KuGouMusicApi 目录、
 `node_modules`（缺了自动 `npm install --omit=dev`）、客户端二进制（缺了自动
@@ -395,7 +430,9 @@ kugou-api help      # 完整说明
 不想让它碰编译就设 `KUGOU_API_SKIP_BUILD=1`（`stop` / `status` 本来就不触发编译）。
 
 参数按**环境变量 > 配置文件 > 默认值**取值。配置文件是可选的
-`~/.config/kugou-tui/api.env`，每行一个 `KEY=VALUE`：
+`<配置根>/kugou-tui/api.env`——Linux 上是 `~/.config/kugou-tui/api.env`，
+macOS 上是 `~/Library/Application Support/kugou-tui/api.env`，两者都可以用
+`KUGOU_TUI_CONFIG_DIR` 整个覆盖。每行一个 `KEY=VALUE`：
 
 ```bash
 # 临时换端口起一次，不动任何文件

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     kugou-api-install —— 拉取并配置 kugou-tui 依赖的第三方接口服务。
 

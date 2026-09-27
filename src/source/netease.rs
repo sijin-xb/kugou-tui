@@ -721,7 +721,11 @@ fn artist_from_json(value: &Value) -> Option<crate::api::model::Artist> {
                 format!("{url}?param=300y300")
             }
         }),
-        song_count: pick_u32(value, &["albumSize"]),
+        // `song_count` 会被渲染成「N 首」，所以只能取**歌曲数** `musicSize`。
+        // 网易云的 `albumSize` 是专辑数——把它填在这里会让每个歌手后面挂一个
+        // 类型正确、语义错误的数字，而且不会有任何异常暴露。
+        // 拿不到就填 None：副标题会整段省掉，比显示一个错的强。
+        song_count: pick_u32(value, &["musicSize"]),
         follower_count: None,
     })
 }
@@ -788,6 +792,31 @@ pub async fn playlist_tracks_all(client: &ApiClient, playlist_id: &str) -> Resul
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 歌手的「N 首」必须是**歌曲数**，不能是专辑数。
+    ///
+    /// 网易云 `/top/artists` 同时给 `albumSize`（专辑数）和 `musicSize`（歌曲数）。
+    /// 早先这里取的是 `albumSize`，于是每个歌手后面挂着一个类型正确、语义错误的
+    /// 数字——没有任何异常会暴露它，只能靠这条测试钉住。
+    #[test]
+    fn artist_song_count_uses_music_size_not_album_size() {
+        let value = json!({
+            "id": 2116,
+            "name": "陈奕迅",
+            "picUrl": "http://p/x.jpg",
+            "albumSize": 37,
+            "musicSize": 821,
+        });
+        let artist = artist_from_json(&value).expect("应当解析出歌手");
+        assert_eq!(artist.song_count, Some(821), "不能拿专辑数当歌曲数");
+
+        // 没有这个字段时宁可不显示，也不要退回去用专辑数
+        let bare = json!({"id": 1, "name": "x", "albumSize": 9});
+        assert_eq!(
+            artist_from_json(&bare).expect("应当解析出歌手").song_count,
+            None
+        );
+    }
 
     /// HTTP 200 但 code 不是 200 时必须报错——否则界面会谎报「已收藏」。
     #[test]

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# kugou-api —— KuGouMusicApi 服务的启停管理（start / stop / restart / status）。
+# kugou-api —— KuGouMusicApi 服务的启停管理（start / stop / restart / status / logs）。
 #
 # 为什么需要两个实例：酷狗的两个平台是两套独立的鉴权体系，平台由服务端 `platform`
 # 环境变量决定（`lite` = 概念版），而一个 Node 进程只能加载一份配置。所以要同时
@@ -13,11 +13,12 @@
 #   ./scripts/kugou-api stop      # 停止（按 PID 精确停止，不是按名字模糊杀）
 #   ./scripts/kugou-api restart   # 先停再起
 #   ./scripts/kugou-api status    # 查看运行状态、PID、日志路径
+#   ./scripts/kugou-api logs      # 跟随日志（默认 standard，可跟 lite）
 #   ./scripts/kugou-api help      # 打印这份说明
 #
 # 首次使用给执行权限：
 #   chmod +x scripts/kugou-api
-#   # 想全局可用就软链到 PATH 里，脚本用 readlink -f 定位仓库根目录，软链也不跑偏：
+#   # 想全局可用就软链到 PATH 里，脚本自己会解软链找到仓库根目录：
 #   ln -s "$(pwd)/scripts/kugou-api" ~/.local/bin/kugou-api
 #
 # 参数怎么给（优先级：**环境变量 > 配置文件 > 内置默认值**）：
@@ -25,7 +26,9 @@
 #   KUGOU_API_DIR        KuGouMusicApi 的目录        默认 /usr/share/kugou-tui/api/kugou
 #                                                     （软件包提供的只读副本，自带依赖），
 #                                                     没有则退回 ~/KuGouMusicApi
-#   KUGOU_API_LOG_DIR    日志与 PID 文件目录          默认 ${XDG_CACHE_HOME:-~/.cache}/kugou-tui
+#   KUGOU_API_LOG_DIR    日志与 PID 文件目录          默认 <缓存根>/kugou-tui
+#                                                     Linux: ~/.cache/kugou-tui
+#                                                     macOS: ~/Library/Caches/kugou-tui
 #   KUGOU_API_HOST       监听地址                    默认 127.0.0.1
 #   KUGOU_STANDARD_PORT  标准版端口                  默认 3000
 #   KUGOU_LITE_PORT      概念版端口                  默认 3001
@@ -33,27 +36,92 @@
 #                                                     不存在则用 PATH 上的 kugou-tui
 #   KUGOU_API_SKIP_BUILD 设为 1 时跳过编译预检        默认空（会检查并在缺失时编译）
 #
-# 配置文件（可选）：`${XDG_CONFIG_HOME:-~/.config}/kugou-tui/api.env`，
-# 每行一个 `KEY=VALUE`，键名就是上面那些环境变量名。文件里出现未知键会警告并忽略
-# ——不加限制地 source 一个用户文件，等于允许它改写脚本里的任何变量（包括二进制
-# 路径），那是没必要的风险。
+# 配置文件（可选）：`<配置根>/kugou-tui/api.env`，每行一个 `KEY=VALUE`，键名就是
+# 上面那些环境变量名。文件里出现未知键会警告并忽略——不加限制地 source 一个用户
+# 文件，等于允许它改写脚本里的任何变量（包括二进制路径），那是没必要的风险。
 #
 # 例：临时换个端口起一次，不改任何文件
 #   KUGOU_STANDARD_PORT=3100 ./scripts/kugou-api restart
 #
+# 平台：Linux 与 macOS 共用这一份（Windows 侧是 scripts/kugou-api.ps1）。
+#
 set -euo pipefail
+
+# ==================================================================
+# 可移植性：下面每一处写法都是刻意的
+#
+#   readlink -f   GNU 扩展。macOS 的 readlink 直接报 `illegal option -- f`
+#   dirname --    GNU 扩展，BSD 会把 `--` 当成参数本身
+#   seq           GNU coreutils，BSD 环境用 jot
+#   ss            iproute2，macOS 用 lsof
+#   setsid        util-linux，macOS 没有
+#   declare -A    需要 bash 4；macOS 自带的 /bin/bash 是 3.2
+#
+# 仓库里的三个 bash 脚本各自独立分发（AUR 装进 /usr/bin、发行包放进 scripts/、
+# 也有人单独软链到 ~/.local/bin），所以**不做成共享库**：任何一份都得能单独跑起来。
+# 代价是这段在每个脚本里重复一遍，改的时候三处一起改。
+# ==================================================================
+
+is_macos() { [ "$(uname -s 2>/dev/null)" = "Darwin" ]; }
+
+# 脚本自身的真实目录，逐层解开软链（不用 `readlink -f`，理由见上）。
+self_dir() {
+  local target="$1" link
+  while [ -L "$target" ]; do
+    link=$(readlink "$target") || break
+    case "$link" in
+      /*) target="$link" ;;
+      *) target="$(dirname "$target")/$link" ;;
+    esac
+  done
+  cd -P "$(dirname "$target")" && pwd
+}
+
+# 配置根目录 / 缓存根目录。**必须与 Rust 侧 `dirs` crate 给出的一致**：
+#
+#   Linux : config=$XDG_CONFIG_HOME|~/.config   cache=$XDG_CACHE_HOME|~/.cache
+#   macOS : config=~/Library/Application Support   cache=~/Library/Caches
+#           （macOS 上 `dirs` 不读 XDG_* 变量，所以这里也不能读）
+#   Windows: %APPDATA% / %LOCALAPPDATA%（由 PowerShell 脚本负责）
+config_root() {
+  if [ -n "${KUGOU_TUI_CONFIG_DIR:-}" ]; then
+    printf '%s' "$KUGOU_TUI_CONFIG_DIR"
+  elif is_macos; then
+    printf '%s/Library/Application Support' "$HOME"
+  else
+    printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}"
+  fi
+}
+
+cache_root() {
+  if is_macos; then
+    printf '%s/Library/Caches' "$HOME"
+  else
+    printf '%s' "${XDG_CACHE_HOME:-$HOME/.cache}"
+  fi
+}
 
 # ==================================================================
 # 参数解析
 # ==================================================================
 
-CONFIG_FILE="${KUGOU_API_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/kugou-tui/api.env}"
+CONFIG_FILE="${KUGOU_API_CONFIG:-$(config_root)/kugou-tui/api.env}"
 
-# 只认这些键。多出来的键一律警告并忽略（理由见上面注释）。
-KNOWN_KEYS="KUGOU_API_DIR KUGOU_API_LOG_DIR KUGOU_API_HOST KUGOU_STANDARD_PORT KUGOU_LITE_PORT KUGOU_API_BIN KUGOU_API_SKIP_BUILD"
+# 配置文件里只认这些键，多出来的一律警告并忽略（理由见文件头）。
+#
+# 用一组普通变量 + `pick` 里的间接展开，而不是 `declare -A`：关联数组要 bash 4，
+# 而 macOS 自带的 /bin/bash 是 3.2。多写几行换来「在 macOS 上开箱能跑」。
+CFG_KUGOU_API_DIR=""
+CFG_KUGOU_API_LOG_DIR=""
+CFG_KUGOU_API_HOST=""
+CFG_KUGOU_STANDARD_PORT=""
+CFG_KUGOU_LITE_PORT=""
+CFG_KUGOU_API_BIN=""
+CFG_KUGOU_API_SKIP_BUILD=""
 
-declare -A CFG=()
-if [ -r "$CONFIG_FILE" ]; then
+load_config() {
+  [ -r "$CONFIG_FILE" ] || return 0
+  local key value
   while IFS='=' read -r key value || [ -n "$key" ]; do
     # 跳过空行与注释
     case "$key" in
@@ -67,29 +135,42 @@ if [ -r "$CONFIG_FILE" ]; then
     value="${value%\"}"
     value="${value#\'}"
     value="${value%\'}"
-    case " $KNOWN_KEYS " in
-      *" $key "*) CFG["$key"]="$value" ;;
+    case "$key" in
+      KUGOU_API_DIR) CFG_KUGOU_API_DIR="$value" ;;
+      KUGOU_API_LOG_DIR) CFG_KUGOU_API_LOG_DIR="$value" ;;
+      KUGOU_API_HOST) CFG_KUGOU_API_HOST="$value" ;;
+      KUGOU_STANDARD_PORT) CFG_KUGOU_STANDARD_PORT="$value" ;;
+      KUGOU_LITE_PORT) CFG_KUGOU_LITE_PORT="$value" ;;
+      KUGOU_API_BIN) CFG_KUGOU_API_BIN="$value" ;;
+      KUGOU_API_SKIP_BUILD) CFG_KUGOU_API_SKIP_BUILD="$value" ;;
       *)
         printf '\033[33m配置 %s 里有未知键「%s」，已忽略\033[0m\n' \
           "$CONFIG_FILE" "$key" >&2
         ;;
     esac
   done <"$CONFIG_FILE"
-fi
+}
+load_config
 
-# 取值：环境变量 > 配置文件 > 默认值
+# 取值：环境变量 > 配置文件 > 默认值。配置值按 `CFG_<变量名>` 找。
 pick() {
-  local env_name="$1" default="$2" value
+  local env_name="$1" default="$2" value cfg_name cfg_value
   value="${!env_name:-}"
   if [ -n "$value" ]; then
     printf '%s' "$value"
-  else
-    printf '%s' "${CFG[$env_name]:-$default}"
+    return
   fi
+  cfg_name="CFG_$env_name"
+  cfg_value="${!cfg_name:-}"
+  if [ -n "$cfg_value" ]; then
+    printf '%s' "$cfg_value"
+    return
+  fi
+  printf '%s' "$default"
 }
 
-self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
-repo_dir=$(dirname -- "$self_dir")
+self_dir_path=$(self_dir "${BASH_SOURCE[0]}")
+repo_dir=$(dirname "$self_dir_path")
 
 # 客户端二进制在哪。
 #
@@ -129,7 +210,7 @@ is_system_api_dir() {
 }
 
 API_DIR="$(pick KUGOU_API_DIR "$(default_api_dir)")"
-LOG_DIR="$(pick KUGOU_API_LOG_DIR "${XDG_CACHE_HOME:-$HOME/.cache}/kugou-tui")"
+LOG_DIR="$(pick KUGOU_API_LOG_DIR "$(cache_root)/kugou-tui")"
 HOST="$(pick KUGOU_API_HOST 127.0.0.1)"
 STANDARD_PORT="$(pick KUGOU_STANDARD_PORT 3000)"
 LITE_PORT="$(pick KUGOU_LITE_PORT 3001)"
@@ -149,12 +230,22 @@ alive() { curl -sf --max-time 2 -o /dev/null "http://$HOST:$1/" 2>/dev/null; }
 
 # 监听该端口的进程 PID；没人监听就返回空。
 #
-# ss 的输出形如 `LISTEN 0 511 *:3001 *:* users:(("node",pid=101898,fd=21))`，
-# 所以先按端口筛行，再从 users 段里抠出 pid。
+# Linux 用 `ss`（iproute2），macOS 没有它——那边用 `lsof`。两条都留着：`ss` 的
+# 输出更稳定，而 macOS 上只能靠 lsof。缺了这一步，macOS 上 `stop` 会在
+# 「PID 文件丢了但端口还活着」时查不到 PID，只能放弃。
 port_pid() {
-  ss -ltnp 2>/dev/null |
-    grep -E "[:.]$1([[:space:]]|$)" |
-    grep -oE 'pid=[0-9]+' | head -n 1 | cut -d= -f2
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    # ss 的输出形如 `LISTEN 0 511 *:3001 *:* users:(("node",pid=101898,fd=21))`，
+    # 所以先按端口筛行，再从 users 段里抠出 pid。
+    ss -ltnp 2>/dev/null |
+      grep -E "[:.]$port([[:space:]]|$)" |
+      grep -oE 'pid=[0-9]+' | head -n 1 | cut -d= -f2
+    return
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -n 1
+  fi
 }
 
 pid_file() { printf '%s/api-%s.pid' "$LOG_DIR" "$1"; }
@@ -267,7 +358,7 @@ ensure_log_dir() {
 
 start_one() {
   local name="$1" port="$2" platform_flag="$3"
-  local pidf log running_pid recorded_port
+  local pidf log running_pid recorded_port pid
   pidf="$(pid_file "$name")"
   log="$(log_file "$name")"
   running_pid="$(pid_of "$pidf")"
@@ -305,28 +396,34 @@ start_one() {
   # 两个都给（环境变量 + 命令行参数），因为 KuGouMusicApi 认 `--port=`。
   # 用 shell 内联赋值而不是 `env` 命令：后者在值为空时会直接报错。
   #
-  # `exec setsid` 是关键：把子 shell 直接替换成 node，这样 `$!` 拿到的就是
-  # node 自己的 PID；否则 PID 文件里记的是 setsid / nohup 那一层，
-  # stop 时 kill 了也停不掉真正的服务。
+  # `exec` 是关键：它让子 shell 被 node 取代，这样 `$!` 拿到的就是 node 自己的
+  # PID；否则 PID 文件里记的是子 shell / setsid 那一层，stop 时 kill 了也停不掉
+  # 真正的服务。
+  #
+  # setsid 是 util-linux 专有的，macOS 没有。那边退回 nohup——仍在同一会话，
+  # 但足以活过启动它的终端（差别只在终端关闭时的信号处理）。
   if command -v setsid >/dev/null 2>&1; then
     (
-      cd "$API_DIR"
-      exec setsid env PORT="$port" node app.js --port="$port" \
-        ${platform_flag:+$platform_flag} >>"$log" 2>&1 </dev/null
+      cd "$API_DIR" &&
+        exec setsid env PORT="$port" node app.js --port="$port" \
+          ${platform_flag:+$platform_flag} >>"$log" 2>&1 </dev/null
     ) &
   else
     (
-      cd "$API_DIR"
-      exec env PORT="$port" node app.js --port="$port" \
-        ${platform_flag:+$platform_flag} >>"$log" 2>&1 </dev/null
+      cd "$API_DIR" &&
+        exec nohup env PORT="$port" node app.js --port="$port" \
+          ${platform_flag:+$platform_flag} >>"$log" 2>&1 </dev/null
     ) &
   fi
-  local pid=$!
+  pid=$!
   printf '%s %s' "$pid" "$port" >"$pidf"
 
-  for _ in $(seq 1 40); do
+  # 等就绪：40 × 0.5 秒。不用 `seq`（GNU coreutils，BSD 环境没有）。
+  local attempt=0
+  while [ "$attempt" -lt 40 ]; do
     sleep 0.5
     alive "$port" && break
+    attempt=$((attempt + 1))
   done
 
   if ! alive "$port"; then
@@ -344,16 +441,17 @@ start_one() {
 
 stop_one() {
   local name="$1" port="$2"
-  local pidf pid
+  local pidf pid attempt=0
   pidf="$(pid_file "$name")"
   pid="$(pid_of "$pidf")"
 
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     kill "$pid" 2>/dev/null || true
     # 给一点时间退出；还在就升级到 -9
-    for _ in $(seq 1 20); do
+    while [ "$attempt" -lt 20 ]; do
       kill -0 "$pid" 2>/dev/null || break
       sleep 0.25
+      attempt=$((attempt + 1))
     done
     if kill -0 "$pid" 2>/dev/null; then
       kill -9 "$pid" 2>/dev/null || true
@@ -466,6 +564,21 @@ case "${1:-start}" in
       rest="${entry#*:}"
       status_one "$name" "${rest%%:*}"
     done
+    ;;
+
+  logs)
+    # 跟着日志看服务在说什么。`kugou-api logs` 跟标准版，`logs lite` 跟概念版。
+    # 服务起来之后最常见的两个问题（端口被占、平台没传对）在日志里一眼能看出来，
+    # 而在此之前用户得自己去翻 status 打印的那条路径。
+    instance="${2:-standard}"
+    case "$instance" in
+      standard | lite) ;;
+      *) die "未知实例：$instance（可用：standard / lite）" ;;
+    esac
+    log="$(log_file "$instance")"
+    [ -f "$log" ] || die "日志还不存在：$log（这个实例还没起过？先 kugou-api start）"
+    printf '跟随 %s（Ctrl-C 退出）\n' "$log"
+    tail -n 40 -f "$log"
     ;;
 
   help | -h | --help)

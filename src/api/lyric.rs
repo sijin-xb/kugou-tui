@@ -197,12 +197,15 @@ pub fn parse_lrc(text: &str) -> Lyric {
             continue;
         }
 
+        // 「这行算不算歌词」只在这里判断一次，判据是 `has_lyric_content`——
+        // `attach_translations` 用的是同一个函数。两边各判一次就会串位。
+        if !has_lyric_content(remainder) {
+            continue;
+        }
+
         // 逐字时间戳是相对**本行起始**的，所以每个重复时间标签都要各解析一次
         for time_ms in timestamps {
             let (content, words) = parse_krc_words(remainder, time_ms);
-            if content.is_empty() {
-                continue;
-            }
             lines.push(LyricLine {
                 time_ms,
                 text: content,
@@ -318,6 +321,16 @@ fn parse_krc_words(text: &str, line_start_ms: u64) -> (String, Vec<LyricWord>) {
     // （MoeKoeMusic 也是把 `Jay` 当一个单元整体高亮）。
     let mut rest = text;
     while let Some(open) = rest.find('<') {
+        // 标记**之前**的字符也是正文。KRC 的标准写法里这里是空的（每行以标记开头），
+        // 但歌里出现「有 `<` 却没有配对 `>`」的文本时（比如 `宝贝<3`），不收下就会
+        // 把这一行的字整段丢掉——那一行会直接不显示。
+        //
+        // 这些字没有逐字时间（标记缺失），所以下面那条「字数与标记数必须一致」的
+        // 检查会把 `words` 清空，退回整行高亮。这正是想要的行为。
+        for character in rest[..open].chars() {
+            output.push(character);
+        }
+
         let after_open = &rest[open + 1..];
         let Some(close) = after_open.find('>') else {
             break;
@@ -353,6 +366,25 @@ fn parse_krc_words(text: &str, line_start_ms: u64) -> (String, Vec<LyricWord>) {
         words.clear();
     }
     (trimmed, words)
+}
+
+/// 一行时间标签之后的文本算不算「有内容」。
+///
+/// # 判据只能有一处
+///
+/// `parse_lrc`（决定哪些行进 `Lyric`）与 `attach_translations`（算这些行在**原始定时行**
+/// 里的序号，好去语言轨里取译文）必须用**同一个**判据。两边筛掉的行不一样，序号就会
+/// 整体错开一位，之后每一行的译文都往后串——用户看到「译文和原文对不上」，没有任何报错。
+///
+/// 曾经是两处各写一份：这边看 `clean_krc_markup` 的结果，那边看 `parse_krc_words`
+/// 的返回值。在「`<` 之前有字、却没有配对的 `>`」的行上（比如歌里写了 `宝贝<3`）
+/// 两者分道扬镳，译文整体串位。回归测试见
+/// `a_line_with_a_stray_angle_bracket_does_not_shift_translations`。
+///
+/// 现在两边都调这一个函数，`parse_lrc` 不再自己看 `parse_krc_words` 的输出。
+/// **这条不变量要守住**：任何一边自己判断「这行算不算数」，串位就会回来。
+fn has_lyric_content(remainder: &str) -> bool {
+    !clean_krc_markup(remainder).is_empty()
 }
 
 /// 去掉 KRC 的内联标记 `<起始偏移,持续时长,0>`。
@@ -514,7 +546,9 @@ fn attach_translations(lyric: &mut Lyric, krc_text: &str) {
         }
         let ordinal = timed_seen;
         timed_seen += 1;
-        if !clean_krc_markup(remainder).is_empty() {
+        // 判据必须与 `parse_lrc` 一致，否则下面的 `ordinals` 会错位——
+        // 见 `has_lyric_content` 的说明
+        if has_lyric_content(remainder) {
             ordinals.push(ordinal);
         }
     }
@@ -622,6 +656,60 @@ mod tests {
             lyric.lines[0].romanization.as_deref(),
             Some("na ga re te ku to ki no na ka de de mo"),
             "没有中文轨时，音译位应放罗马音"
+        );
+    }
+
+    /// **回归测试**：`parse_lrc` 与 `attach_translations` 必须用**同一个**判据判断
+    /// 「这一行算不算歌词」，否则译文会整体串位。
+    ///
+    /// 两处原本各写了一份：`parse_lrc` 看 `parse_krc_words(...)` 的返回值是否为空，
+    /// `attach_translations` 看 `clean_krc_markup(...)` 是否为空。绝大多数输入上两者一致，
+    /// 但只要出现一行「`<` 之前有字、却没有配对的 `>`」的歌词（比如歌里写了 `宝贝<3`），
+    /// 两者就分道扬镳：`parse_krc_words` 只输出**标记之后**的字符，所以那行整行算空、
+    /// 被丢掉；`clean_krc_markup` 只按深度过滤，`<` 前面的字照样留下，所以那行算有内容。
+    /// 于是 `ordinals` 多出一项，**之后每一行的译文都往后串一位**——用户看到的是
+    /// 「译文和原文对不上」，而且没有任何报错。
+    ///
+    /// 这条测试同时钉住两件事：那一行不再被丢掉（`<` 之前的字是正文），
+    /// 以及剩下的行与译文逐行对齐（中间那行空行仍然会被跳过）。
+    #[test]
+    fn a_line_with_a_stray_angle_bracket_does_not_shift_translations() {
+        use base64::Engine;
+
+        let payload = r#"{"content":[
+            {"language":0,"type":2,"lyricContent":[
+                ["","译1"],["","译2"],["","译3"],["","译4"]
+            ]}
+        ]}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+        let krc = format!(
+            "[id:1]\n[language:{encoded}]\n\
+             [0,1000]第一句\n\
+             [1000,1000]   \n\
+             [2000,1000]宝贝<3\n\
+             [3000,1000]第四句\n"
+        );
+
+        let mut lyric = parse_lrc(&krc);
+        attach_translations(&mut lyric, &krc);
+
+        let texts: Vec<&str> = lyric.lines.iter().map(|line| line.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["第一句", "宝贝", "第四句"],
+            "空行该跳过；`宝贝<3` 这一行的字是正文，不该丢"
+        );
+
+        // 关键：剩下三行拿到的译文必须与它们在**原始定时行**里的位置对应
+        let translations: Vec<Option<&str>> = lyric
+            .lines
+            .iter()
+            .map(|line| line.translation.as_deref())
+            .collect();
+        assert_eq!(
+            translations,
+            vec![Some("译1"), Some("译3"), Some("译4")],
+            "译文串位了：宝贝那一行应当拿第 3 条译文"
         );
     }
 

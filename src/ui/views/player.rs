@@ -582,6 +582,15 @@ fn stretch_to(image: &image::DynamicImage, (width, height): (u32, u32)) -> image
 
 /// 在 `area` 里找出与图片像素比例一致的最大矩形，居中放置。
 fn fit_box(image: &image::DynamicImage, area: Rect, font: FontSize) -> Rect {
+    // 退化区域直接返回空矩形。**不能省这一步**：下面的 `clamp(1, area.height)`
+    // 在 `area.height == 0` 时会 panic（`Ord::clamp` 要求 `min <= max`），
+    // 而硬凑成 1×1 又会把框撑到区域外面去（`area.width - columns` 当场下溢）。
+    // 现在 `render_home` 的布局恰好不会产出 0 行的封面区（`Min(6)` 优先于
+    // `Length(8)`，实测 4~24 行时最低给到 4），但那是布局的巧合，不是这里的保证。
+    if area.width == 0 || area.height == 0 {
+        return Rect::new(area.x, area.y, 0, 0);
+    }
+
     let image_aspect = image.width().max(1) as f32 / image.height().max(1) as f32;
     // 单元格是「高 : 宽 = font.height : font.width」，换算成列数要乘上去
     let cell_aspect = f32::from(font.height) / f32::from(font.width.max(1));
@@ -1314,6 +1323,69 @@ mod tests {
             cropped > fitted,
             "铺满模式应当比完整显示覆盖得更广：crop={cropped} fit={fitted}"
         );
+    }
+
+    /// 端到端复现：**宽而矮**的终端 + 「不变形」铺满方式。
+    #[test]
+    fn render_home_in_a_short_wide_area_does_not_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        for height in 4..=12u16 {
+            let mut state = AppState::new(crate::config::Config::default());
+            state.picker = Some(ratatui_image::picker::Picker::halfblocks());
+            state.config.cover_fill = CoverFill::Fit;
+            state.current = Some(crate::api::model::Song::default());
+            state.cover.set_image(
+                "x".to_string(),
+                image::DynamicImage::ImageRgb8(image::RgbImage::new(64, 64)),
+                1.0,
+            );
+
+            let area = Rect::new(0, 0, 62, height);
+            let theme =
+                crate::ui::theme::Theme::for_config(crate::ui::theme::ThemeName::default(), false);
+            let mut terminal =
+                Terminal::new(TestBackend::new(62, height.max(1))).expect("测试后端可用");
+            terminal
+                .draw(|frame| render_home(frame, area, &mut state, &theme))
+                .unwrap_or_else(|error| panic!("{height} 行时渲染失败：{error}"));
+        }
+    }
+
+    /// 零高度 / 零宽度的封面区不能 panic。
+    ///
+    /// **回归测试**：`fit_box` 里那句 `rows.clamp(1, area.height)` 在
+    /// `area.height == 0` 时会炸——`Ord::clamp` 要求 `min <= max`，
+    /// 而 `clamp(1, 0)` 直接 `assert!(min <= max)`。触发路径很普通：
+    /// 终端**宽而矮**（比如 100×8）时，宽屏分支要求 `inner.width >= 60`，
+    /// 而高度那一路 `Layout::vertical([Min(6), Length(ACCOUNT_HEIGHT)])` 在空间
+    /// 不够时会把封面那一栏压到 0 行，`panel().inner()` 再减掉边框就还是 0。
+    ///
+    /// 另外两种铺满方式（`Crop` / `Stretch`）走 `pixel_size`，那里有 `.max(1)`，
+    /// 所以只有 `Fit` 会炸——也正是用户得先在设置里选「不变形」才会撞上，
+    /// 默认的 `Crop` 不会。
+    #[test]
+    fn fit_box_tolerates_a_degenerate_area() {
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(64, 64));
+        let font = FontSize::new(10, 20);
+
+        // 高度为 0：修复前这里 panic
+        let _ = fit_box(&image, Rect::new(0, 0, 34, 0), font);
+        // 宽度为 0
+        let _ = fit_box(&image, Rect::new(0, 0, 0, 11), font);
+        // 两者都是 0
+        let _ = fit_box(&image, Rect::new(0, 0, 0, 0), font);
+
+        // 走完整路径也要安全（`Fit` 是唯一会碰 `fit_box` 的分支）
+        for (width, height) in [(34, 0), (0, 11), (0, 0)] {
+            let (_, area) =
+                prepare_cover(&image, Rect::new(0, 0, width, height), font, CoverFill::Fit);
+            assert!(
+                area.width <= width && area.height <= height,
+                "算出来的框不能超出区域：{area:?} 不在 {width}x{height} 里"
+            );
+        }
     }
 
     /// 区域变了才重新编码；区域不变时**一帧都不重编**。

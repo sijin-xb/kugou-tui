@@ -94,7 +94,11 @@ pub enum Loaded {
         append: bool,
     },
     /// 歌单广场 / 搜索结果里的歌单列表。
+    ///
+    /// `category` 是这次请求的分类 id。带上它只为了一件事：结果回来时判断它还是
+    /// 不是当前分类要的（用户可能已经切了分类，见 `App::handle_loaded` 里的判据）。
     Playlists {
+        category: i64,
         title: String,
         items: Vec<Playlist>,
     },
@@ -103,7 +107,12 @@ pub enum Loaded {
         songs: Vec<Song>,
         source: PlaylistSource,
     },
-    Artists(Vec<Artist>),
+    /// 歌手列表。`kind` 是这次请求的地区筛选（0 全部 / 1 华语 / 2 欧美 / 3 日韩），
+    /// 用途同 [`Self::Playlists`] 的 `category`。
+    Artists {
+        kind: i64,
+        artists: Vec<Artist>,
+    },
     ArtistSongs {
         artist: Artist,
         songs: Vec<Song>,
@@ -268,7 +277,7 @@ impl Loaded {
             Self::Search { .. }
                 | Self::Playlists { .. }
                 | Self::PlaylistTracks { .. }
-                | Self::Artists(_)
+                | Self::Artists { .. }
                 | Self::ArtistSongs { .. }
                 | Self::RankBoards(_)
                 | Self::RankTracks { .. }

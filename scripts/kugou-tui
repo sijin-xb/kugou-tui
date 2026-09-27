@@ -9,15 +9,82 @@
 # 用法：
 #   kugou-tui                 # 打开播放器
 #   kugou-tui -s 海阔天空      # 启动即搜索（其余参数原样透传）
+#   kugou-tui --dry-run       # 只打印决策，不启动任何东西（排查「为什么说服务没起」）
 #   KUGOU_API_BASE=http://other:3000 kugou-tui
+#
+# 平台：Linux 与 macOS 共用这一份（Windows 侧是 scripts/kugou-tui.ps1）。
 #
 set -euo pipefail
 
-API_LOG="${KUGOU_API_LOG:-${XDG_CACHE_HOME:-$HOME/.cache}/kugou-tui/api.log}"
+# ==================================================================
+# 可移植性：下面每一处写法都是刻意的
+#
+# 这个脚本在 Linux 与 macOS 上跑同一份。BSD 与 GNU 的差异踩过一遍了，
+# 每处都对应一个具体差异，**不要「顺手简化」回去**：
+#
+#   readlink -f   GNU 扩展。macOS 的 readlink 直接报 `illegal option -- f`
+#   dirname --    GNU 扩展，BSD 会把 `--` 当成参数本身
+#   seq           GNU coreutils，BSD 环境用 jot
+#   setsid        util-linux，macOS 没有
+#   declare -A    需要 bash 4；macOS 自带的 /bin/bash 是 3.2
+#   ${arr[@]}     空数组在 bash 3.2 + `set -u` 下会报 unbound variable
+#
+# 仓库里的三个 bash 脚本各自独立分发（AUR 装进 /usr/bin、发行包放进 scripts/、
+# 也有人单独软链到 ~/.local/bin），所以**不做成共享库**：任何一份都得能单独跑起来。
+# 代价是这段在每个脚本里重复一遍，改的时候三处一起改。
+# ==================================================================
+
+is_macos() { [ "$(uname -s 2>/dev/null)" = "Darwin" ]; }
+
+# 脚本自身的真实路径，逐层解开软链。
+#
+# 不用 `readlink -f`（理由见上），也不用 `realpath`（同样是 GNU/coreutils 扩展，
+# 老系统上没有）。循环解软链在任何 POSIX shell 上都能跑。
+self_path() {
+  local target="$1" link
+  while [ -L "$target" ]; do
+    link=$(readlink "$target") || break
+    case "$link" in
+      /*) target="$link" ;;
+      *) target="$(dirname "$target")/$link" ;;
+    esac
+  done
+  printf '%s/%s' "$(cd -P "$(dirname "$target")" && pwd)" "$(basename "$target")"
+}
+
+# 配置根目录。**必须与 Rust 侧 `dirs::config_dir()` 给出的一致**：
+#
+#   Linux : $XDG_CONFIG_HOME 或 ~/.config
+#   macOS : ~/Library/Application Support —— `dirs` 在 macOS 上**不读** XDG_*
+#   （Windows 由 PowerShell 那侧负责：%APPDATA%）
+#
+# 不一致的后果很实在：macOS 上会去 ~/.config 找一个永远不存在的 config.toml，
+# 于是永远按默认值（:3000、标准版）探活——用概念版音源的人只会看到「服务启动失败」。
+config_root() {
+  if [ -n "${KUGOU_TUI_CONFIG_DIR:-}" ]; then
+    printf '%s' "$KUGOU_TUI_CONFIG_DIR"
+  elif is_macos; then
+    printf '%s/Library/Application Support' "$HOME"
+  else
+    printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}"
+  fi
+}
+
+# 缓存根目录，同样对齐 `dirs::cache_dir()`：macOS 是 ~/Library/Caches。
+cache_root() {
+  if is_macos; then
+    printf '%s/Library/Caches' "$HOME"
+  else
+    printf '%s' "${XDG_CACHE_HOME:-$HOME/.cache}"
+  fi
+}
+
+CACHE_DIR="$(cache_root)/kugou-tui"
+API_LOG="${KUGOU_API_LOG:-$CACHE_DIR/api.log}"
 
 # 配置文件路径。全新安装（还没跑过客户端）时它并不存在，所以下面每一处读取
 # 都必须容忍这一点。
-config_file="${XDG_CONFIG_HOME:-$HOME/.config}/kugou-tui/config.toml"
+config_file="$(config_root)/kugou-tui/config.toml"
 
 # 读配置里的 `sources.active`（值形如 `kugou` / `kugou_concept`）。读不到就输出空，
 # 调用方按标准版处理——那也是服务端的默认值。
@@ -52,27 +119,38 @@ prefer_system_api_dir() {
   fi
 }
 
+# 实例名（standard / lite）—— 与 `scripts/kugou-api` 的实例名、PID 文件命名保持一致。
+# 这样启动器拉起来的服务，`kugou-api status` 看得见、`kugou-api stop` 停得掉。
 case "$ACTIVE_SOURCE" in
   netease)
     API_DIR="${NETEASE_API_DIR:-$(prefer_system_api_dir netease "$HOME/NeteaseCloudMusicApi")}"
     SERVICE_NAME="NeteaseCloudMusicApi"
+    INSTANCE_NAME="standard"
+    ;;
+  kugou_concept)
+    API_DIR="${KUGOU_API_DIR:-$(prefer_system_api_dir kugou "$HOME/KuGouMusicApi")}"
+    SERVICE_NAME="KuGouMusicApi"
+    INSTANCE_NAME="lite"
     ;;
   *)
     API_DIR="${KUGOU_API_DIR:-$(prefer_system_api_dir kugou "$HOME/KuGouMusicApi")}"
     SERVICE_NAME="KuGouMusicApi"
+    INSTANCE_NAME="standard"
     ;;
 esac
 
+PID_FILE="$CACHE_DIR/api-$INSTANCE_NAME.pid"
+
 # 定位二进制：优先环境变量，其次脚本所在仓库的 target/release，最后 PATH。
 #
-# 用 readlink -f 解析软链接，这样把脚本软链到 ~/.local/bin 也能找对地方。
+# 解析软链接，这样把脚本软链到 ~/.local/bin 也能找对地方。
 # 但脚本被**装到**（而不是软链到）`/usr/bin` 时，`../target/release` 会指向
 # `/usr/target/...`，必然不存在——发行版打包走的就是这条路，所以要有 PATH 这一层。
 if [ -n "${KUGOU_TUI_BIN:-}" ]; then
   BIN="$KUGOU_TUI_BIN"
 else
-  self_path=$(readlink -f -- "${BASH_SOURCE[0]}")
-  BIN="$(dirname -- "$self_path")/../target/release/kugou-tui"
+  self_path_value=$(self_path "${BASH_SOURCE[0]}")
+  BIN="$(dirname "$self_path_value")/../target/release/kugou-tui"
   if [ ! -x "$BIN" ]; then
     BIN="$(command -v kugou-tui 2>/dev/null || printf '%s' "$BIN")"
   fi
@@ -83,6 +161,16 @@ if [ ! -x "$BIN" ]; then
   printf '从源码跑的话先编译：cargo build --release\n' >&2
   printf '已经装过包的话，用 KUGOU_TUI_BIN 指向 kugou-tui 的实际路径。\n' >&2
   exit 1
+fi
+
+# macOS 的 Gatekeeper：从浏览器下载的 tar 包会带上 com.apple.quarantine，
+# 而包里的二进制没有签名，直接跑会被系统杀掉——终端上只看到 `Killed: 9`，
+# 没有任何解释，很容易被当成程序 bug。这里主动检查并把那条命令摆出来。
+if is_macos && command -v xattr >/dev/null 2>&1; then
+  if xattr "$BIN" 2>/dev/null | grep -qx 'com\.apple\.quarantine'; then
+    printf '\033[33m%s 带着 macOS 隔离属性，直接运行会被系统杀掉。\033[0m\n' "$BIN" >&2
+    printf '先执行这条（只需一次）：xattr -d com.apple.quarantine "%s"\n' "$BIN" >&2
+  fi
 fi
 
 # 健康检查用的地址。
@@ -128,14 +216,14 @@ fi
 API_PORT=$(printf '%s' "$CHECK_BASE" | sed -n 's#.*:\([0-9]\{1,\}\).*#\1#p')
 API_PORT="${API_PORT:-3000}"
 
-# 平台（`lite` = 概念版）跟着当前音源走。`ACTIVE_SOURCE` 上面已经取过，这里不重复读。
+# 平台（`lite` = 概念版）跟着当前音源走。
 case "$ACTIVE_SOURCE" in
   kugou_concept) API_PLATFORM="lite" ;;
   *) API_PLATFORM="" ;;
 esac
 
 # 用本地静态页做健康检查：/register/dev 会真的去请求酷狗服务器（冷缓存时 1 秒以上），
-# 而 `/` 由 express.static 直接吐出来，是纯本地操作。顺手校验内容，确认监听的是本服务。
+# 而 `/` 由 express.static 直接吐出来，是纯本地操作。
 # 只判断「这个地址有没有服务在听」，**不校验响应内容**。
 #
 # 早先这里要求响应里含「酷狗」二字：KuGouMusicApi 的首页确实有，但网易云、
@@ -143,10 +231,55 @@ esac
 # 撞上端口占用（EADDRINUSE）。探活就该只探活。
 api_alive() { curl -sf --max-time 2 -o /dev/null "$CHECK_BASE/" 2>/dev/null; }
 
+# ==================================================================
+# 参数：摘掉脚本自己的开关，其余原样透传给播放器
+#
+# `--dry-run` 与 PowerShell 侧同名（那边还有 -DryRun），两个平台一套记法。
+# ==================================================================
+DRY_RUN="${KUGOU_TUI_DRY_RUN:-}"
+PLAYER_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run | -DryRun) DRY_RUN=1 ;;
+    *) PLAYER_ARGS+=("$arg") ;;
+  esac
+done
+
+# 空数组在 bash 3.2（macOS 自带的那版）+ `set -u` 下展开会报 unbound variable，
+# 所以要写成 `${PLAYER_ARGS[@]+"${PLAYER_ARGS[@]}"}`。下面的 exec 都这么用。
+if [ -n "$DRY_RUN" ]; then
+  printf '\033[36m--- dry-run：只打印决策，不启动任何东西 ---\033[0m\n'
+  printf '配置文件    : %s\n' "$config_file"
+  printf '当前音源    : %s%s\n' "${ACTIVE_SOURCE:-kugou}" \
+    "$([ -n "$ACTIVE_SOURCE" ] || printf '（默认）')"
+  printf '实例        : %s（PID 文件 %s）\n' "$INSTANCE_NAME" "$PID_FILE"
+  printf '探测地址    : %s（端口 %s%s）\n' \
+    "$CHECK_BASE" "$API_PORT" "${API_PLATFORM:+，平台 $API_PLATFORM}"
+  printf '服务目录    : %s\n' "$API_DIR"
+  printf '服务日志    : %s\n' "$API_LOG"
+  printf '播放器      : %s\n' "$BIN"
+  printf '透传参数    : %s\n' "${PLAYER_ARGS[*]-}"
+  if api_alive; then
+    printf '服务在跑吗  : 在跑\n'
+  else
+    printf '服务在跑吗  : 没起\n'
+  fi
+  exit 0
+fi
+
 if ! api_alive; then
   if [ ! -d "$API_DIR" ]; then
     printf '\033[33m%s 未运行，且目录不存在：%s\033[0m\n' "$SERVICE_NAME" "$API_DIR" >&2
     printf '先执行：\n  kugou-api-install %s\n' "${ACTIVE_SOURCE:-kugou}" >&2
+    exit 1
+  fi
+
+  # node 先查一遍再起。少了这一步，失败要等满 20 秒才从日志尾部看出来，
+  # 而日志里那句 ENOENT 对不熟的人等于没说。
+  if ! command -v node >/dev/null 2>&1; then
+    printf '\033[31m找不到 node，%s 起不来。\033[0m\n' "$SERVICE_NAME" >&2
+    printf '装一个 Node.js（>= 18）：https://nodejs.org\n' >&2
+    printf '装完再跑一次这条命令即可，不需要别的操作。\n' >&2
     exit 1
   fi
 
@@ -163,40 +296,64 @@ if ! api_alive; then
   #
   # 两个都给对两种服务都无害：认参数的用参数，认环境的用环境。
   #
-  # 这里用 shell 内联赋值（`PORT=... cmd`）而不是 `env` 命令：后者在值为空时会报错。
-  # setsid 让服务脱离当前会话，避免终端或父进程退出时被一起回收；没有就退回 nohup。
+  # 用 shell 内联赋值（`PORT=... cmd`）而不是 `env` 命令：后者在值为空时会报错。
+  #
+  # `exec` 是关键：它让子 shell 被 node 取代，于是 `$!` 拿到的就是 node 自己的
+  # PID，而不是子 shell / setsid 那一层的。PID 要写进文件给 `kugou-api stop` 用，
+  # 记错了就停不掉真正的服务。
+  #
+  # setsid 让服务脱离当前会话（util-linux 专有，macOS 没有），没有它就用 nohup
+  # 顶住 SIGHUP——效果差一点（仍在同一会话），但足够活过启动它的那个终端。
   if command -v setsid >/dev/null 2>&1; then
-    ( cd "$API_DIR" && PORT="$API_PORT" setsid nohup node app.js --port="$API_PORT" \
-        ${API_PLATFORM:+--platform=$API_PLATFORM} >>"$API_LOG" 2>&1 </dev/null & )
+    (
+      cd "$API_DIR" &&
+        exec setsid env PORT="$API_PORT" node app.js --port="$API_PORT" \
+          ${API_PLATFORM:+--platform=$API_PLATFORM} >>"$API_LOG" 2>&1 </dev/null
+    ) &
   else
-    ( cd "$API_DIR" && PORT="$API_PORT" nohup node app.js --port="$API_PORT" \
-        ${API_PLATFORM:+--platform=$API_PLATFORM} >>"$API_LOG" 2>&1 </dev/null & )
+    (
+      cd "$API_DIR" &&
+        exec nohup env PORT="$API_PORT" node app.js --port="$API_PORT" \
+          ${API_PLATFORM:+--platform=$API_PLATFORM} >>"$API_LOG" 2>&1 </dev/null
+    ) &
   fi
+  api_pid=$!
 
-  for _ in $(seq 1 40); do
+  # 记下 PID 与端口，格式与 `scripts/kugou-api` 一致（`<PID> <端口>`）。
+  # 只记 PID 不够：端口改了以后单看 `kill -0` 会以为「还是那个实例」。
+  mkdir -p "$CACHE_DIR"
+  printf '%s %s' "$api_pid" "$API_PORT" >"$PID_FILE"
+
+  # 等就绪：40 × 0.5 秒。不用 `seq`（GNU coreutils，BSD 环境没有）。
+  attempt=0
+  while [ "$attempt" -lt 40 ]; do
     sleep 0.5
     api_alive && break
+    attempt=$((attempt + 1))
   done
 
   if ! api_alive; then
     printf '\033[31m服务启动失败，日志尾部：\033[0m\n' >&2
     tail -n 15 "$API_LOG" >&2 || true
+    printf '\n排查：%s --dry-run 会打印它到底在探哪个地址。\n' "$0" >&2
+    rm -f "$PID_FILE"
     exit 1
   fi
-  printf '\033[32m服务已就绪：%s\033[0m\n' "$CHECK_BASE" >&2
+  printf '\033[32m服务已就绪：%s\033[0m（PID %s，停止用 kugou-api stop）\n' \
+    "$CHECK_BASE" "$api_pid" >&2
 fi
 
 # 用户自己传了 --api-base 就完全尊重，不再叠加（否则 clap 会因重复参数报错）
-for arg in "$@"; do
+for arg in ${PLAYER_ARGS[@]+"${PLAYER_ARGS[@]}"}; do
   case "$arg" in
-    -a|--api-base|--api-base=*) exec "$BIN" "$@" ;;
+    -a | --api-base | --api-base=*) exec "$BIN" ${PLAYER_ARGS[@]+"${PLAYER_ARGS[@]}"} ;;
   esac
 done
 
 # 只有显式指定 KUGOU_API_BASE 才传给二进制，否则让它读配置——
 # 这样按 v 切换音源的选择才能真正持久化生效（见上方 CHECK_BASE 的说明）。
 if [ -n "${KUGOU_API_BASE:-}" ]; then
-  exec "$BIN" --api-base "$KUGOU_API_BASE" "$@"
+  exec "$BIN" --api-base "$KUGOU_API_BASE" ${PLAYER_ARGS[@]+"${PLAYER_ARGS[@]}"}
 else
-  exec "$BIN" "$@"
+  exec "$BIN" ${PLAYER_ARGS[@]+"${PLAYER_ARGS[@]}"}
 fi

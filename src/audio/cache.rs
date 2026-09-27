@@ -210,10 +210,12 @@ struct CacheEntry {
     modified: SystemTime,
 }
 
-/// 是不是流式下载还没写完的半成品（`xxx.mp3.part`）。
+/// 是不是下载还没写完的半成品。
 ///
 /// 判据用后缀而不是"名字里有没有点"：缓存文件名本身带扩展名
 /// （`{hash}-{quality}.mp3`），只有 `.part` 结尾的才是半成品。
+/// 两种写法都要认：整首下载是 `x.mp3.part`，流式下载是 `x.mp3.stream.part`
+/// （见 [`crate::audio::download`] 的 `stream_temp_path_for`）。
 fn is_partial(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| extension == "part")
@@ -332,5 +334,21 @@ mod tests {
         assert!(partial.is_file(), "清空缓存也不该动半成品");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// **两种**半成品命名都要被认出来。
+    ///
+    /// 整首下载用 `x.mp3.part`，流式下载用 `x.mp3.stream.part`（刻意分开，见
+    /// `download::stream_temp_path_for`）。判据是「扩展名是不是 `part`」，
+    /// 所以第二种也能被认出来——但这条不能靠推断，改命名规则时要有一条测试挡住：
+    /// 认不出来就意味着回收会在下载中途把半成品删掉，这次下载白下。
+    #[test]
+    fn recognises_both_kinds_of_partial_download() {
+        assert!(is_partial(Path::new("/cache/abc-128.mp3.part")));
+        assert!(is_partial(Path::new("/cache/abc-128.mp3.stream.part")));
+        // 正式缓存文件不能误判
+        assert!(!is_partial(Path::new("/cache/abc-128.mp3")));
+        assert!(!is_partial(Path::new("/cache/abc-128.flac")));
+        assert!(!is_partial(Path::new("/cache/part")));
     }
 }

@@ -6,14 +6,23 @@
 //! 每页条数、缓存上限）。散在各处写死的话，设置页显示的顺序和实际能取到的
 //! 值很容易对不上——用户按右键切出来的档位和他看到的不一致，是最难查的那种 bug。
 //!
-//! 这里只放**纯数据**：界面怎么画、值怎么落到 [`crate::config::Config`] 上，
-//! 分别归 `ui::views::settings` 与 `app::update`。
+//! 这里放两样东西：**候选值与显示文本**（纯数据，见下面那些自由函数），以及
+//! **设置页的三个交互**（`impl App` 里的移动光标 / 点击 / 调整值）。
+//!
+//! 界面怎么画归 `ui::views::settings`；「调整值之后要不要顺手做点别的」
+//! （重建缓存、换音频设备、落盘）在这里，因为那三条路径都要写一遍落盘与提示。
 
 use std::path::{Path, PathBuf};
 
+use ratatui::crossterm::event::MouseEvent;
+
+use crate::app::App;
 use crate::app::queue::PlaybackMode;
-use crate::app::state::AppState;
-use crate::config::CoverFill;
+use crate::app::state::{AppState, HitZone};
+use crate::audio::cache::AudioCache;
+use crate::audio::engine::PlaybackState;
+use crate::config::{CoverFill, SUPPORTED_QUALITIES};
+use crate::ui::theme::ThemeName;
 use crate::ui::views::settings::toggle_text;
 
 /// 设置项。顺序即设置页里的显示顺序。
@@ -167,7 +176,6 @@ pub const PAGE_SIZE_OPTIONS: [u32; 4] = [20, 30, 50, 100];
 /// 缓存上限候选（MiB），`0` 表示不限制。
 pub const CACHE_LIMIT_OPTIONS: [u64; 5] = [0, 256, 512, 1024, 2048];
 
-/// 歌词偏移的步进与上下限（毫秒）。
 /// 歌词换行过渡的时长上限候选（毫秒），`0` 表示关闭。
 ///
 /// 档位不多是刻意的：这个值只是**上限**（实际按行距自适应），做成精细可调
@@ -350,6 +358,198 @@ pub fn cycle_str<'a>(options: &'a [&'a str], current: &str, delta: isize) -> Opt
     options.get(next).copied()
 }
 
+impl App {
+    // ==================================================================
+    // 设置页的三个交互：移动光标、点击、调整值
+    // ==================================================================
+
+    /// 设置页上下移动选中项。到头就停住，不回绕——设置项一共十来个，
+    /// 绕回去反而容易改错项。
+    pub(super) fn move_settings(&mut self, delta: isize) {
+        let len = crate::app::settings::Setting::ALL.len() as isize;
+        let next = (self.state.settings_cursor as isize + delta).clamp(0, len - 1);
+        self.state.settings_cursor = next as usize;
+    }
+
+    /// 点击设置项：点一下选中，**再点一下**改值。
+    ///
+    /// 之所以不做「点一次就改」：设置行横跨整屏，用户更多时候只是想选中它，
+    /// 误触就改值会很难受。两次点击的语义和列表的「双击激活」一致。
+    pub(super) fn click_setting(&mut self, zone: HitZone, mouse: &MouseEvent) {
+        let Some(index) = zone.index_at(mouse.row) else {
+            return;
+        };
+        let already_selected = self.state.settings_cursor == index;
+        self.state.settings_cursor = index;
+
+        let double = self.state.is_double_click(zone.target, Some(index));
+        self.state.set_last_click(zone.target, Some(index));
+        if already_selected || double {
+            self.adjust_setting(1);
+        }
+    }
+
+    /// 把设置页选中的那一项按 `delta` 调整一档（左为 -1、右为 +1），并落盘。
+    ///
+    /// 改完立刻 `save()`：设置页的价值就在于「改了就是改了」，退出时再保存
+    /// 的话，崩溃或强制退出会丢掉刚才那几下调整，用户会觉得没生效。
+    pub(super) fn adjust_setting(&mut self, delta: isize) {
+        use crate::app::settings as s;
+
+        let Some(setting) = s::Setting::ALL.get(self.state.settings_cursor).copied() else {
+            return;
+        };
+        let config = &mut self.state.config;
+
+        match setting {
+            s::Setting::Theme => {
+                if let Some(next) = s::cycle(&ThemeName::ALL, config.theme, delta) {
+                    config.theme = next;
+                }
+            }
+            s::Setting::Quality => {
+                if let Some(next) = s::cycle_str(SUPPORTED_QUALITIES, &config.quality, delta) {
+                    config.quality = next.to_string();
+                }
+            }
+            s::Setting::PlaybackMode => {
+                if let Some(next) = s::cycle(&s::PLAYBACK_MODES, config.playback_mode, delta) {
+                    config.playback_mode = next;
+                }
+            }
+            s::Setting::RefreshMs => {
+                if let Some(next) = s::cycle(&s::REFRESH_MS_OPTIONS, config.tick_ms, delta) {
+                    config.tick_ms = next;
+                }
+            }
+            s::Setting::LyricOffsetMs => {
+                let next = config.lyric_offset_ms + delta as i64 * s::LYRIC_OFFSET_STEP;
+                config.lyric_offset_ms = next.clamp(-s::LYRIC_OFFSET_LIMIT, s::LYRIC_OFFSET_LIMIT);
+            }
+            s::Setting::LyricAnimMs => {
+                if let Some(next) = s::cycle(&s::LYRIC_ANIM_OPTIONS, config.lyric_anim_ms, delta) {
+                    config.lyric_anim_ms = next;
+                    // 关掉动画时把在飞的过渡也收干净，否则「关」要等这一轮走完
+                    // 才生效——用户看到的是「按了没反应」。
+                    if next == 0 {
+                        self.state.lyric.reset_transition();
+                    }
+                }
+            }
+            s::Setting::PageSize => {
+                if let Some(next) = s::cycle(&s::PAGE_SIZE_OPTIONS, config.page_size, delta) {
+                    config.page_size = next;
+                }
+            }
+            s::Setting::CacheLimitMib => {
+                if let Some(next) = s::cycle(&s::CACHE_LIMIT_OPTIONS, config.cache_limit_mib, delta)
+                {
+                    config.cache_limit_mib = next;
+                    // AudioCache 只认构造时传进来的上限，改了要重建。
+                    // 它没有别的状态（就是目录 + 上限字节数），重建是安全的。
+                    self.cache = AudioCache::new(config.cache_dir.clone(), next);
+                    self.refresh_cache_usage();
+                }
+            }
+            // 这三项只影响界面，不进配置文件：它们是「这次会话想不想看」
+            // 而不是「以后都要这样」，持久化反而会在下次启动时让人困惑
+            s::Setting::BasicColor => {
+                if delta != 0 {
+                    config.basic_color = !config.basic_color;
+                }
+            }
+            s::Setting::LyricPanel => {
+                if delta != 0 {
+                    self.state.show_lyric_panel = !self.state.show_lyric_panel;
+                }
+            }
+            s::Setting::Sidebar => {
+                if delta != 0 {
+                    self.state.sidebar_visible = !self.state.sidebar_visible;
+                }
+            }
+            // 简易模式进配置文件：它是「这台机器要不要省资源」的长期选择，
+            // 不像歌词面板那样只关乎这一次会话。
+            s::Setting::LiteMode => {
+                if delta != 0 {
+                    config.lite_mode = !config.lite_mode;
+                    // 关掉封面就把已解码的那张也扔了，否则内存不会降
+                    if config.lite_mode {
+                        self.state.cover = crate::app::state::CoverArt::default();
+                    }
+                }
+            }
+            // 路径用 Cycle 在几个预设之间切，配置文件里空着也行
+            // （首次启动按 `~/Music` 走，不会坏在「路径不存在」上）。
+            s::Setting::DownloadDir => {
+                let current = config.download_dir.as_deref().unwrap_or("~/Music");
+                if let Some(next) = s::cycle(&s::DOWNLOAD_DIR_OPTIONS, current, delta) {
+                    config.download_dir = Some(next.to_string());
+                }
+            }
+            // 进配置文件：这是「这块封面以后都这么铺」的长期选择，不是一次性开关。
+            // 改了下一帧就生效——`cover_fill` 是每帧从 config 读的，封面协议会
+            // 因为铺满方式变了而重新裁一次图。
+            s::Setting::CoverFill => {
+                if let Some(next) = s::cycle(&s::COVER_FILLS, config.cover_fill, delta) {
+                    config.cover_fill = next;
+                }
+            }
+            // 换一张声卡。设备是在音频线程里重建的，当前这首会停一下，
+            // 等新设备就绪（DeviceOpened）再按原位置续播，所以这里单独提示并返回。
+            s::Setting::AudioDevice => {
+                let options = s::device_options(&self.state.audio_devices);
+                let Some(next) = s::cycle_device(&options, config.audio_device.as_deref(), delta)
+                else {
+                    return;
+                };
+                let target = next
+                    .clone()
+                    .unwrap_or_else(|| s::DEFAULT_DEVICE_LABEL.to_string());
+                config.audio_device = next.clone();
+                // 只在真的有声音在放时才续播：暂停状态下换设备不该自作主张开始播
+                self.pending_device_resume = match self.state.playback {
+                    PlaybackState::Playing => self
+                        .state
+                        .current
+                        .clone()
+                        .map(|song| (song, self.state.position_ms)),
+                    _ => None,
+                };
+                self.audio.use_device(next);
+                self.state.info(crate::ui::views::settings::change_notice(
+                    setting.label(),
+                    &target,
+                ));
+                if let Err(error) = self.state.config.save() {
+                    self.state
+                        .error(format!("保存设置失败：{}", error.user_hint()));
+                }
+                return;
+            }
+        }
+
+        let label = setting.label();
+        let value = s::value_text(setting, &self.state);
+        // 这两项只改本次会话的界面，不进配置文件：它们是「现在想不想看」
+        // 而不是「以后都这样」，持久化反而会在下次启动时让人困惑
+        if matches!(setting, s::Setting::LyricPanel | s::Setting::Sidebar) {
+            self.state
+                .info(crate::ui::views::settings::change_notice(label, &value));
+            return;
+        }
+
+        match self.state.config.save() {
+            Ok(()) => self
+                .state
+                .info(crate::ui::views::settings::change_notice(label, &value)),
+            Err(error) => self
+                .state
+                .error(format!("保存设置失败：{}", error.user_hint())),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +559,25 @@ mod tests {
         for setting in Setting::ALL {
             assert!(!setting.label().is_empty());
             assert!(!setting.description().is_empty());
+        }
+    }
+
+    /// **每个可选音质都要有中文名。**
+    ///
+    /// 这条挡的是一个真实踩过的坑：`app::update` 里曾经另有一份私有的
+    /// `quality_label`，只认 6 档（少了 `viper_atmos` / `viper_tape`）。于是按
+    /// 快捷键切到那两档时，状态栏显示的是原始串 `viper_atmos`，而设置页同一项
+    /// 显示的是「蝰蛇全景声」——同一个值两个说法。现在只有这一份实现，
+    /// 但「忘了给新档位起名」这件事本身还是很容易再犯，所以钉住它。
+    #[test]
+    fn every_supported_quality_has_a_human_label() {
+        for quality in crate::config::SUPPORTED_QUALITIES {
+            let label = quality_label(quality);
+            assert_ne!(
+                label, *quality,
+                "音质 {quality} 没有中文名，退回了原始串（设置页与状态栏会各说各话）"
+            );
+            assert!(!label.is_empty());
         }
     }
 

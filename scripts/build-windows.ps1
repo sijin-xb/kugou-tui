@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     kugou-tui —— Windows 构建 + 打包。
 
@@ -8,12 +8,13 @@
     为什么要单独写一个：仓库里其余脚本（`release`、`make-release-tarball`、
     `kugou-tui` 启动器）都是 bash，Windows 上默认跑不了。构建本身两条命令就够
     （`cargo build --release`），真正容易漏的是**打包**——发行包里必须同时带上
-    那三个 bash 脚本和 `docs/`，否则拿到包的人配不起接口服务。手工拼目录漏东西
+    `scripts/` 与 `docs/`，否则拿到包的人配不起接口服务。手工拼目录漏东西
     是常态（0.3.7 那版就漏了），所以固化成一个脚本。
 
-    三个 bash 脚本在 Windows 上不是给 PowerShell 用的，而是给 Git Bash / WSL 用的
-    ——那两种环境里 `kugou-api` 之类照常能跑。包里带上它们不花什么代价，
-    少了却会让一部分用户直接卡住。
+    **包里带哪几份脚本，以「文档提到过的」为准**：README 与 docs/INSTALL.md 让
+    Windows 用户跑的是 `.\scripts\kugou-tui.ps1` / `.\scripts\kugou-api-install.ps1`，
+    所以 PowerShell 那几份必须在包里；bash 那几份也一起带上，Git Bash / WSL 下
+    照常能用，成本只有几 KB。
 
     **在 PowerShell 5.1（Windows 自带的那版）上也能跑**，不需要额外装 pwsh 7。
     所以这里刻意避开 `$IsWindows`（6.0 才有），改用 `$env:OS`。
@@ -114,10 +115,25 @@ try {
     New-Item -ItemType Directory -Force -Path $stageDocs | Out-Null
 
     Copy-Item $bin (Join-Path $stage "kugou-tui$exeSuffix")
-    # 三个 bash 脚本：Git Bash / WSL 下仍然要用，见文件头说明。
+    # 六份脚本，两类用途，都要带上：
+    #
+    #   *.ps1  —— Windows 原生用法，也是 README / INSTALL.md 里写的那些命令
+    #   *.sh   —— Git Bash / WSL 下照常能跑，成本只是一个几 KB 的文件
+    #
+    # 以前只拷了 bash 那三份，于是解压后 `.\scripts\kugou-tui.ps1` 根本不存在，
+    # 而文档让用户跑的就是它——拿到 zip 的人第一步就卡住。缺的是**文档里出现过的
+    # 文件**，所以这里以「文档提到的都必须在包里」为准，不按「哪个平台用哪个」筛。
     $srcScripts = Join-Path $repoDir 'scripts'
-    foreach ($script in 'kugou-api', 'kugou-api-install', 'kugou-tui') {
-        Copy-Item (Join-Path $srcScripts $script) $stageScripts
+    $scripts = @(
+        'kugou-api', 'kugou-api-install', 'kugou-tui',
+        'kugou-api.ps1', 'kugou-api-install.ps1', 'kugou-tui.ps1'
+    )
+    foreach ($script in $scripts) {
+        $source = Join-Path $srcScripts $script
+        if (-not (Test-Path $source)) {
+            throw "发行包里要带的脚本不存在：$source"
+        }
+        Copy-Item $source $stageScripts
     }
     foreach ($file in 'LICENSE', 'README.md', 'CHANGELOG.md', 'KEYBINDINGS.md') {
         Copy-Item (Join-Path $repoDir $file) $stage

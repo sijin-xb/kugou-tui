@@ -633,6 +633,13 @@ pub struct SearchPane {
     /// 搜索刻意分页：酷狗只有第 1 页是精确匹配，深页是兜底内容，
     /// 一次取全会把相关结果淹没。想要更多就一页页追加。
     pub page: u32,
+    /// 「加载更多」是否在飞。
+    ///
+    /// 单独一个标志，**不能复用 `results.load`**：那个状态一立起来，面板就会把
+    /// 现有结果整屏换成「载入中…」（见 `ui/views/lists.rs`）——翻页时闪一下，
+    /// 比多出一页重复的歌更糟。它的作用是挡住连按 `M`：两次按键会基于同一个
+    /// `page` 各发一次请求，两条结果都追加就是重复的一页，晚到的那条还会让顺序倒过来。
+    pub loading_more: bool,
 }
 
 #[derive(Debug, Default)]
@@ -652,12 +659,19 @@ pub struct ArtistPane {
     pub songs: SongList,
     /// 歌手分类：0 全部 / 1 华语 / 2 欧美 / 3 日韩。
     pub kind: i64,
+    /// 当前打开的是哪位歌手。
+    ///
+    /// 迟到的结果要拿它比对：用户可能已经点了下一位，不比对的话右侧会变成
+    /// 「左侧高亮 B、右侧列着 A 的歌」——而且没有任何提示，看起来就是数据错了。
+    pub open_artist: Option<Artist>,
 }
 
 #[derive(Debug, Default)]
 pub struct RankPane {
     pub list: EntryList<RankBoard>,
     pub songs: SongList,
+    /// 当前打开的是哪个榜单，理由同 [`ArtistPane::open_artist`]。
+    pub open_board: Option<RankBoard>,
 }
 
 #[derive(Debug, Default)]

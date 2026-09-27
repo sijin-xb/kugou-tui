@@ -12,14 +12,59 @@
 #   kugou-api-install all           # 全部
 #   kugou-api-install               # 列出可安装项与当前状态
 #
-# 目前只支持 kugou / netease 两个音源——`REPO` 与 `dir_for()` 里没有的项目
-# 会落到「未知音源」分支。加新音源时这三处要一起改：
-# `REPO`、`PORT_LABEL` / `dir_for`、以及下面 `case` 里的启动分支。
+# 目前只支持 kugou / netease 两个音源——下面 `repo_of` / `dir_for` 里没有的项目
+# 会落到「未知音源」分支。加新音源时这几处要一起改：
+# `repo_of`、`pinned_of`、`port_label_of`、`dir_for`，以及 `case` 里的启动分支。
+#
+# 平台：Linux 与 macOS 共用这一份（Windows 侧是 scripts/kugou-api-install.ps1）。
 #
 set -euo pipefail
 
+# ==================================================================
+# 可移植性：下面每一处写法都是刻意的
+#
+#   readlink -f   GNU 扩展。macOS 的 readlink 直接报 `illegal option -- f`
+#   dirname --    GNU 扩展，BSD 会把 `--` 当成参数本身
+#   seq           GNU coreutils，BSD 环境用 jot
+#   setsid        util-linux，macOS 没有
+#   declare -A    需要 bash 4；macOS 自带的 /bin/bash 是 3.2
+#
+# 仓库里的三个 bash 脚本各自独立分发（AUR 装进 /usr/bin、发行包放进 scripts/、
+# 也有人单独软链到 ~/.local/bin），所以**不做成共享库**：任何一份都得能单独跑起来。
+# 代价是这段在每个脚本里重复一遍，改的时候三处一起改。
+# ==================================================================
+
+is_macos() { [ "$(uname -s 2>/dev/null)" = "Darwin" ]; }
+
+# 脚本自身的真实目录，逐层解开软链（不用 `readlink -f`，理由见上）。
+self_dir() {
+  local target="$1" link
+  while [ -L "$target" ]; do
+    link=$(readlink "$target") || break
+    case "$link" in
+      /*) target="$link" ;;
+      *) target="$(dirname "$target")/$link" ;;
+    esac
+  done
+  cd -P "$(dirname "$target")" && pwd
+}
+
+# 缓存根目录。与 Rust 侧 `dirs::cache_dir()` 对齐：macOS 是 ~/Library/Caches，
+# 不是 ~/.cache。日志与 PID 文件都落在这里，两边不一致会让「日志在哪」变成玄学。
+cache_root() {
+  if is_macos; then
+    printf '%s/Library/Caches' "$HOME"
+  else
+    printf '%s' "${XDG_CACHE_HOME:-$HOME/.cache}"
+  fi
+}
+
 # 安装根目录（各服务会放到它的子目录里）
 ROOT="${KUGOU_API_ROOT:-$HOME}"
+
+# 日志与 PID 文件目录。与 `scripts/kugou-api` 的默认值一致——那边按 PID 文件停服务，
+# 路径不一致就停不掉了。
+LOG_DIR="${KUGOU_API_LOG_DIR:-$(cache_root)/kugou-tui}"
 
 # 软件包会把接口服务连同**生产依赖**一起装在 `/usr/share/kugou-tui/api/<音源>`。
 # 有这份就什么都不用装——那才是真正的「装完即用」。
@@ -36,22 +81,37 @@ SYSTEM_ROOT="${KUGOU_API_SYSTEM_ROOT:-/usr/share/kugou-tui/api}"
 # 不会坏；真正会坏的是「一处钉、一处跟 master」）。
 #
 # 端口必须与 src/source/mod.rs 里 default_api_base() 保持一致，改这里也要改那边。
-declare -A REPO PINNED PORT_LABEL
-REPO[kugou]="https://github.com/MakcRe/KuGouMusicApi.git"
-PINNED[kugou]="a5a98013cce79fe0ae2ad65fc84b68176ebcfc1e"
+#
+# 用 `case` 而不是关联数组：关联数组要 bash 4，而 macOS 自带的 /bin/bash 是 3.2
+# ——`declare -A` 会直接报 `declare: -A: invalid option`，整个脚本一行都跑不了。
+repo_of() {
+  case "$1" in
+    kugou) printf '%s' 'https://github.com/MakcRe/KuGouMusicApi.git' ;;
+    netease) printf '%s' 'https://github.com/neteasecloudmusicapienhanced/api-enhanced.git' ;;
+  esac
+}
+
 # 注意：原 Binaryify/NeteaseCloudMusicApi 已因版权问题停止维护（仓库只剩占位文件）。
 # 这里用社区持续维护的分支版本。它没有稳定提交可钉，跟默认分支。
-REPO[netease]="https://github.com/neteasecloudmusicapienhanced/api-enhanced.git"
-PINNED[netease]=""
+pinned_of() {
+  case "$1" in
+    kugou) printf '%s' 'a5a98013cce79fe0ae2ad65fc84b68176ebcfc1e' ;;
+    netease) printf '%s' '' ;;
+  esac
+}
 
-PORT_LABEL[kugou]="3000(标准版) / 3001(概念版)"
-PORT_LABEL[netease]="3002"
+port_label_of() {
+  case "$1" in
+    kugou) printf '%s' '3000(标准版) / 3001(概念版)' ;;
+    netease) printf '%s' '3002' ;;
+  esac
+}
 
 # 目录名：kugou -> KuGouMusicApi，netease -> NeteaseCloudMusicApi
 dir_for() {
   case "$1" in
-    kugou) echo "$ROOT/KuGouMusicApi" ;;
-    netease) echo "$ROOT/NeteaseCloudMusicApi" ;;
+    kugou) printf '%s' "$ROOT/KuGouMusicApi" ;;
+    netease) printf '%s' "$ROOT/NeteaseCloudMusicApi" ;;
   esac
 }
 
@@ -69,6 +129,25 @@ status_of() {
       alive 3002 && echo "3002 运行中" || echo "3002 未运行"
       ;;
   esac
+}
+
+# 前置工具一次查完，缺哪个就说哪个。
+#
+# 以前是「跑到哪一步才发现缺什么」：没装 git 的人会先看到一句 git 的报错，没装
+# node 的人要等 npm install 跑一半才炸。三个都是硬前置，进门就查。
+require_tools() {
+  local missing=0 tool
+  for tool in git node npm; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      printf '\033[31m找不到 %s。\033[0m\n' "$tool" >&2
+      case "$tool" in
+        git) printf '  macOS：xcode-select --install ／ Linux：装 git 包\n' >&2 ;;
+        *) printf '  装一个 Node.js（>= 18）：https://nodejs.org\n' >&2 ;;
+      esac
+      missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ] || exit 1
 }
 
 start_kugou() {
@@ -93,14 +172,28 @@ start_simple() {
     return 0
   fi
 
-  ( cd "$dir" && PORT="$port" setsid nohup node app.js >/tmp/kugou-api-$name.log 2>&1 </dev/null & )
+  # 日志放到缓存目录里，与 `kugou-api` 一致；以前写 /tmp，重启就被清掉，
+  # 用户回头看「当时为什么失败」什么都没有。
+  mkdir -p "$LOG_DIR"
+  local log="$LOG_DIR/api-$name.log"
 
-  for _ in $(seq 1 40); do
+  # setsid 是 util-linux 专有的，macOS 没有。那边退回 nohup：仍在同一会话，
+  # 但足以活过启动它的终端。
+  if command -v setsid >/dev/null 2>&1; then
+    ( cd "$dir" && exec setsid env PORT="$port" node app.js >>"$log" 2>&1 </dev/null ) &
+  else
+    ( cd "$dir" && exec nohup env PORT="$port" node app.js >>"$log" 2>&1 </dev/null ) &
+  fi
+
+  # 等就绪：40 × 0.5 秒。不用 `seq`（GNU coreutils，BSD 环境没有）。
+  local attempt=0
+  while [ "$attempt" -lt 40 ]; do
     sleep 0.5
     alive "$port" && break
+    attempt=$((attempt + 1))
   done
   alive "$port" && printf '  \033[32m:%s 已就绪\033[0m\n' "$port" \
-    || printf '  \033[31m:%s 启动失败，日志：/tmp/kugou-api-%s.log\033[0m\n' "$port" "$name"
+    || printf '  \033[31m:%s 启动失败，日志：%s\033[0m\n' "$port" "$log"
 }
 
 install_one() {
@@ -115,18 +208,20 @@ install_one() {
       kugou) start_kugou "$SYSTEM_ROOT/$name" ;;
       netease) start_simple netease 3002 "$SYSTEM_ROOT/$name" ;;
     esac
-    printf '  端口：%s\n' "${PORT_LABEL[$name]}"
+    printf '  端口：%s\n' "$(port_label_of "$name")"
     return 0
   fi
 
-  local dir; dir=$(dir_for "$name")
+  require_tools
+
+  local dir; dir="$(dir_for "$name")"
 
   printf '\033[36m== %s ==\033[0m\n' "$name"
 
   # 判断「装好了没有」要看入口文件，不能只看目录在不在——
   # clone 中断、只拉到 README 之类的情况都会留下一个空壳目录。
   local entry="app.js"
-  local pin="${PINNED[$name]:-}"
+  local pin; pin="$(pinned_of "$name")"
 
   if [ -f "$dir/$entry" ]; then
     printf '  已安装：%s\n' "$dir"
@@ -150,7 +245,7 @@ install_one() {
   else
     # 空目录（或不存在）：清掉再建，避免 git 报「目标已存在」
     [ -d "$dir" ] && rmdir "$dir"
-    printf '  克隆 %s → %s\n' "${REPO[$name]}" "$dir"
+    printf '  克隆 %s → %s\n' "$(repo_of "$name")" "$dir"
     if [ -n "$pin" ]; then
       printf '  固定到 %s\n' "${pin:0:7}"
     fi
@@ -161,7 +256,7 @@ install_one() {
     git init -q "$dir" || { printf '  \033[31m初始化仓库失败\033[0m\n'; return 1; }
     if (
       cd "$dir" &&
-        git remote add origin "${REPO[$name]}" &&
+        git remote add origin "$(repo_of "$name")" &&
         git fetch -q --depth 1 origin "${pin:-HEAD}" &&
         git checkout -q FETCH_HEAD
     ); then
@@ -182,7 +277,7 @@ install_one() {
     kugou) start_kugou "$dir" ;;
     netease) start_simple netease 3002 "$dir" ;;
   esac
-  printf '  端口：%s\n' "${PORT_LABEL[$name]}"
+  printf '  端口：%s\n' "$(port_label_of "$name")"
 }
 
 case "${1:-list}" in
@@ -196,8 +291,9 @@ case "${1:-list}" in
     printf '可安装的音源服务（安装到 %s）：\n\n' "$ROOT"
     for name in kugou netease; do
       pin_label=""
-      [ -n "${PINNED[$name]:-}" ] && pin_label="固定提交 ${PINNED[$name]:0:7}，"
-      printf '  %-8s %s\n' "$name" "${REPO[$name]}"
+      pin="$(pinned_of "$name")"
+      [ -n "$pin" ] && pin_label="固定提交 ${pin:0:7}，"
+      printf '  %-8s %s\n' "$name" "$(repo_of "$name")"
       printf '           %s%s\n' "$pin_label" "$(status_of "$name")"
     done
     printf '\n用法：kugou-api-install <kugou|netease|all>\n'

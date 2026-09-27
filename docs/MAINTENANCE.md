@@ -43,7 +43,13 @@ src/
 ├─ app/               状态机（主线程独占）
 │  ├─ mod.rs          App 装配、主循环、退出
 │  ├─ state.rs        AppState：界面的唯一真相
-│  ├─ update.rs       事件 → 状态变更（全程序唯一改状态的地方）
+│  ├─ update.rs       事件 → 状态变更（分派 + 加载层 + 结果处理，见 §1.8）
+│  ├─ navigation.rs   导航：切页 / 焦点 / 选择移动 / 数字键（从 update.rs 切出）
+│  ├─ playback.rs     播放控制：起播 / 切歌 / 进度 / 音量 / 静音 / 歌词偏移
+│  ├─ search.rs       搜索：提交与分页追加
+│  ├─ cloud.rs        登录 / 音源切换 / VIP / 云端歌单 / 账号资料
+│  ├─ settings.rs     设置页：候选值 + 显示文本 + 三个交互（移动 / 点击 / 改值）
+│  ├─ desktop.rs      MPRIS / 系统托盘 / 窗口控制
 │  ├─ queue.rs        播放队列与播放模式
 │  └─ session.rs      会话持久化（上次听到哪）
 └─ ui/                ratatui 渲染（只读 state，不改）
@@ -89,7 +95,31 @@ audio thread(kugou-audio) ───────────→ 原子量（位�
 ### 1.4 缓存文件命名
 
 `{hash}-{quality}.{ext}`，例如 `b3a52a7a…-128.mp3`；音质不同互不覆盖。
-**未下完的是 `同目录同名 + .part`**，`cache.find` 看不到它（这是故意的，见 §3.3）。
+
+未下完的是**同目录同名 + 一个 `.part` 后缀**，两种写法都有，`cache.find` 都看不到
+（这是故意的，见 §3.3）：
+
+| 写法 | 谁用 |
+|---|---|
+| `abc-128.mp3.part` | 整首下载（`fetch_to`：续播、预取下一首） |
+| `abc-128.mp3.stream.part` | 边下边播（`start_streaming`） |
+
+**两个写法刻意不同**：同一首歌上可以同时跑一条整首下载（后台预取）和一条流式下载
+（用户正好切到这首）。共用一个 `.part` 的话，整首下载那次 `File::create` 会把流式
+那条已经落盘的字节截掉，而缓冲窗口之外的数据正是靠 `pread` 这个文件读回来的——
+读回空洞就是噪音。两者仍然都以 `.part` 结尾，所以 `cache::is_partial` 照样认得。
+
+同一目录下还有脚本用的运行态文件，命名是**两个平台之间的约定**，改一处就要改另一处：
+
+| 文件 | 内容 | 谁写 / 谁读 |
+|---|---|---|
+| `api-<实例>.pid` | `<PID> <端口>`（空格分隔） | 启动器与 `kugou-api` 写；`kugou-api stop/status` 读 |
+| `api-<实例>.log` | 服务的 stdout（Windows 另有 `.log.err`） | 启动器与 `kugou-api` 写；`kugou-api logs` 读 |
+
+实例名只有两个：`standard`（标准版 / 网易云）与 `lite`（酷狗概念版）。
+**为什么 PID 文件要带端口**：只存 PID 时，改了端口没重启的旧进程会让 `status`
+拿新端口报一个「运行中」，而它其实监听在旧端口上——实测踩到过（见 `kugou-api`
+里 `pid_of` 的注释）。
 
 ### 1.5 打开歌单（两段式加载）
 
@@ -124,6 +154,8 @@ audio thread(kugou-audio) ───────────→ 原子量（位�
 | `config.rs`、`app/settings.rs` | 路径都走 `dirs`，只有 `~` 展开要额外兜一层 | Windows 上没有 `HOME` |
 | `ui/icons.rs` | Nerd Font 探测走 `fc-list`，Windows 上没有 → 回落 ASCII + `KUGOU_TUI_NERD_FONT` 覆盖 | 那边字体清单在注册表里 |
 | `api/model.rs`、`event.rs`、`keymap.rs` | 三处 `#[cfg_attr(not(unix), allow(dead_code))]` | 那些项只由 MPRIS 构造；留 `allow` 而不是 cfg 掉，是为了让枚举/模型在两边形状一致，下游 `match` 不用长平台分支 |
+| `scripts/*`（bash） | 不写平台分支，改成**只用两边都有的写法** | 脚本在 Linux 与 macOS 上跑同一份，逐条差异见 §1.7 |
+| `scripts/*.ps1` | `$env:OS -eq 'Windows_NT'` 判断（`-WindowStyle` 等只在 Windows 存在） | `$IsWindows` 是 PowerShell 6+ 的自动变量，而 Windows 自带的是 5.1 |
 
 验证 Windows 侧**不需要 Windows 机器**（编译期能查的部分）：
 
@@ -144,29 +176,165 @@ Linux 那栏把二进制传成 artifact（`kugou-tui-linux-x86_64`，留 14 天�
 macOS 那栏的意义也是这个：它和 Linux 共用 `cfg(unix)` 分支，但 `dirs` 给的是
 `~/Library/...`、音频走 CoreAudio、拿不到 `fc-list`，不跑就只是「理论可用」。
 
-### 1.7 Windows 侧新增的三个脚本
+### 1.7 启动器脚本：跨平台约定
 
-`scripts/` 下的 bash 脚本在 PowerShell 里跑不了，所以各补了一个对应物：
+`scripts/` 下的 bash 脚本在 Linux 与 macOS 上跑**同一份**，PowerShell 那几份只在
+Windows 上有意义（但发行 zip 里也带上 bash 那几份，Git Bash / WSL 下要用）。
 
 | Windows | Unix 侧 | 说明 |
 |---|---|---|
 | `kugou-tui.ps1` | `kugou-tui` | 启动器。**刻意不写 `param()` 块**，否则 PowerShell 会把 `-s 海阔天空` 当成写错的参数名；参数全部经 `$args` 原样透传。带 `--dry-run` 只打印决策 |
 | `kugou-api-install.ps1` | `kugou-api-install` | 只 clone + 装依赖，**不启动**——起服务交给启动器，避免两处各写一份 |
-| `build-windows.ps1` | `make-release-tarball` | 构建 + 打包 zip |
+| `kugou-api.ps1` | `kugou-api` | 启停管理（`start` / `stop` / `restart` / `status` / `logs`）。与启动器共用 PID 文件，见 §1.4 |
+| `build-windows.ps1` | `make-release-tarball` | 构建 + 打包 zip。**包里带哪几份脚本以「文档提到过的」为准**，别只按平台筛——0.4.3 那版就漏掉了 `.ps1`，而文档让用户跑的正是不存在的那几个 |
 
-三条注意：
+#### bash 侧：不许用的写法
+
+macOS 自带的是 BSD 工具链加 **bash 3.2**，下面每一条都会让脚本直接中断（不是
+「行为略有不同」）。三个脚本各自独立分发（AUR 装进 `/usr/bin`、发行包放进
+`scripts/`、也有人单独软链），所以**没有共享库**：这段限制在每个脚本里重复声明一遍，
+改的时候三处一起改。
+
+| 不能用 | 会怎样 | 改成 |
+|---|---|---|
+| `readlink -f` | macOS 报 `illegal option -- f` | 逐层解软链（见各脚本的 `self_path` / `self_dir`） |
+| `dirname --` | BSD 把 `--` 当成参数本身 | 去掉 `--` |
+| `seq` | GNU coreutils，BSD 环境没有 | `while [ "$i" -lt N ]` 计数循环 |
+| `setsid` | util-linux 专有 | `nohup`（仍在同一会话，但足以活过终端） |
+| `ss` | iproute2，macOS 没有 | `lsof -nP -iTCP:<端口> -sTCP:LISTEN -t` |
+| `declare -A` | bash 3.2 报 `declare: -A: invalid option` | `case` 分派 + `${!name}` 间接展开 |
+| `"${arr[@]}"`（空数组） | bash 3.2 + `set -u` 报 unbound variable | `"${arr[@]+"${arr[@]}"}"` |
+
+**目录必须与 `dirs` crate 对齐**，这不是风格问题：
+
+| | Linux | macOS |
+|---|---|---|
+| 配置根 | `$XDG_CONFIG_HOME` / `~/.config` | `~/Library/Application Support` |
+| 缓存根 | `$XDG_CACHE_HOME` / `~/.cache` | `~/Library/Caches` |
+
+macOS 上 `dirs` **不读** XDG 变量，所以脚本也不能读。不对齐的后果很实在：启动器会去
+`~/.config` 找一个永远不存在的 `config.toml`，于是永远按默认值（`:3000`、标准版）探活，
+概念版用户只会看到「服务启动失败」。配置根可以用 `KUGOU_TUI_CONFIG_DIR` 整体覆盖
+（三个脚本 + 两个 ps1 都认它，语义与 `config.rs` 的 `config_root()` 一致）。
+
+#### PowerShell 侧：四条注意
 
 * **只用 PowerShell 5.1 的语法**（Windows 自带的就是它）。别用 `$IsWindows`
   （6.0 才有）、`Start-Process -Environment`（7.4 才有）。平台判断统一用
   `$env:OS -eq 'Windows_NT'`。
+* **文件必须带 UTF-8 BOM**，而且**只能靠手工保证**——CI 发现不了。
+  5.1 在文件没有 BOM 时按当前 ANSI 代码页（中文 Windows 上是 GBK）解码 `.ps1`，
+  而这几个脚本里有几十条面向用户的中文提示，全部会变成乱码。PowerShell 7
+  默认按 UTF-8 读，而 CI 用的正是 `shell: pwsh`（7.x），所以**绿了也不代表
+  用户那边正常**。新增或改写 `.ps1` 之后，用
+  `head -c 3 scripts/*.ps1 | od -An -tx1` 确认每个文件都以 `ef bb bf` 开头；
+  行尾保持 LF 即可（5.1 读 LF 的脚本没问题）。
 * `Start-Process` **不允许**把 stdout 与 stderr 重定向到同一个文件，所以服务日志
   是两个：`api.log` 与 `api.log.err`，报错时两个都打。
 * 启动器里那份配置解析（读 `sources.active` 与 `[sources.<kind>].api_base`）是手写的
   正则，不是 TOML 解析器。改配置结构时要同步改它——同理，`kugou-api-install.ps1`
-  里钉住的提交必须和 bash 版的 `PINNED[kugou]` 一致（一处钉、一处跟 master 是最坏的组合）。
+  里钉住的提交必须和 bash 版的一致（一处钉、一处跟 master 是最坏的组合）。
 
 `docs/INSTALL.md` 的「在 Windows 上构建与运行」一节列了平台能力对照表
 （哪些是降级、哪些是缺失），改动平台分支后记得同步那张表。
+
+### 1.8 拆 `update.rs`：进度与规矩
+
+`update.rs` 曾经是一个 4700 行的 `impl App`，职责太多。拆的目标**不是减少行数**，
+是降低「改一处要读多少上下文」的成本。按审计给的顺序，可靠性问题先修完（`download.rs`
+的 Range 校验、`accepts_*` 那套陈旧结果判据），再动结构——先修可靠性才知道真正的边界在哪。
+
+已完成（每块都是**纯搬移**，逻辑零改动，搬完逐字符比对过）：
+
+| 模块 | 行数 | 内容 |
+|---|---|---|
+| `navigation.rs` | 275 | 切页、焦点、选择移动、`go_back`、数字键、`v` 键打开音源页 |
+| `playback.rs` | 320 | 起播 / 切歌 / 进度 / 音量 / 静音 / 歌词偏移 |
+| `search.rs` | 142 | 提交搜索、加载更多 |
+| `desktop.rs` | 106 | MPRIS / 托盘快照、窗口控制 |
+| `cloud.rs` | 937 | 登录 / 音源切换 / VIP / 云端歌单 / 账号资料 |
+| `settings.rs` | 728 | 设置页的候选值与三个交互（`move_settings` / `click_setting` / `adjust_setting`） |
+
+`update.rs`：4728 → 4144 → 2958 行。
+
+**边界修正（切完 playback 之后发现并修掉的）**：`activate()` 与 `startup_search()` 搬回了
+`update.rs` 的分派层。`activate` 原本跟着「导航」那一节切进了 `navigation.rs`，但它是
+「Enter 键按 `(Tab, Focus)` 决定做什么」——横跨 search / playback / 数据加载三个方向。
+结果就是 navigation 去调播放、去调搜索，`navigation ↔ search` 变成**叶子互依**。
+`startup_search`（`--search` 的启动胶水：切页 + 填词 + 提交）同理，留在 `search.rs`
+会让 search 反过来依赖 navigation。
+
+搬完的依赖形状（**这就是要守的目标**）：
+
+```text
+update ──→ navigation / search / playback / cloud / desktop / settings / mod   （分派器）
+navigation ──→ update（请加载层拉数据）、settings（设置页的光标移动）
+playback ──→ update（client_for / load_cover / request_lyric / sync_queue_cursor）
+settings ──→ update（refresh_cache_usage）
+cloud ──→ update（client_for）、mod（ensure_device_fingerprint）
+desktop ──→ （无）
+search ──→ （无）
+```
+
+叶子之间零调用，且**没有互相调用的一对**。`update.rs` 里留下的是三类东西：分派
+（`handle_event` / `handle_action` / `activate`）、加载层（`load_*` / `open_selected_*`，
+`navigation.rs` 只请它们拉数据）、结果与收尾（`handle_loaded` / `handle_audio_event` /
+`tick`）。
+
+**「播放控制」那一节并不干净，所以没有整节搬走。** 它里面挤着五个不属于播放的方法，
+前三个后来去了 `desktop.rs`，另两个留在 `update.rs`：
+
+| 不在 playback.rs | 为什么不算播放 |
+|---|---|
+| `sync_mpris` / `sync_tray` → `desktop.rs` | 输出适配器，由 `tick()` 每拍调一次把状态推给 D-Bus 组件 |
+| `toggle_window` → `desktop.rs` | 走 niri 的 compositor IPC，与音频无关 |
+| `client_for` | 全文件共用的客户端构造辅助（8 处调用），搬走只会让调用方到处写 `pub(super)` |
+| `request_lyric` | 「取歌词」这个网络请求；它的结果处理在 `handle_loaded` 里，请求与处理同文件才省上下文（`load_cover` 同理，两者现在同在 `update.rs` 的「封面与歌词」小节） |
+
+**这是判断拆分的标准**：一节里的方法**调用方在哪、结果谁处理**，比它写在哪个标题下面更重要。
+宁可模块小一点、边界干净，也不要为了凑体积把邻居一起搬走。
+
+一轮拆完之后还有一处**故意接受**的跨模块调用：`navigation.rs` 的 `move_selection`
+调 `settings.rs` 的 `move_settings`。设置页的光标移动归 `settings.rs`（「设置页的三个
+交互」应当在一起），所以导航这一侧只是请它挪一下；它不反过来调导航，也没有把
+`settings_cursor` 的细节散到两个文件里。改之前想清楚这一点，别为了「图上一个边」
+把 `move_settings` 搬回 `update.rs`——那才是真的把一个设置页的行为扔进了
+「什么都放」的文件。
+
+切 `cloud.rs` 之前那一大段的归类（登录 / 音源 / VIP / 云端歌单 / 通用加载辅助）
+已经做完，落在 `cloud.rs` 的四类各有小节标题；`client_for`、`request_lyric`
+这类**谁都在用**的辅助留在 `update.rs`。
+
+切的时候会撞上一件事，先知道就不用惊讶：**Rust 的方法私有性是按「写 impl 块的模块」
+算的**，不是按类型。方法一搬走，另一侧调用它就报 `E0624 method is private`，
+得逐个改成 `pub(super)`。这不是设计问题，是拆分的固有代价——编译器会把清单列全，
+照它改就行（导航 13 处、播放 16 处、桌面 3 处、云端 15 处、设置 1 处）。
+注意**两个方向都要改**：搬走的要被原来的调用方调到，留在原地的要被搬走的那块调到。
+
+几条规矩：
+
+* **一次只切一块，切完立刻 `clippy -D warnings` + `cargo test`**。搬移不改逻辑，
+  所以全部测试（当前 328 个）必须全绿；绿不了说明搬错了，不是「顺手改好了」。
+* **搬移要留证据**。做法：搬之前把原始文件复制到 `/tmp`，搬完跑一遍
+  「按函数名比对签名 + 函数体（空白折叠成一个空格、`pub(super)` 归一化）」的脚本，
+  逐字符确认每个函数都还活着。这一轮的结果是 116 个函数全部逐字符存活，
+  唯一被删的是 `update.rs` 里那份重复的音质标签函数（见 §6）。
+* **别在搬移的那次提交里夹带改动**。混在一起就没人能看出哪一行是行为变化。
+* `handle_loaded`（事件分发）**留在 `update.rs`**：它是调度器，判断「这条结果该不该
+  采纳」的判据也留在那里（见 §4 第 11 条），只有纯业务动作搬走。
+* **切口容易吃掉小节标题**。`sed -i 'A,Bd'` 的边界多一行少一行，症状是留下一个孤立的
+  `// =====` 或把 `// 播放控制` 一起带走。切完立刻 `sed -n` 看接缝，并
+  `grep -n '^    // [^=]'` 点一遍剩下的小节标题。
+* **切完跑一遍模块调用图，要的是星形。** 搬移等价不代表边界正确——边界错了不报错，
+  只是把耦合从文件里挪到模块之间。做法：取出各模块定义的方法名，再数
+  `src/app/X.rs` 里出现多少次 `self.<Y 的方法>(`。出现**叶子 ↔ 叶子**就是边界错了，
+  回去找那个函数（通常是「按 Tab 分派」的那种）。上面的 `navigation ↔ search`
+  就是这么查出来的。
+* **一节里的方法不一定属于同一件事**。判断标准是「调用方在哪、结果谁处理」，
+  不是「它写在哪个标题下面」（见上面那张表）。
+* 常量跟着用它的人走：`RESTART_THRESHOLD_MS` 搬进 `playback.rs`，
+  `SEARCH_MAX_PAGES` 搬进 `search.rs`——它们只被那一块用。
+
 
 ---
 
@@ -304,7 +472,6 @@ let position_ms = self.last_position_ms;   // 上一帧还在播时的值
 ---
 
 ## 4. 改这块代码时的不变量
-
 改 `audio/` 下任何东西之前，先确认这些还没被破坏：
 
 1. **先落盘、再 `push`**。缓冲只留窗口，窗口外的字节只能从 `.part` 读回来；
@@ -327,6 +494,31 @@ let position_ms = self.last_position_ms;   // 上一帧还在播时的值
 10. **`Output` 的字段顺序不能动**（播放器必须排在设备前面），也别删那个
     `_stream` 字段——它靠生命周期起作用，删了声音立刻断。
 
+改 `app/update.rs` 的 `handle_loaded` 之前，这条也要守住：
+
+11. **每一条异步结果都要自证身份**。请求都是 `tokio::spawn` 出去的，回来的顺序不保证；
+    用户完全可以在这中间再搜一次、再开一个歌单、再点一位歌手。结果照单全收就会变成
+    「输入框写着 B、列表是 A」这类**看起来就是数据错了**的状态，而且不报错。
+
+    判据是「身份比对」，不是给每次请求编号：播放那一侧本来就这么做
+    （`App::is_current` 比 `song.hash`、歌词比 `hash`），其余照抄同一套思路即可。
+    已经有的比对点：
+
+    | 结果 | 拿什么比 |
+    |---|---|
+    | `StreamReady` / `StreamPrerolled` / `StreamCached` | `song.hash`（`App::is_current`） |
+    | `Lyric` / `LyricFailed` / `CoverReady` | `hash` |
+    | `Search` | 关键词（`state.search.submitted`） |
+    | `PlaylistTracks` | 当前打开的歌单 id（`open_playlist`） |
+    | `ArtistSongs` / `RankTracks` | 当前打开的歌手 / 榜单 id |
+    | `Playlists` / `Artists` | 请求时的分类 id（`category` / `kind`） |
+
+    判据本身抽成了自由函数（`accepts_search_result` / `accepts_open_item`），
+    因为它们能单独测，而 `App` 构造需要音频引擎与运行时、单测里搭不出来。
+    **新增一个带网络请求的 `Loaded` 变体时，先想清楚它回来时拿什么比。**
+    另外，身份字段要**在 `spawn` 之前**写进状态（`open_playlist` / `open_artist` /
+    `open_board` 都是这么做的）——写在结果里就晚了，那条结果永远对不上。
+
 ---
 
 ## 5. 常见陷阱清单
@@ -346,10 +538,24 @@ let position_ms = self.last_position_ms;   // 上一帧还在播时的值
 **下载/缓存**
 
 - `cache.find` 只按"文件在不在"判断，不校验长度——这就是 `.part` 存在的理由。
-- `reqwest` 的 `chunk_stream` 与并发 Range 都要带正确的 `Range`；自己写代理做实验时
-  别忘了透传它，否则 4 个分块会各拿到整首、拼出一个坏文件。
+- **分块下载的每一步都要自证**：状态码必须是 `206`、`Content-Range` 必须与请求范围
+  逐字节一致、每块要写满自己的长度、总和要等于总长度。少任何一条，服务端（或中间
+  CDN / 代理）忽略 `Range`、回 `200 OK` 加整首时就会让 4 个分块互相覆盖，拼出一个
+  "长度对、内容全错"的文件——而它照常改名进缓存。自己写代理做实验时也别忘透传
+  `Range`。回归测试见 `audio/download.rs` 的 `server_ignoring_range_*` 与
+  `truncated_transfer_*`（用一个 std `TcpListener` 起的假服务端，没引新依赖）。
+- `.part` 是 `set_len(total)` 预分配过的，**文件大小证明不了完整性**，只有写满的
+  字节数能。所以"下载任务结束"不等于"下载成功"。
 - 分块下载失败会**退回单连接**重下一次（`fetch_to`），所以"看起来下了两遍"可能是正常的。
 - 缓存回收是同步目录扫描，必须在 `spawn_blocking` 里跑，别卡住 UI。
+- **同一个目标上不能同时跑两条流**。`start_streaming` 在一个按临时文件路径索引的
+  登记表里查重：第二条直接复用第一条的缓冲，不再起任务。原因是两条流会互相破坏——
+  后开的那次 `truncate(true)` 抹掉先写的字节，失败/取消时的 `remove_file` 删掉对方
+  的文件。触发它不需要异常操作：**连按两次 Enter** 就是两条 `start_streaming`
+  落在同一个目标上（`App::active_stream` 要等攒够开头才被握住，中间那段窗口谁也
+  拦不住第二条）。回归测试 `audio::download::tests::a_second_stream_for_the_same_target_reuses_the_first_buffer`。
+- 整首下载与流式下载**不共用**临时文件（`x.mp3.part` vs `x.mp3.stream.part`，
+  见 §1.4）：后台预取下一首时，用户完全可能正好切到那一首。
 
 **列表分页**
 
@@ -358,6 +564,15 @@ let position_ms = self.last_position_ms;   // 上一帧还在播时的值
 - 「这一页不满 ⇒ 这就是全部」这个判据**只在第 1 页成立**。首屏改从末页取之后
   （倒序显示时），末页不满是常态——照搬会让"整表补齐"永远不出门，歌单只显示末页
   那几十首。判据抽在 `app::update::needs_full_fetch`，有测试钉住。
+- 更根本的一条：**判"还有没有下一页"只能看这一页是不是空**。解析会过滤条目
+  （缺 hash、字段类型不对），一页 30 条剩 29 条是常事，按"不满页"停会把列表静默
+  截断。酷狗那侧（`catalog.rs::collect_all_pages`）已经是这个判据；网易云那侧
+  （`source/netease.rs::playlist_tracks_all`）还在用"不满页"，见 §7。
+- **并发翻页的结果必须按页码拼，不能按完成顺序拼。** `JoinSet::join_next()` 给的是
+  任务完成顺序，一批页同时发出去谁先回来谁先 append，整表页序就是随机的——榜单
+  尤其致命，它的"顺序"就是榜单内容本身。回归测试
+  `api::catalog::tests::concurrent_pages_are_assembled_in_page_order`（用手写的假
+  服务端让页码**必然**倒序返回，所以这条测试不是靠运气过的）。
 - 取哪一页由 `app::update::first_screen_page` 决定：**必须与 `sort_descending` 一致**，
   否则首屏内容与最终列表的头部对不上，画面会整体翻一次（用户能直接看出来）。
 - 首屏取到空页（`song_count` 过期）要退回第 1 页，不能让用户对着空列表干等。
@@ -374,6 +589,38 @@ let position_ms = self.last_position_ms;   // 上一帧还在播时的值
   （能给出默认输出配置 + 排除 `null`），别退回去"全部列出"。
 - 概念版（lite）与标准版的 `ppage_id` 处理不同，**取直链时不要自己编 `ppage_id`**
   （详见 `api/catalog.rs` 的注释：编错会直接 31863，表现是"所有歌都听不了"）。
+
+**歌词解析**
+
+- **「这一行算不算歌词」的判据只能有一处**（`api/lyric.rs::has_lyric_content`）。
+  `parse_lrc` 用它决定哪些行进 `Lyric`，`attach_translations` 用它算这些行在
+  **原始定时行**里的序号、好去语言轨（`[language:base64]`）里取译文。
+  两边各判一次、判据稍有不同，序号就整体错开一位，**之后每一行的译文都往后串**——
+  表现是「译文和原文对不上」，不报错、不崩溃，只能靠盯着歌词看。
+- **`<` 之前的字也是正文**。KRC 的标准写法是每行以 `<偏移,持续,0>` 开头，所以
+  标记之前通常是空的；但歌里出现「有 `<` 却没有配对 `>`」的文本时（比如 `宝贝<3`），
+  只收标记之后的字就会把整行丢掉。`parse_krc_words` 现在先收前缀，
+  而前缀没有逐字时间，于是 `words` 被那条「字数与标记数必须一致」的检查清空、
+  退回整行高亮——这是设计好的兜底，不是 bug。
+- 逐字信息宁可**没有**也不要**猜**：字数与标记数对不上时清空 `words`，
+  界面退回整行高亮。猜出来的时间会让整行唱得和声音对不上，比没效果更糟。
+
+**渲染 / 布局**
+
+- **`Ord::clamp` 在 `min > max` 时 panic**（`assert!(min <= max)`）。`x.clamp(1, area.height)`
+  这种写法在 `area.height == 0` 时是一颗定时炸弹，而它长得完全像防御性代码。
+  退化区域要先 `if area.width == 0 || area.height == 0 { return ...; }` 挡掉，
+  **不要**靠 `max(1)` 硬凑——凑出来的框会跑到区域外面，`area.width - columns`
+  接着下溢。踩过一次：`ui/views/player.rs::fit_box`。
+- 反过来也要注意：`area.width - columns` 这类减法在「框比区域大」时下溢，
+  所以算完框要**同时**断言 `框 ⊆ 区域`，别只断言「不 panic」。
+- **UI 层目前没有任何生产代码里的 `unwrap()` / `expect()`**（全都在 `#[cfg(test)]` 里）。
+  一次 panic 就是界面没了、终端留在 raw 模式，是最贵的一类故障——保持这个状态。
+- **宽而矮**的终端（比如 100×8）是布局最容易出问题的形状：宽屏分支开了、
+  高度却不够，`Min` 与 `Length` 抢空间。改布局后拿几个这样的尺寸过一遍
+  （`TestBackend` + `terminal.draw`，见 `render_home_in_a_short_wide_area_does_not_panic`）。
+  实测 `[Min(6), Length(8)]` 在空间不够时是 `Min` 赢，所以封面栏最低仍有 4 行——
+  但那是**实测出来的行为，不是文档承诺**，升级 ratatui 后要重新测。
 
 **测试**
 
@@ -416,3 +663,22 @@ cp src/audio/streaming.rs            > /tmp/mem-repro/src/new.rs
 
 判断"有没有持续泄漏"的方法：**跑够多的首歌（≥20）再看 RSS 是否收敛到同一个值**。
 修复后连播 24 首 RSS 稳定在 12.5 MiB 不动，就说明每条流的生命周期都收干净了。
+
+---
+
+## 7. 已知但**没有动**的地方
+
+这一节记的是「审查过、确认有问题或可疑，但这次故意没改」的东西。留着它们不是
+忘了，是改的代价或风险大于收益——动之前先读这里的理由。
+
+| 位置 | 问题 | 为什么没动 |
+|---|---|---|
+| `source/netease.rs::playlist_tracks_all` | 用「不满一页 ⇒ 结束」停翻页，与酷狗那侧「只有空页才停」的判据冲突。某页只要有一条被解析过滤掉，整张表就被静默截断 | 改了会多打一次越界请求，而**本机跑的是酷狗概念版服务（:3001），网易云那一侧没法实测**——万一越界 offset 让接口报错（而不是返回空数组），就从「截断但能听」变成「整次加载失败」。等能连上网易云服务再改 |
+| `source/netease.rs::plaza_playlists` / `artist_list` | 分类（`_category_id`）与地区（`_kind`）参数被忽略，但界面照常显示选择器 | 界面传下来的是**酷狗**那套分类 id，网易云要的是 `cat` 字符串 / `area`，两套对不上。补映射是新增功能，不是修 bug；先承认它不生效，别让用户以为筛选坏了 |
+| `api/catalog.rs::request_song_url_with_hash` | `Song.album_id` / `album_audio_id` 解析了但没发给 `/song/url` | 2026-09-28 在概念版服务上实测四种参数组合（不带 / 带 `ppage_id` / 带搜索给的 id / 带 `/privilege/lite` 给的 id）**都拿到了直链**，而 `status_reason()` 里记着「带 privilege 那个 id 会 status=3」的反例。传了没有可证明的收益、传错有明确代价，所以一个都不传；结论写在那里的注释里了 |
+| `api/model.rs::normalize_duration` | 用 10000 猜单位：9 秒的短曲（毫秒值 9000）会被当成 9000 秒；2.8 小时的长合集（秒值 10800）会被当成 10.8 秒 | 两个方向都在 1000–9999 这个区间里撞车，而实际接口各自的单位是**已知**的（搜索 `Duration` 秒、歌单 `timelen` 毫秒），这个兜底只在遇到没见过的形状时才生效。改阈值是把错从这个区间挪到那个区间，不是修好；有测试钉着当前行为，等真撞上再说 |
+| `config.rs::save` | 直接 `fs::write` 覆盖 `config.toml`，不是「写临时文件 + 改名」，崩溃时理论上会留下半个配置文件 | 配置文件只有几百字节，一次 `write` 系统调用写不满一个块，实际拿到的是旧内容或新内容，不是混合的；而且 `load()` 对坏文件是退默认配置并告警，最坏是「设置丢了要重新登录」。真要改得处理 Windows 上 `rename` 不能覆盖已存在文件的差异，收益配不上这个复杂度 |
+| `audio/download.rs` | 两条**整首**下载落在同一个目标上时（预取 vs 续播）仍会争用同一个 `.part` | 两条写的是同一个 URL 的同一份字节，最坏是后完的那次改名失败、报一次下载错误。触发链条很长（预取在飞 → 切歌 → 那一首又断流），先把「流式 × 整首」这个更容易撞的组合隔开就够了 |
+
+**改其中任何一条之前**，先看有没有办法真机验证——这几条的共同点就是「改了之后
+对不对，光靠单元测试看不出来」。

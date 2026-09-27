@@ -285,19 +285,32 @@ impl ApiClient {
 
             let mut set = tokio::task::JoinSet::new();
             for batch_page in page..=batch_end {
-                // 每页一份克隆：ApiClient 内部是 Arc，克隆很便宜
-                set.spawn(make(self.clone(), batch_page));
+                // 每页一份克隆：ApiClient 内部是 Arc，克隆很便宜。
+                // 把页码跟着结果一起搬回来——下面要按页码重排，见 `collected`。
+                let future = make(self.clone(), batch_page);
+                set.spawn(async move { future.await.map(|songs| (batch_page, songs)) });
             }
+
+            // `join_next()` 返回的是**任务完成顺序**，不是发起顺序。并发请求谁先回来
+            // 是不确定的，直接按返回顺序 `extend` 会让整表的页序被打乱：
+            // 榜单尤其致命——它的「顺序」就是榜单本身的内容。
+            //
+            // 所以先把一批的结果收进 `collected`，再按页码排好序拼上去。
+            let mut collected: Vec<(u32, Vec<Song>)> = Vec::with_capacity(
+                (batch_end.saturating_sub(page) + 1)
+                    .try_into()
+                    .unwrap_or(usize::MAX),
+            );
 
             let mut stop = false;
             while let Some(joined) = set.join_next().await {
                 match joined {
-                    Ok(Ok(songs)) => {
+                    Ok(Ok((_batch_page, songs))) => {
                         // 同理，只有空页才停；短页后面可能还有内容
                         if songs.is_empty() {
                             stop = true;
                         }
-                        all.extend(songs);
+                        collected.push((_batch_page, songs));
                     }
                     Ok(Err(error)) => {
                         // 页码越界 = 后面没有了，属正常终止，保留已取到的内容。
@@ -330,6 +343,12 @@ impl ApiClient {
                         return Err(AppError::Other(format!("翻页任务失败：{error}")));
                     }
                 }
+            }
+
+            // 按页码重排再拼——顺序错了整张表就是乱的（见上面那条注释）
+            collected.sort_by_key(|(batch_page, _)| *batch_page);
+            for (_batch_page, songs) in collected {
+                all.extend(songs);
             }
 
             if stop {
@@ -664,11 +683,21 @@ impl ApiClient {
     /// 所以**不传**，让服务端各用各的默认值：标准版拿它的硬编码、概念版拿它的
     /// 默认串，两种都对。
     ///
-    /// # 别省 `album_id` / `album_audio_id`
+    /// # 关于 `album_id` / `album_audio_id`
     ///
-    /// 服务端会用它们补 `dataMap`，实测能显著提高命中率（见 [`Song::album_audio_id`]
-    /// 的注释）。MoeKoeMusic 不传是因为它先查了 `/privilege/lite` 拿到可用 hash，
-    /// 而我们未登录时那一步走不通，只能靠这两个字段兜底。
+    /// **现在刻意不传它们**，尽管 `Song` 上有这两个字段（[`Song::album_audio_id`]）。
+    /// 2026-09-28 在概念版服务上实测过四种组合：只带 `hash` + `quality`、
+    /// 再加 `ppage_id`、再加 `album_id` + `album_audio_id`（搜索给的 `MixSongID`
+    /// 与 `/privilege/lite` 给的值都试了）——**四种都拿到了直链**，而且实测那两首歌
+    /// 的两个 id 完全相等。也就是说「传了命中率更高」在当前服务上没有体现。
+    ///
+    /// 反过来，[`Self::status_reason`] 里记着另一条实测：带 `/privilege/lite`
+    /// 返回的那个 `album_audio_id` 会让 `/song/url` 回 `status=3`、空 url。
+    /// 既然传没有可证明的收益、传错又有明确代价，**就一个都不传**。
+    ///
+    /// 哪天出现「hash 没问题但服务端死活不给直链」的歌，优先怀疑这里：把
+    /// `Song` 自己的 `album_id` / `album_audio_id` 加上去试一次（注意用歌曲自带
+    /// 的那组，不是 `/privilege/lite` 那组），并把结论记回这里。
     async fn request_song_url_with_hash(
         &self,
         _song: &Song,
@@ -979,6 +1008,104 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // ------------------------------------------------------------------
+    // 并发翻页的顺序
+    //
+    // `collect_all_pages` 是异步的，一批页同时发出去。测它需要一个真的服务端，
+    // 而且**必须能控制每页的返回顺序**——否则「页序对不对」只能碰运气。
+    // 和 `audio::download` 那组测试一样，用 std 的 TcpListener 手写一个，
+    // 不引 wiremock / httpmock。
+    // ------------------------------------------------------------------
+
+    /// 起一个「第 N 页等 `SLEW_MS * (7 - N)` 才回」的服务端。
+    ///
+    /// 于是第一批（页码 2..7）**必然**按 7、6、5、4、3、2 的顺序回来——
+    /// 正是把「按完成顺序拼接」打回原形的那种顺序。
+    fn spawn_paged_server() -> String {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        const LAST_PAGE: u32 = 7;
+        const SLEW_MS: u64 = 60;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+        let addr = listener.local_addr().expect("取本地地址");
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().expect("克隆流"));
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                // 只解析测试用得到的那一个参数
+                let page = line
+                    .split("page=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(['&', ' ']).next())
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .unwrap_or(0);
+
+                // 把请求头读完，否则 reqwest 会认为连接异常
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if header.trim().is_empty() => break,
+                        Ok(_) => {}
+                    }
+                }
+
+                // 高页码先回来：这是让测试**确定性**地暴露顺序问题的关键
+                if page < LAST_PAGE {
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        SLEW_MS * (LAST_PAGE - page) as u64,
+                    ));
+                }
+
+                let body = if page == 0 || page > LAST_PAGE {
+                    json!({"data": []})
+                } else {
+                    json!({"data": [{"hash": format!("h{page}"), "name": format!("第{page}页")}]})
+                };
+                let payload = body.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// **回归测试**：并发翻页的结果必须按页码拼，不能按完成顺序拼。
+    ///
+    /// 修复前 `collect_all_pages` 在 `join_next()` 里直接 `all.extend(songs)`，
+    /// 而 `join_next()` 给的是**任务完成顺序**。一批 6 页同时发出去，谁先回来
+    /// 谁先 append，于是整表的页序是随机的——榜单尤其致命，它的「顺序」就是
+    /// 榜单内容本身。
+    #[tokio::test]
+    async fn concurrent_pages_are_assembled_in_page_order() {
+        let client = ApiClient::new(&spawn_paged_server(), None, None).expect("构造客户端");
+
+        let songs = client
+            .playlist_tracks_all("any", false)
+            .await
+            .expect("翻页应当成功");
+
+        let hashes: Vec<&str> = songs.iter().map(|song| song.hash.as_str()).collect();
+        assert_eq!(
+            hashes,
+            vec!["h1", "h2", "h3", "h4", "h5", "h6", "h7"],
+            "整表必须按页码顺序，实际：{hashes:?}"
+        );
+    }
+
     #[test]
     fn finds_url_in_array_payload() {
         let root = json!({"data": [{"url": ["http://a/1.mp3"], "play_url": "http://a/2.mp3"}]});
@@ -1203,13 +1330,18 @@ mod tests {
         );
     }
 
-    /// 下架歌曲误判的修复点：同一个候选必须配**两个** album_audio_id 都试。
+    /// `/privilege/lite` 那一档里的 `album_audio_id` 要能被解析出来。
     ///
-    /// 实测概念版服务端：歌单条目给的 audio_id 能拿直链，而 /privilege/lite
-    /// 返回的那个（mixsongid）会让 /song/url 返回 status=3、空 url。只信后者
-    /// 会把能播的歌判成下架。
+    /// 这个字段**目前只解析、不发送**——见 [`ApiClient::request_song_url_with_hash`]
+    /// 里的说明：实测四种参数组合都能拿到直链，而带错 id 反而会让服务端回
+    /// `status=3`。留着它是因为那是「用户买的究竟是哪个版本」的唯一凭据，
+    /// 将来要在 `/song/url` 上补字段时，值就在这里，不用重新解析一遍。
+    ///
+    /// 注意别把它和搜索接口给的 `MixSongID` 混为一谈：实测同一个值在两处都出现过，
+    /// 但 [`ApiClient::status_reason`] 记着「带 privilege 那个会 status=3」的
+    /// 反面案例，所以两者在 `Song` 上是**分开存的**（`album_audio_id` 与 `audio_id`）。
     #[test]
-    fn candidates_carry_both_album_audio_ids() {
+    fn privilege_candidates_keep_the_server_side_album_audio_id() {
         // 构造一个 privilege 响应，variant 的 album_audio_id 与 Song 自己的不同
         let response = json!({
             "data": [{
@@ -1224,7 +1356,7 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].album_audio_id, "330978610");
 
-        // 上层会把 Song 自己的那个也并进来——这里直接验证 fallback 用的是 Song 的
+        // fallback 那一支用的是 Song 自己的 hash（它不携带 album_audio_id）
         let mut song = Song {
             name: "x".to_string(),
             hash: "h_128".to_string(),
