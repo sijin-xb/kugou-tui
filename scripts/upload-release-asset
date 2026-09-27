@@ -5,12 +5,14 @@
 # 为什么单独写一个脚本、而不是把这几行写在 YAML 里：这件事有两个坑，两个平台都要
 # 踩一遍，写进 YAML 就是复制粘贴两份（然后其中一份忘了改）。
 #
-# 1. **要等 Release 出现。** 本地 `scripts/release` 的顺序是「推 tag → 建 Release」，
-#    而 tag 一推 CI 就起来了——直接 upload 大概率撞上 release not found。
+# 1. **要等 Release 出现。** 建 Release 的可能是本地 `scripts/release`（它的顺序是
+#    「推 tag → 建 Release」），也可能是 CI 的 `prepare` job——后者让「只推 tag」
+#    成为可能。两种情况下 upload 都可能先于 release create 到达，直接传会撞上
+#    release not found。
 # 2. **要幂等。** 手动重跑（`workflow_dispatch` 补资产）时资产可能已经在了，
 #    要覆盖而不是报错退出。
 #
-# 两个平台共用同一个脚本：Windows runner 上 `shell: bash` 用的是 Git Bash，
+# 三个平台共用同一个脚本：Windows runner 上 `shell: bash` 用的是 Git Bash，
 # `gh` 与 glob 都在。这样逻辑只有一份，也能在开发机上真跑一遍。
 #
 # 用法：
@@ -31,7 +33,10 @@ fi
 # 等 Release 出现，最多 5 分钟。
 #
 # 判据是 **Release 本身**而不是 tag：tag 是 CI 的触发条件，走到这一步它必然已经在；
-# 真正要等的是本地那个 `gh release create`。
+# 真正要等的是**建 Release 那个动作**，谁做的不重要。
+#
+# 正常路径下三个平台 job 都 `needs: prepare`，走到这里 Release 已经在了，
+# 这个循环不会转——留着是给手动重跑兜底。
 deadline=$((SECONDS + 300))
 until gh release view "$tag" >/dev/null 2>&1; do
   if [ "$SECONDS" -ge "$deadline" ]; then
