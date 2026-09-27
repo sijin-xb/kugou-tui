@@ -8,6 +8,20 @@
 
 ### 变更
 
+- **只推 tag 就能发版**。`release.yml` 增加第一个 job `prepare`，由它调用新的
+  `scripts/release-notes` 从 `CHANGELOG.md` 取出该版本正文、建好 Release；三个平台
+  job 都 `needs: prepare`。
+
+  此前 Release 只能由本地 `scripts/release` 创建，工作流只负责**等**它出现——于是
+  「只推 tag」是不成立的：tag 一推 CI 就起来，等满 5 分钟也没有 Release，三个 job
+  一起失败。现在 `git tag … && git push origin <tag>` 一条路走完。
+
+  `scripts/release-notes` 是从 `scripts/release` 里那段 `awk` 抽出来的：这段正文有
+  两个消费方（本地发版与 CI），写成两份必然漂移，而发行说明是发布页的门面。
+
+  > 代价：只推 tag 不会更新 AUR 的 `PKGBUILD` / `.SRCINFO`，也不校验 CHANGELOG
+  > 有对应版本节。要同时发 AUR 仍然得跑 `scripts/release`。
+
 - **Linux 发行包也由 CI 产出**。此前只有 Windows 与 macOS 交给 CI，Linux 那份由本地
   `scripts/release` 编好上传——那意味着**开发机不在手边就发不出 Linux 包**：换机器、
   重装，或者只想给一个已经发过的版本补资产，都得先把 Rust 工具链与整棵依赖树重建一遍。

@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+#
+# release-notes —— 从 CHANGELOG.md 里取出指定版本的正文。
+#
+# # 为什么单独一个脚本
+#
+# 这段正文有**两个**消费方：
+#
+#   1. 本地 `scripts/release` —— 写进附注 tag 的注释，以及 GitHub Release 的正文；
+#   2. `.github/workflows/release.yml` —— 只推 tag 时由 CI 建 Release，同样要这段正文。
+#
+# 写成两份必然漂移，而发行说明是发布页的门面：漂移一次，就是对下载页上的人
+# 说错一次话。所以抽成一份，两边都调它。
+#
+# # 用法
+#
+#   ./scripts/release-notes 0.4.3      # 版本号，带不带 v 都行
+#   ./scripts/release-notes v0.4.3
+#
+# 正文写到 stdout。找不到该节、或该节是空的，就以非零码退出——
+# 「发行说明为空」不能悄悄放过去，那正是这个脚本要防的事。
+#
+# # 取的是「正文」不是「整节」
+#
+# 从 `## [X.Y.Z]` 那一行之后开始，到下一个 `## [` 之前结束。标题行本身不算正文
+# ——它会被当作 Release 标题，正文里再来一遍是重复。
+
+set -euo pipefail
+
+version="${1:-}"
+if [ -z "$version" ]; then
+  echo "用法：release-notes <版本号>（如 0.4.3，带不带 v 都行）" >&2
+  exit 1
+fi
+# 两种写法都收：tag 是 v0.4.3，CHANGELOG 的节标题是 [0.4.3]
+version="${version#v}"
+
+# 本脚本所在的真实目录。
+#
+# **不用 `readlink -f`**：那是 GNU 的扩展，BSD（macOS）的 readlink 没有 `-f`。
+# 与 `scripts/make-release-tarball` 里同一个理由、同一段实现——脚本可能被软链进
+# PATH，也可能在 macOS 的 runner 上跑。
+self_dir() {
+  local target="${BASH_SOURCE[0]}"
+  while [ -L "$target" ]; do
+    local link
+    link=$(readlink "$target")
+    case "$link" in
+      /*) target="$link" ;;
+      *) target="$(dirname "$target")/$link" ;;
+    esac
+  done
+  cd -P -- "$(dirname -- "$target")" && pwd
+}
+
+repo_dir=$(cd -- "$(self_dir)/.." && pwd -P)
+changelog="$repo_dir/CHANGELOG.md"
+
+[ -f "$changelog" ] || {
+  echo "找不到 $changelog" >&2
+  exit 1
+}
+
+# 取节正文。
+#
+# `next` 是必须的：没有它，标题行自己也会被打印进正文。
+# 结尾的 `exit` 而不是置 `inside = 0`：后面的节一律不看，省掉整篇扫描。
+notes=$(awk -v version="$version" '
+  $0 ~ "^## \\[" version "\\]" { inside = 1; next }
+  inside && /^## \[/ { exit }
+  inside { print }
+' "$changelog")
+
+# 掐掉首尾的空行。CHANGELOG 里 `## [X.Y.Z]` 与第一个 `###` 之间有空行，
+# 直接塞进 Release 会在正文顶部留一段空白。
+notes=$(printf '%s\n' "$notes" | sed -e '/./,$!d' -e ':a' -e '/^\n*$/{$d;N;ba' -e '}')
+
+if [ -z "$notes" ]; then
+  echo "CHANGELOG.md 里没有 '## [$version]' 一节，或者该节是空的。" >&2
+  echo "发行说明是给下载页上的人看的，不能省。" >&2
+  exit 1
+fi
+
+printf '%s\n' "$notes"

@@ -204,14 +204,11 @@ release_sha=$(sha256sum "$tarball" | cut -d' ' -f1)
 # 打开下载页面的人来说那等于没写：他要在这里看到「改了什么」，而不是一个还要自己
 # 点进仓库去找的链接。（release notes 是发布页的门面，正文得在这儿。）
 #
-# 抽出来的正文同时给两处用：附注 tag 的注释、Release 的正文。
-release_notes=$(awk -v version="$version" '
-  $0 ~ "^## \\[" version "\\]" { inside = 1; next }
-  inside && /^## \[/ { exit }
-  inside { print }
-' CHANGELOG.md)
-[ -n "$release_notes" ] ||
-  die "CHANGELOG 的 [$version] 一节是空的——发行说明不能是空的，那是给用户看的门面"
+# 抽取逻辑在 `scripts/release-notes`，**不是**留在这里的一段 awk：CI 的
+# `release.yml` 在只推 tag 时也要同一段正文，两边各写一份必然漂移。
+# 取出来的正文同时给两处用：附注 tag 的注释、Release 的正文。
+release_notes=$(./scripts/release-notes "$version") ||
+  die "取不到 CHANGELOG 的 [$version] 一节正文——发行说明不能是空的，那是给用户看的门面"
 
 # 清单必须**跟着 --no-aur 变**。这个脚本存在的意义就是让人在按下回车之前看清
 # 「将要发生什么」——列了 AUR 却跳过它，清单本身就是假的，正是它要防的那类事。

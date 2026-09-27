@@ -54,8 +54,45 @@ env:
   TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
+  # 先建 Release，再让三个平台往里挂资产。
+  #
+  # # 为什么需要它
+  #
+  # 早先 Release 由本地 `scripts/release` 建（它的顺序是「推 tag → 建 Release」），
+  # 这个工作流只负责**等**它出现。那样「只推 tag 就发版」是不成立的：tag 一推 CI
+  # 就起来了，等满 5 分钟也没有 Release，三个 job 会一起失败。
+  #
+  # 现在改成 CI 自己建，于是**推 tag 就够了**，不需要本地跑任何东西。
+  # 本地 `scripts/release` 仍然可用：它先建，这里再建会发现已存在而跳过——
+  # 两条路互不干扰，谁先到谁负责创建。
+  prepare:
+    name: 建 Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: 建 Release（已存在则跳过）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$TAG"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag 已存在，跳过创建。"
+            exit 0
+          fi
+          # 正文取 CHANGELOG 里这一节的正文——与本地发版同一份来源，
+          # 共用 `scripts/release-notes`，两边不会漂移。
+          # 取不到就让它失败：发行说明是发布页的门面，空着比没有更糟。
+          notes=$(./scripts/release-notes "$tag")
+          gh release create "$tag" --title "$tag" --notes "$notes"
+          echo "已创建 Release $tag"
+
   linux:
     name: Linux 包
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -102,6 +139,7 @@ jobs:
 
   windows:
     name: Windows 包
+    needs: prepare
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -140,6 +178,7 @@ jobs:
 
   macos:
     name: macOS 包
+    needs: prepare
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
