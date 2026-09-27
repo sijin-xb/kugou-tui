@@ -232,6 +232,7 @@ impl App {
                 self.click_list_row(zone, mouse)
             }
             HitTarget::Progress => self.click_progress(zone, mouse),
+            HitTarget::LyricLine => self.click_lyric(zone, mouse),
             HitTarget::Settings => self.click_setting(zone, mouse),
             HitTarget::VipClaim => self.claim_daily_vip(),
             HitTarget::ProfileRetry => {
@@ -272,6 +273,7 @@ impl App {
             }
             HitTarget::Tab(_)
             | HitTarget::Progress
+            | HitTarget::LyricLine
             | HitTarget::Settings
             | HitTarget::VipClaim
             | HitTarget::ProfileRetry => {
@@ -419,6 +421,7 @@ impl App {
             }
             HitTarget::Tab(_)
             | HitTarget::Progress
+            | HitTarget::LyricLine
             | HitTarget::Settings
             | HitTarget::VipClaim
             | HitTarget::ProfileRetry => {
@@ -658,6 +661,16 @@ impl App {
                 let next = config.lyric_offset_ms + delta as i64 * s::LYRIC_OFFSET_STEP;
                 config.lyric_offset_ms = next.clamp(-s::LYRIC_OFFSET_LIMIT, s::LYRIC_OFFSET_LIMIT);
             }
+            s::Setting::LyricAnimMs => {
+                if let Some(next) = s::cycle(&s::LYRIC_ANIM_OPTIONS, config.lyric_anim_ms, delta) {
+                    config.lyric_anim_ms = next;
+                    // 关掉动画时把在飞的过渡也收干净，否则「关」要等这一轮走完
+                    // 才生效——用户看到的是「按了没反应」。
+                    if next == 0 {
+                        self.state.lyric.reset_transition();
+                    }
+                }
+            }
             s::Setting::PageSize => {
                 if let Some(next) = s::cycle(&s::PAGE_SIZE_OPTIONS, config.page_size, delta) {
                     config.page_size = next;
@@ -787,6 +800,31 @@ impl App {
         self.state.position_ms = target;
     }
 
+    /// 点击歌词行：跳到这一句的起始时间。
+    ///
+    /// 命中区记的是**显示行**（译文/音译各占一行），而跳转要的是**歌词行**，
+    /// 所以经 `display_line_index` 换一次下标——那个映射由渲染层每帧回填，
+    /// 因为只有它知道这次滚动到了哪里。
+    fn click_lyric(&mut self, zone: HitZone, mouse: &MouseEvent) {
+        let Some(display) = zone.index_at(mouse.row) else {
+            return;
+        };
+        let Some(line_index) = self.state.lyric.line_index_at_display(display) else {
+            return;
+        };
+        let Some(line) = self.state.lyric.lyric.lines.get(line_index) else {
+            return;
+        };
+
+        // **要加回歌词偏移**：当前行是按 `position - lyric_offset_ms` 算出来的，
+        // 直接跳到 `line.time_ms` 会正好差一句。偏移为 0 时看不出，调过的人一眼
+        // 就发现。
+        self.seek_to(lyric_seek_target(
+            line.time_ms,
+            self.state.config.lyric_offset_ms,
+        ));
+    }
+
     /// 把焦点切到命中区对应的面板。离开搜索框时退出输入态，否则字母键会被吞掉。
     fn focus_hit_target(&mut self, target: HitTarget) {
         let focus = match target {
@@ -795,8 +833,10 @@ impl App {
             HitTarget::Queue => Focus::Queue,
             HitTarget::Settings => Focus::Primary,
             // 领取 VIP 是一行即时动作，不改变焦点——点完继续看首页
+            // 歌词行同理：点它是「跳到这句」，跳完还在原处看歌词
             HitTarget::Tab(_)
             | HitTarget::Progress
+            | HitTarget::LyricLine
             | HitTarget::VipClaim
             | HitTarget::ProfileRetry => return,
         };
@@ -3565,7 +3605,9 @@ impl App {
                 let empty = lyric.is_empty();
                 self.state.lyric.lyric = lyric;
                 self.state.lyric.load.succeed();
-                self.state.lyric.active_line = None;
+                // 换歌了：过渡状态一并复位，否则新歌的第一句会从上一首的某一行
+                // 淡过来，看着像歌词串了。
+                self.state.lyric.reset_transition();
                 if empty {
                     tlog!(crate::logger::LEVEL_DEBUG, "歌曲 {hash} 没有可用歌词");
                 }
@@ -3578,7 +3620,7 @@ impl App {
                 }
                 self.state.lyric.lyric = crate::api::model::Lyric::default();
                 self.state.lyric.load.fail(reason);
-                self.state.lyric.active_line = None;
+                self.state.lyric.reset_transition();
             }
 
             Loaded::StreamReady {
@@ -4307,6 +4349,9 @@ impl App {
             self.state.spectrum.clear();
         }
         self.state.advance_visualizer(elapsed);
+        // 歌词换行的过渡时钟。放在 `update_active_lyric` **之前**：这样本帧刚换的行
+        // 从 t = 0 开始渲染，不会先闪一帧稳态再开始淡。
+        self.state.lyric.advance_transition(elapsed);
 
         // 桌面集成只在 Unix 上存在（MPRIS / StatusNotifierItem 都是 D-Bus 接口）
         #[cfg(unix)]
@@ -4342,9 +4387,18 @@ impl App {
         // 正值表示歌词提前，所以要从播放位置里减掉偏移
         let position = (self.state.position_ms as i64 - self.state.config.lyric_offset_ms).max(0);
         let index = self.state.lyric.lyric.index_at(position as u64);
-        if index != self.state.lyric.active_line {
-            self.state.lyric.active_line = index;
+        if index == self.state.lyric.active_line {
+            return;
         }
+        // 换行了：记下旧锚点、算这次该用多长的过渡。
+        //
+        // 时长在这里算而不是在渲染层：它要用到「行距」与「跨了几行」，都是
+        // 状态层的知识；渲染层只管拿一个进度 t 去插值。
+        let total =
+            self.state
+                .lyric
+                .transition_ms_for(&self.state.config, self.state.duration_ms, index);
+        self.state.lyric.retarget(index, total);
     }
 
     /// 取一条事件，最多处理 [`MAX_EVENTS_PER_FRAME`] 条，防止事件洪水饿死渲染。
@@ -4359,6 +4413,15 @@ impl App {
             }
         }
     }
+}
+
+/// 点击歌词行时该跳到的播放位置。
+///
+/// 抽成自由函数是为了能直接测：`+ lyric_offset_ms` 这一步漏了**不会报错**，
+/// 只会「跳过去正好差一句」——偏移为 0 时完全看不出来，而调过偏移的人一眼就发现。
+/// 这正是那种只能靠测试兜住的错。
+pub fn lyric_seek_target(line_time_ms: u64, lyric_offset_ms: i64) -> u64 {
+    line_time_ms.saturating_add_signed(lyric_offset_ms)
 }
 
 /// `歌手 - 歌名`，用于状态栏与提示。
@@ -4451,6 +4514,26 @@ fn needs_full_fetch(fetched_page: u32, received: usize, page_limit: u32) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 点歌词行跳转必须**加回歌词偏移**。
+    ///
+    /// 漏掉这一步不会报错，只会「跳过去正好差一句」：偏移为 0 时完全看不出来，
+    /// 调过偏移的人一眼就发现。三档偏移各验一次。
+    #[test]
+    fn lyric_seek_adds_the_offset_back() {
+        // 偏移为 0：跳过去就是这一句
+        assert_eq!(lyric_seek_target(12_000, 0), 12_000);
+        // 正值（歌词提前显示）：这一句实际出现在 12_000 + 300
+        assert_eq!(lyric_seek_target(12_000, 300), 12_300);
+        // 负值（歌词延后）：实际出现在 12_000 - 300
+        assert_eq!(lyric_seek_target(12_000, -300), 11_700);
+    }
+
+    /// 偏移大到把目标压到 0 以下时不能下溢成天文数字。
+    #[test]
+    fn lyric_seek_saturates_at_zero() {
+        assert_eq!(lyric_seek_target(100, -5_000), 0);
+    }
 
     /// 倒序（默认）时首屏取最后一页——这是「进歌单先看到最老的歌」那个问题的正解。
     #[test]

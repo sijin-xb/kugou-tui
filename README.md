@@ -35,8 +35,8 @@
 支持 **Linux**（主力平台）与 **Windows 10/11 x86_64**；**macOS 理论可用、CI 覆盖但未在真机长期使用**——
 三者的差异见下面的对照表。
 
-**最省事：下预编译包。** [Releases](https://github.com/sijin-xb/kugou-tui/releases) 里有
-Linux tarball 与 Windows zip，都带着脚本与文档：
+**最省事：下预编译包。** [Releases](https://github.com/sijin-xb/kugou-tui/releases) 里
+**三个平台都有**（Linux tarball / Windows zip / macOS tarball），都带着脚本与文档：
 
 ```bash
 # Linux
@@ -99,7 +99,7 @@ cd kugou-tui && cargo build --release
 | 浏览 | 歌单广场、歌手列表（可按地区筛选）、排行榜、个人云端歌单 |
 | 检索 | 单曲搜索，结果按服务端相关性排序，`M` 加载更多 |
 | 播放 | 播放/暂停、上下首、±5 秒跳转、音量、静音；顺序 / 列表循环 / 单曲循环 / 随机 |
-| 歌词 | 逐字高亮（KRC）、译文与音译、卡拉 OK 式居中滚动、±100 ms 偏移微调 |
+| 歌词 | 逐字高亮（KRC）、译文与音译、卡拉 OK 式居中滚动、换行淡入淡出、**点歌词行跳到这一句**、±100 ms 偏移微调 |
 | 可视化 | 真频谱：FFT + 对数分频，贝斯亮左、镲片亮右 |
 | 播放队列 | 追加（`a`）、插播下一首（`i`）、整列表加入（`A`）、移除（`x`）、清空（`X`） |
 | 云端歌单 | 收藏单曲（`s`）、整个队列同步（`S`）、增删歌单（`N` / `D`） |

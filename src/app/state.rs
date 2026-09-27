@@ -218,6 +218,8 @@ pub enum HitTarget {
     Queue,
     /// 播放条的进度条区域：点击可跳转进度。
     Progress,
+    /// 歌词面板的一行：点击跳转到这一句的起始时间。
+    LyricLine,
     /// 设置页的条目列表。
     Settings,
     /// 「我的资料」里的「领取今日 VIP」那一行。
@@ -901,6 +903,19 @@ impl Connection {
     }
 }
 
+/// 歌词换行过渡：一次过渡最多跨多少行。
+///
+/// 拖动进度条、点歌词行跳转会一次跨几十行，逐行淡过去又慢又晕；超过这个跨度
+/// 就直接吸附到目标行（见 [`LyricPane::transition_ms_for`]）。
+const LYRIC_ANIM_MAX_LINES: usize = 3;
+
+/// 过渡时长相对「该行到下一行的间隔」的比例。
+///
+/// 快歌的行只有几百毫秒，按配置上限走会出现「上一次过渡还没走完就该换下一行」——
+/// 看着不是顺滑，是拖沓。取 0.55 是留出「过渡结束 → 稳定几帧 → 下一次换行」的
+/// 呼吸感；再小就显得急促了。
+const LYRIC_ANIM_SPAN_RATIO: f32 = 0.55;
+
 /// 歌词面板状态。
 #[derive(Debug, Default)]
 pub struct LyricPane {
@@ -910,6 +925,117 @@ pub struct LyricPane {
     pub load: LoadState,
     /// 已渲染过的当前行下标，用于只在换行时重新计算居中偏移。
     pub active_line: Option<usize>,
+
+    // ---- 换行过渡 ----
+    /// 过渡的**旧锚点**（歌词行下标）。`None` 表示这次过渡没有旧行可淡出
+    /// （歌曲刚开始唱第一句）。
+    pub prev_line: Option<usize>,
+    /// 过渡已走过的毫秒数。
+    pub transition_ms: f32,
+    /// 这次过渡的总时长（毫秒）。`0` 表示不做过渡——此时
+    /// [`Self::transition_progress`] 恒为 `1.0`，也就是稳态。
+    ///
+    /// 默认值就是 `0`，这一点是刻意的：所有既有的渲染测试都只设 `active_line`
+    /// 而不碰过渡状态，于是它们断言的仍是稳态配色，一行都不用改。
+    pub transition_total_ms: f32,
+
+    /// 本帧显示的第 N 行对应哪个歌词行下标。
+    ///
+    /// 由 `render_lyric` 回填、[`AppState::begin_frame`] 清空——和 `hit_zones`
+    /// 同一套约定：只有渲染层知道行几何（译文/音译会让显示行与歌词行不再一一对应），
+    /// 而点击要的是歌词行。
+    pub display_line_index: Vec<usize>,
+}
+
+impl LyricPane {
+    /// 换行过渡的进度 `t ∈ [0, 1]`，`1.0` 表示稳态（没有过渡在进行）。
+    ///
+    /// 用 ease-out cubic：前 1/3 时间走完约 2/3 的视觉变化，之后缓慢收敛。
+    /// 线性缓动在终端里「起步发木」——而这个动画总共只有几帧（200ms / 33ms），
+    /// 起步那两帧的差别恰恰最明显。
+    pub fn transition_progress(&self) -> f32 {
+        if self.transition_total_ms <= 0.0 {
+            return 1.0;
+        }
+        let raw = (self.transition_ms / self.transition_total_ms).clamp(0.0, 1.0);
+        1.0 - (1.0 - raw).powi(3)
+    }
+
+    /// 推进过渡时钟。
+    ///
+    /// 时钟来自 `Event::Tick` 的 `elapsed` 累加，而不是 `Instant::now()`——
+    /// 与 `advance_visualizer` 同一套做法，好处是测试能喂固定步长。
+    pub fn advance_transition(&mut self, elapsed: std::time::Duration) {
+        if self.transition_total_ms <= 0.0 || self.transition_ms >= self.transition_total_ms {
+            return;
+        }
+        self.transition_ms += elapsed.as_secs_f32() * 1000.0;
+        if self.transition_ms >= self.transition_total_ms {
+            // 走完就收尾：清掉旧锚点，渲染层之后走稳态路径（不做浮点插值）。
+            self.transition_ms = self.transition_total_ms;
+            self.prev_line = None;
+        }
+    }
+
+    /// 换行：记下旧锚点、把时钟归零。`total_ms` 为 `0` 表示不做过渡。
+    pub fn retarget(&mut self, new_line: Option<usize>, total_ms: f32) {
+        self.prev_line = self.active_line;
+        self.active_line = new_line;
+        self.transition_ms = 0.0;
+        self.transition_total_ms = total_ms;
+    }
+
+    /// 本次换行该用多长的过渡（毫秒）。`0` 表示不做过渡。
+    ///
+    /// 四道否决，顺序即优先级：
+    ///
+    /// 1. 用户把 `lyric_anim_ms` 设成 `0`（或开了 `lite_mode` / 16 色模式）；
+    /// 2. 新状态是「没有当前行」（停止、重放回前奏）——没有新行可点亮；
+    /// 3. 跨行太多（拖动进度条、点行跳转）——逐行淡过去又慢又晕；
+    /// 4. 其余按行距自适应，上限是用户配的值。
+    pub fn transition_ms_for(&self, config: &Config, duration_ms: u64, next: Option<usize>) -> f32 {
+        let cap = config.lyric_anim_ms as f32;
+        // `lite_mode` 的卖点就是少重绘；16 色下 `theme::mix` 没有中间色阶可取
+        // （只能二选一），淡入会退化成「t 过 0.5 时整块硬翻」，比不动画更怪。
+        if cap <= 0.0 || config.lite_mode || config.basic_color {
+            return 0.0;
+        }
+        let Some(next) = next else {
+            return 0.0;
+        };
+        if let Some(prev) = self.active_line
+            && next.abs_diff(prev) >= LYRIC_ANIM_MAX_LINES
+        {
+            return 0.0;
+        }
+        (self.line_span_ms(next, duration_ms) * LYRIC_ANIM_SPAN_RATIO).min(cap)
+    }
+
+    /// 第 `index` 行持续多久（到下一行的时间差）。最后一行用歌曲总时长兜底。
+    fn line_span_ms(&self, index: usize, duration_ms: u64) -> f32 {
+        let Some(line) = self.lyric.lines.get(index) else {
+            return 0.0;
+        };
+        let next_ms = self
+            .lyric
+            .lines
+            .get(index + 1)
+            .map_or_else(|| duration_ms.max(line.time_ms + 1), |next| next.time_ms);
+        next_ms.saturating_sub(line.time_ms) as f32
+    }
+
+    /// 显示行号 → 歌词行号。越界返回 `None`。
+    pub fn line_index_at_display(&self, display: usize) -> Option<usize> {
+        self.display_line_index.get(display).copied()
+    }
+
+    /// 切歌 / 清空歌词时复位过渡状态：新歌的第一句不该从上一首的某一行淡过来。
+    pub fn reset_transition(&mut self) {
+        self.active_line = None;
+        self.prev_line = None;
+        self.transition_ms = 0.0;
+        self.transition_total_ms = 0.0;
+    }
 }
 
 // ============================================================================
@@ -1428,6 +1554,9 @@ impl AppState {
     /// 供 ui 层在每帧开始时调用：清掉上一帧的命中区。
     pub fn begin_frame(&mut self) {
         self.hit_zones.clear();
+        // 同 `hit_zones`：本帧的歌词行映射只对「这一帧画出来的东西」有效，
+        // 留着上一帧的会让点击跳到已经滚走的那一句。
+        self.lyric.display_line_index.clear();
         // 每帧先当作「没画歌词」，由 `render_lyric` 在真的画出内容时置位。
         // 不复位的话，切走标签页之后还会一直按 30fps 重绘。
         self.lyric_visible = false;
@@ -1754,6 +1883,217 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ================================================================
+    // 歌词换行过渡
+    // ================================================================
+
+    use crate::api::model::{Lyric, LyricLine};
+    use std::time::Duration;
+
+    fn lyric_with(times: &[u64]) -> Lyric {
+        Lyric {
+            lines: times
+                .iter()
+                .map(|time_ms| LyricLine {
+                    time_ms: *time_ms,
+                    text: "词".to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+
+    fn config(anim_ms: u64) -> Config {
+        Config {
+            lyric_anim_ms: anim_ms,
+            ..Config::default()
+        }
+    }
+
+    /// 一个已经载入歌词、当前行已定的面板。
+    ///
+    /// 用构造式而不是「先 `default()` 再逐字段赋值」：后者会撞 clippy 的
+    /// `field_reassign_with_default`，而且字段一多就看不出到底设了什么。
+    fn pane_with(times: &[u64], active: Option<usize>) -> LyricPane {
+        LyricPane {
+            lyric: lyric_with(times),
+            active_line: active,
+            ..LyricPane::default()
+        }
+    }
+
+    /// 没换过行时必须是**稳态**——这条是既有渲染测试能一行不改的前提：
+    /// 它们只设 `active_line`，不碰过渡状态，断言的是改造前的配色。
+    #[test]
+    fn progress_is_settled_before_any_line_change() {
+        let pane = LyricPane::default();
+        assert_eq!(pane.transition_progress(), 1.0);
+    }
+
+    /// 换行瞬间进度为 0，走完一个时长后到 1 并收掉旧锚点。
+    #[test]
+    fn transition_runs_from_zero_to_one_then_settles() {
+        let mut pane = LyricPane::default();
+        pane.retarget(Some(3), 200.0);
+        assert_eq!(pane.transition_progress(), 0.0, "换行那一帧应当是 t = 0");
+
+        pane.advance_transition(Duration::from_millis(100));
+        let half = pane.transition_progress();
+        assert!(half > 0.5, "ease-out 前半段就该走完大半：{half}");
+        assert!(half < 1.0);
+
+        pane.advance_transition(Duration::from_millis(120));
+        assert_eq!(pane.transition_progress(), 1.0, "超时后必须正好收在 1.0");
+        assert_eq!(pane.prev_line, None, "走完要清掉旧锚点，渲染层才走稳态路径");
+    }
+
+    /// 过渡走完之后再推进时钟不该有任何变化（稳态不能被越推越偏）。
+    #[test]
+    fn advancing_after_settle_changes_nothing() {
+        let mut pane = LyricPane::default();
+        pane.retarget(Some(1), 100.0);
+        pane.advance_transition(Duration::from_millis(500));
+        let settled = pane.transition_progress();
+        pane.advance_transition(Duration::from_secs(10));
+        assert_eq!(pane.transition_progress(), settled);
+    }
+
+    /// `total_ms = 0` 表示不做过渡，进度必须直接是 1.0——否则会卡在 0 上，
+    /// 表现为「整块歌词一直是暗的」。
+    #[test]
+    fn zero_duration_means_no_transition() {
+        let mut pane = LyricPane::default();
+        pane.retarget(Some(2), 0.0);
+        assert_eq!(pane.transition_progress(), 1.0);
+    }
+
+    /// 四道否决：用户关了 / `lite_mode` / 16 色 / 跨行太多。
+    #[test]
+    fn transition_is_skipped_when_it_should_be() {
+        let pane = pane_with(&[0, 1_000, 2_000, 3_000, 4_000, 5_000], Some(0));
+
+        assert_eq!(
+            pane.transition_ms_for(&config(0), 60_000, Some(1)),
+            0.0,
+            "用户关了"
+        );
+        assert_eq!(
+            pane.transition_ms_for(
+                &Config {
+                    lite_mode: true,
+                    ..config(200)
+                },
+                60_000,
+                Some(1)
+            ),
+            0.0,
+            "简易模式要的就是少重绘"
+        );
+        assert_eq!(
+            pane.transition_ms_for(
+                &Config {
+                    basic_color: true,
+                    ..config(200)
+                },
+                60_000,
+                Some(1)
+            ),
+            0.0,
+            "16 色没有中间色阶，淡入会退化成整块硬翻"
+        );
+        assert_eq!(
+            pane.transition_ms_for(&config(200), 60_000, None),
+            0.0,
+            "变成「没有当前行」时没有新行可点亮"
+        );
+        assert_eq!(
+            pane.transition_ms_for(&config(200), 60_000, Some(5)),
+            0.0,
+            "跨 5 行是拖动进度条，逐行淡过去又慢又晕"
+        );
+        assert!(
+            pane.transition_ms_for(&config(200), 60_000, Some(2)) > 0.0,
+            "跨 2 行是正常换行，应当有过渡"
+        );
+    }
+
+    /// 时长按行距自适应：短行压短，长行取用户配的上限。
+    #[test]
+    fn duration_adapts_to_the_line_span() {
+        // 行距 300ms → 300 × 0.55 = 165ms，低于上限 200
+        let short_pane = pane_with(&[0, 300, 600], Some(0));
+        let short = short_pane.transition_ms_for(&config(200), 60_000, Some(1));
+        assert!(
+            (short - 165.0).abs() < 0.01,
+            "短行应当压到 165ms，实际 {short}"
+        );
+
+        // 行距 10s → 5.5s，被用户配的 200ms 封顶
+        let long_pane = pane_with(&[0, 10_000], Some(0));
+        assert_eq!(
+            long_pane.transition_ms_for(&config(200), 60_000, Some(1)),
+            200.0
+        );
+    }
+
+    /// 最后一行没有「下一行」，用歌曲总时长兜底——不能算出 0 而丢掉过渡。
+    #[test]
+    fn last_line_falls_back_to_the_song_duration() {
+        let pane = pane_with(&[0, 1_000], Some(0));
+        let total = pane.transition_ms_for(&config(200), 60_000, Some(1));
+        assert_eq!(total, 200.0, "60s 的兜底远大于上限，应当取上限");
+
+        // 总时长也很短时（比如最后一句接尾奏），仍要给出一个正数
+        let total = pane.transition_ms_for(&config(200), 1_200, Some(1));
+        assert!(total > 0.0 && total <= 200.0, "实际 {total}");
+    }
+
+    /// 切歌 / 清空歌词要把过渡状态一并复位，否则新歌第一句会从上一首淡过来。
+    #[test]
+    fn reset_clears_everything() {
+        let mut pane = LyricPane::default();
+        pane.retarget(Some(4), 200.0);
+        pane.advance_transition(Duration::from_millis(50));
+        pane.reset_transition();
+
+        assert_eq!(pane.active_line, None);
+        assert_eq!(pane.prev_line, None);
+        assert_eq!(pane.transition_progress(), 1.0);
+    }
+
+    /// 换行时旧锚点要接住**换行前**的当前行，而不是换行后的。
+    #[test]
+    fn retarget_keeps_the_previous_anchor() {
+        let mut pane = pane_with(&[0, 1_000, 2_000], Some(7));
+        pane.retarget(Some(8), 200.0);
+        assert_eq!(pane.active_line, Some(8));
+        assert_eq!(pane.prev_line, Some(7), "旧锚点必须是 7，否则没有行会淡出");
+    }
+
+    /// 过渡没走完就再次换行：旧锚点改成「上一次的当前行」，不会闪烁。
+    #[test]
+    fn retarget_mid_flight_uses_the_latest_anchor() {
+        let mut pane = LyricPane::default();
+        pane.retarget(Some(1), 200.0);
+        pane.advance_transition(Duration::from_millis(60));
+        pane.retarget(Some(2), 200.0);
+        assert_eq!(pane.prev_line, Some(1));
+        assert_eq!(pane.transition_progress(), 0.0, "时钟归零，从头淡向新行");
+    }
+
+    /// 显示行 → 歌词行的映射：越界给 `None`，不能 panic。
+    #[test]
+    fn display_line_mapping_is_bounds_checked() {
+        let pane = LyricPane {
+            display_line_index: vec![0, 0, 1],
+            ..LyricPane::default()
+        };
+        assert_eq!(pane.line_index_at_display(0), Some(0));
+        assert_eq!(pane.line_index_at_display(1), Some(0), "译文行仍属于同一句");
+        assert_eq!(pane.line_index_at_display(2), Some(1));
+        assert_eq!(pane.line_index_at_display(3), None);
+    }
 
     // ================================================================
     // LoadState：载入三态

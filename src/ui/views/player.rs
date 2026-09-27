@@ -189,8 +189,26 @@ const LYRIC_FADE_SPAN: f32 = 4.0;
 ///
 /// 距离 1 是紧邻当前行的那一行，它应当保持原来的 idle 色（比例 0），
 /// 所以先把 1 减掉再算。
-fn fade_ratio(distance: usize) -> f32 {
-    (distance.saturating_sub(1) as f32 / LYRIC_FADE_SPAN).min(1.0)
+///
+/// 参数是**浮点**而不是整数，因为换行过渡期间距离是插值出来的：`t = 0` 时按旧
+/// 当前行算、`t = 1` 时按新的算，中间几帧是小数。稳态下传进来的仍是整数值，
+/// 结果与改造前逐位相同。
+fn fade_ratio(distance: f32) -> f32 {
+    ((distance - 1.0).max(0.0) / LYRIC_FADE_SPAN).min(1.0)
+}
+
+/// 两个距离之间按 `t` 线性插值。`t = 0` 取 `from`、`t = 1` 取 `to`。
+///
+/// 单独写一个而不是用 `from + (to - from) * t`：`t = 1` 时后者会因为浮点误差
+/// 差一个 ulp，而稳态配色是拿精确相等做断言的（`distant_lines_fade_out` 就是）。
+fn lerp(from: f32, to: f32, t: f32) -> f32 {
+    if t >= 1.0 {
+        return to;
+    }
+    if t <= 0.0 {
+        return from;
+    }
+    from + (to - from) * t
 }
 
 /// 歌词面板。
@@ -281,6 +299,24 @@ pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
     // 都会影响它，渲染层才是唯一知道真相的地方。
     state.lyric_visible = true;
 
+    // 本帧「显示行 → 歌词行」的映射，供点击跳转用（见 `App::click_lyric`）。
+    // 与 `hit_zones` 同一套约定：渲染层回填，`begin_frame` 清空。
+    state
+        .lyric
+        .display_line_index
+        .extend(display.iter().map(|(index, _, _)| *index));
+
+    // 换行过渡的进度：`1.0` 表示稳态（没有过渡在进行）。
+    let progress = state.lyric.transition_progress();
+    let prev_line = state.lyric.prev_line;
+    // 稳态走整数距离，既不白算浮点，也保证既有断言的精确相等。
+    let transitioning = progress < 1.0;
+    let prev_display = if transitioning {
+        prev_line.and_then(|line| display_of(&display, line))
+    } else {
+        None
+    };
+
     // 当前行未唱部分的底色：比 `text_dim` 亮一档，整行才压得住上下两行
     let active_base = mix(theme.text_dim, theme.text, LYRIC_ACTIVE_BASE);
 
@@ -290,15 +326,42 @@ pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
         .take(viewport)
         .enumerate()
         .map(|(row, (index, is_translation, text))| {
-            // 离当前行多远（按**显示行**算，译文行也占一格，视觉间隔才均匀）
-            let distance = (offset + row).abs_diff(focus_display);
+            let here = offset + row;
+            // 离当前行多远（按**显示行**算，译文行也占一格，视觉间隔才均匀）。
+            //
+            // 过渡期间这个距离是**插值**出来的：`t = 0` 时按旧当前行算、`t = 1`
+            // 时按新的算。于是换行时不只是「新行点亮、旧行熄灭」，中间几行按距离
+            // 排开的明暗层次也会一起平滑地重排——这才是 Apple Music 那种「整块
+            // 歌词跟着动」的观感。终端没有子单元格定位，位置动不了，能动的就是
+            // 这个颜色维度。
+            let distance = if let Some(prev) = prev_display {
+                let from = here.abs_diff(prev) as f32;
+                let to = here.abs_diff(focus_display) as f32;
+                lerp(from, to, progress)
+            } else {
+                here.abs_diff(focus_display) as f32
+            };
 
             // 译文比它的原文再暗一档，一眼能分出主次
-            let t = fade_ratio(distance) + if *is_translation { 0.25 } else { 0.0 };
+            let fade = fade_ratio(distance) + if *is_translation { 0.25 } else { 0.0 };
 
-            if Some(*index) != active {
-                let color = mix(theme.text_dim, theme.lyric_far, t);
-                return Line::from(Span::styled(text.clone(), Style::default().fg(color)));
+            // 「非当前行」该有的颜色。
+            let base = mix(theme.text_dim, theme.lyric_far, fade);
+
+            // 进入 / 退出：一个标量同时表达两件事——新行 0 → 1 点亮，旧行 1 → 0
+            // 淡出，其余行恒为 0。稳态下它是 0 / 1 的硬值，退化成改造前的行为。
+            let heat = if !transitioning {
+                if Some(*index) == active { 1.0 } else { 0.0 }
+            } else if Some(*index) == active {
+                progress
+            } else if Some(*index) == prev_line {
+                1.0 - progress
+            } else {
+                0.0
+            };
+
+            if heat <= 0.0 {
+                return Line::from(Span::styled(text.clone(), Style::default().fg(base)));
             }
 
             // 当前行：拿得到逐字时间戳就逐字染色（唱到哪亮到哪），
@@ -311,18 +374,27 @@ pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
                 .map(|line| line.words.as_slice())
                 .unwrap_or(&[]);
             if words.len() != text.chars().count() {
-                return Line::from(Span::styled(text.clone(), theme.lyric_active()));
+                // 保留 `lyric_active()` 自带的 BOLD，只换前景色——稳态下
+                // `mix(base, accent, 1.0)` 精确等于 `accent`，与改造前逐位相同。
+                return Line::from(Span::styled(
+                    text.clone(),
+                    theme.lyric_active().fg(mix(base, theme.accent, heat)),
+                ));
             }
 
             // 每个字按**它自己**的进度在「未唱底色 → 强调色」之间取值。
             // 边界字因此是两色之间的过渡，看上去是渐变扫过，不是一格一格硬跳。
             // 非真彩终端没有中间色阶，`mix` 会自动退回两端取一，行为等价于
             // 原来的三档离散——不需要在这里特判。
+            //
+            // 再叠一层 `heat`：过渡期间整行（含已唱的字）从它原来的暗色一起亮起来，
+            // 而不是只有未唱部分变亮。
             let spans: Vec<Span> = text
                 .chars()
                 .zip(words.iter())
                 .map(|(character, word)| {
-                    let color = mix(active_base, theme.accent, word.progress_at(position_ms));
+                    let lit = mix(active_base, theme.accent, word.progress_at(position_ms));
+                    let color = mix(base, lit, heat);
                     Span::styled(character.to_string(), Style::default().fg(color))
                 })
                 .collect();
@@ -337,6 +409,17 @@ pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
         Paragraph::new(lines).alignment(Alignment::Center),
         lyric_area,
     );
+
+    // 点击这一行的任意位置 → 跳到这一句的起始时间。
+    //
+    // 登记在最后：`hit_test` 取**后登记**的优先，这样歌词面板上浮出的右键菜单
+    // 之类小区域不会被它盖住。范围只到 `lyric_area`，不会吃掉别的面板的点击。
+    state.add_hit_zone(lyric_area, HitTarget::LyricLine, offset, display.len());
+}
+
+/// 某个歌词行在**显示行**里的位置（译文/音译会让两者不再一一对应）。
+fn display_of(display: &[(usize, bool, String)], line: usize) -> Option<usize> {
+    display.iter().position(|(index, _, _)| *index == line)
 }
 
 /// 播放队列面板需要的外部状态。
@@ -1498,7 +1581,7 @@ mod tests {
         );
         assert_eq!(
             near,
-            mix(theme.text_dim, theme.lyric_far, fade_ratio(1)),
+            mix(theme.text_dim, theme.lyric_far, fade_ratio(1.0)),
             "距离 1 应当正好是 idle 色（比例 0）"
         );
         assert_eq!(
@@ -1511,10 +1594,35 @@ mod tests {
     /// 淡出比例：距离 1 不淡，超过跨度封顶。
     #[test]
     fn fade_ratio_starts_at_zero_and_caps() {
-        assert_eq!(fade_ratio(1), 0.0, "紧邻当前行的那一行保持 idle 色");
-        assert_eq!(fade_ratio(0), 0.0, "当前行自身（不该走到这里）也不能出负数");
-        assert!(fade_ratio(2) > 0.0 && fade_ratio(2) < 1.0);
-        assert_eq!(fade_ratio(100), 1.0, "再远也封顶，不能溢出");
+        assert_eq!(fade_ratio(1.0), 0.0, "紧邻当前行的那一行保持 idle 色");
+        assert_eq!(
+            fade_ratio(0.0),
+            0.0,
+            "当前行自身（不该走到这里）也不能出负数"
+        );
+        assert!(fade_ratio(2.0) > 0.0 && fade_ratio(2.0) < 1.0);
+        assert_eq!(fade_ratio(100.0), 1.0, "再远也封顶，不能溢出");
+    }
+
+    /// 过渡期间距离是插值出来的小数，比例必须**连续**——不能像整数版那样
+    /// 在 `d = 1` 处从 0 跳到 0.25 而中间没有过渡。
+    #[test]
+    fn fade_ratio_is_continuous_over_fractional_distances() {
+        let mut previous = fade_ratio(0.0);
+        for step in 1..=200 {
+            let distance = step as f32 / 20.0;
+            let current = fade_ratio(distance);
+            assert!(
+                current >= previous,
+                "比例必须随距离单调不减：d={distance} 时 {current} < {previous}"
+            );
+            assert!(
+                current - previous < 0.05,
+                "相邻采样之间不该有跳变：d={distance} 时涨了 {}",
+                current - previous
+            );
+            previous = current;
+        }
     }
 
     /// 歌词真的画出来时回填 `lyric_visible`，否则 `App` 不会为逐字推进提速。
@@ -1536,5 +1644,235 @@ mod tests {
         state.lyric_visible = false;
         render_lyric_into(&mut state, 40, 9, &theme);
         assert!(!state.lyric_visible, "只有占位提示时不该置位");
+    }
+
+    // ---- 换行过渡 ----
+
+    /// 一段 15 行的歌词，行距 `gap_ms`。行数必须**多于视口**，居中定位才生效。
+    fn many_lines(count: usize, gap_ms: u64) -> crate::api::model::Lyric {
+        crate::api::model::Lyric {
+            lines: (0..count)
+                .map(|index| line_with_words(index as u64 * gap_ms, "一二三四五"))
+                .collect(),
+        }
+    }
+
+    /// 40×9 的歌词面板：内区 7 行，当前行居中落在内区第 4 行（屏幕第 4 行）。
+    /// 显示行 `offset + 3` 对应当前行，所以当前行的屏幕行号恒为 `1 + 3`。
+    const ACTIVE_ROW: u16 = 4;
+
+    /// 换行过渡必须**两头都对**：旧行变暗、新行变亮。
+    ///
+    /// 这条是这次改动的核心断言。终端没有子单元格定位，位置动不了，能动的只有
+    /// 颜色——所以「有没有动画」等价于「换行时那两行的颜色有没有随时间变」。
+    #[test]
+    fn line_change_cross_fades_between_the_two_lines() {
+        let theme = Theme::for_config(ThemeName::Default, false);
+        let mut state = AppState::new(crate::config::Config::default());
+        state.lyric.lyric = many_lines(15, 1_000);
+        // 第 1 个字唱完（1300 > 该字的 end_ms 1200），取色稳定，不受进度抖动影响
+        state.position_ms = 1_300;
+
+        // 换行瞬间：高亮还在**旧**行（第 6 句），新行（第 7 句）还没亮起来
+        state.lyric.active_line = Some(6);
+        state.lyric.retarget(Some(7), 200.0);
+        let start = render_lyric_into(&mut state, 40, 9, &theme);
+        let old_at_start = fg_at(
+            &start,
+            first_text_column(&start, ACTIVE_ROW - 1, 40),
+            ACTIVE_ROW - 1,
+        );
+        let new_at_start = fg_at(
+            &start,
+            first_text_column(&start, ACTIVE_ROW, 40),
+            ACTIVE_ROW,
+        );
+
+        // 走完：高亮移到**新**行
+        state
+            .lyric
+            .advance_transition(std::time::Duration::from_millis(200));
+        let end = render_lyric_into(&mut state, 40, 9, &theme);
+        let old_at_end = fg_at(
+            &end,
+            first_text_column(&end, ACTIVE_ROW - 1, 40),
+            ACTIVE_ROW - 1,
+        );
+        let new_at_end = fg_at(&end, first_text_column(&end, ACTIVE_ROW, 40), ACTIVE_ROW);
+
+        assert!(
+            luma(old_at_start) > luma(new_at_start),
+            "换行瞬间高亮还应当在旧行上：旧 {:.0} 应当高于新 {:.0}",
+            luma(old_at_start),
+            luma(new_at_start)
+        );
+        assert!(
+            luma(old_at_end) < luma(new_at_end),
+            "走完之后高亮应当已经在新行上：旧 {:.0} 应当低于新 {:.0}",
+            luma(old_at_end),
+            luma(new_at_end)
+        );
+        assert!(
+            luma(old_at_end) < luma(old_at_start),
+            "旧行必须**随时间变暗**：{:.0} → {:.0}",
+            luma(old_at_start),
+            luma(old_at_end)
+        );
+        assert!(
+            luma(new_at_end) > luma(new_at_start),
+            "新行必须**随时间变亮**：{:.0} → {:.0}",
+            luma(new_at_start),
+            luma(new_at_end)
+        );
+    }
+
+    /// 过渡中间那一帧，两行都该是**部分点亮**——这是「交叉淡化」与「硬切」的区别。
+    #[test]
+    fn mid_transition_leaves_both_lines_partially_lit() {
+        let theme = Theme::for_config(ThemeName::Default, false);
+        let mut state = AppState::new(crate::config::Config::default());
+        state.lyric.lyric = many_lines(15, 1_000);
+        state.position_ms = 1_300;
+        state.lyric.active_line = Some(6);
+        state.lyric.retarget(Some(7), 200.0);
+
+        let settled_old = {
+            let mut plain = AppState::new(crate::config::Config::default());
+            plain.lyric.lyric = many_lines(15, 1_000);
+            plain.position_ms = 1_300;
+            plain.lyric.active_line = Some(6);
+            let buffer = render_lyric_into(&mut plain, 40, 9, &theme);
+            fg_at(
+                &buffer,
+                first_text_column(&buffer, ACTIVE_ROW, 40),
+                ACTIVE_ROW,
+            )
+        };
+
+        state
+            .lyric
+            .advance_transition(std::time::Duration::from_millis(100));
+        let mid = render_lyric_into(&mut state, 40, 9, &theme);
+        let old_mid = fg_at(
+            &mid,
+            first_text_column(&mid, ACTIVE_ROW - 1, 40),
+            ACTIVE_ROW - 1,
+        );
+
+        assert!(
+            luma(old_mid) < luma(settled_old),
+            "中途的旧行应当已经比它满亮时暗：中途 {:.0} vs 满亮 {:.0}",
+            luma(old_mid),
+            luma(settled_old)
+        );
+        assert!(
+            luma(old_mid)
+                > luma(fg_at(
+                    &mid,
+                    first_text_column(&mid, ACTIVE_ROW + 2, 40),
+                    ACTIVE_ROW + 2
+                )),
+            "但要比更远处那些完全没被点亮的行亮"
+        );
+    }
+
+    /// 过渡走完之后，渲染结果必须与「直接设 active_line」**逐格相同**。
+    ///
+    /// 这条是既有那批配色断言的护栏：过渡状态不能污染稳态路径，否则
+    /// `active_line_ramps_from_pending_to_sung` / `distant_lines_fade_out` 会在
+    /// 未来的某次改动里悄悄失效。
+    #[test]
+    fn settled_transition_renders_identically_to_a_plain_line_change() {
+        let theme = Theme::for_config(ThemeName::Default, false);
+
+        let mut plain = AppState::new(crate::config::Config::default());
+        plain.lyric.lyric = many_lines(15, 1_000);
+        plain.position_ms = 1_300;
+        plain.lyric.active_line = Some(7);
+        let expected = render_lyric_into(&mut plain, 40, 9, &theme);
+
+        let mut through_transition = AppState::new(crate::config::Config::default());
+        through_transition.lyric.lyric = many_lines(15, 1_000);
+        through_transition.position_ms = 1_300;
+        through_transition.lyric.active_line = Some(6);
+        through_transition.lyric.retarget(Some(7), 200.0);
+        through_transition
+            .lyric
+            .advance_transition(std::time::Duration::from_millis(500));
+        let actual = render_lyric_into(&mut through_transition, 40, 9, &theme);
+
+        for row in 0..9 {
+            for column in 0..40 {
+                assert_eq!(
+                    fg_at(&expected, column, row),
+                    fg_at(&actual, column, row),
+                    "({column}, {row}) 处颜色不同：过渡走完后必须与稳态逐格相同"
+                );
+            }
+        }
+    }
+
+    /// 歌词行要登记命中区，并回填「显示行 → 歌词行」映射——点击跳转全靠这两个。
+    #[test]
+    fn lyric_lines_register_a_click_zone_and_a_row_mapping() {
+        let theme = Theme::for_config(ThemeName::Default, false);
+        let mut state = AppState::new(crate::config::Config::default());
+        // 每行都带译文 → 显示行是歌词行的两倍，两者不再一一对应
+        let mut lyric = many_lines(15, 1_000);
+        for line in &mut lyric.lines {
+            line.translation = Some("译文".to_string());
+        }
+        state.lyric.lyric = lyric;
+        state.lyric.active_line = Some(7);
+        state.position_ms = 1_300;
+
+        state.begin_frame();
+        render_lyric_into(&mut state, 40, 9, &theme);
+
+        assert_eq!(
+            state.lyric.display_line_index.len(),
+            30,
+            "15 句 × 2（原文 + 译文）"
+        );
+        assert_eq!(state.lyric.display_line_index[0], 0);
+        assert_eq!(
+            state.lyric.display_line_index[1], 0,
+            "译文行仍属于第 0 句——点它也该跳到第 0 句"
+        );
+        assert_eq!(state.lyric.display_line_index[2], 1);
+
+        let zone = state
+            .hit_test(5, ACTIVE_ROW)
+            .expect("歌词区应当登记了命中区");
+        assert!(
+            matches!(zone.target, crate::app::state::HitTarget::LyricLine),
+            "点歌词不该被当成点别的东西"
+        );
+        assert_eq!(zone.len, 30, "命中区要覆盖全部显示行，而不只是这一屏");
+        // 命中区记的是**显示行**下标，所以顶部那一行对应 offset，而不是 0
+        assert_eq!(
+            zone.index_at(zone.rect.top()),
+            Some(zone.first_index),
+            "屏幕第一行应当对应 offset 处那一行"
+        );
+        assert_eq!(
+            state.lyric.line_index_at_display(zone.first_index),
+            Some(5),
+            "30 条显示行、当前行第 7 句居中 → 偏移 11 → 屏幕首行是第 5 句的译文"
+        );
+    }
+
+    /// 没有歌词时只画占位提示，**不该**登记命中区——否则点空白处会跳到奇怪的时间。
+    #[test]
+    fn placeholder_does_not_register_a_click_zone() {
+        let theme = Theme::for_config(ThemeName::Default, false);
+        let mut state = AppState::new(crate::config::Config::default());
+        state.lyric.lyric = crate::api::model::Lyric::default();
+
+        state.begin_frame();
+        render_lyric_into(&mut state, 40, 9, &theme);
+
+        assert!(state.hit_test(5, ACTIVE_ROW).is_none(), "占位提示不该可点");
+        assert!(state.lyric.display_line_index.is_empty());
     }
 }

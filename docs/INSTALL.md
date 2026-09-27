@@ -64,14 +64,22 @@ paru -S kugou-tui          # 或 yay -S kugou-tui
 
 ### 路径三：预编译二进制（GitHub Release）
 
-不想装 Rust 工具链的话，直接下 Release 里的包——**Linux 是 tarball、Windows 是 zip**，
-两者内容一致（二进制 + 三个脚本 + 全部文档）。
+不想装 Rust 工具链的话，直接下 Release 里的包——**三个平台都有**，内容一致
+（二进制 + 三个脚本 + 全部文档）：
+
+| 平台 | 文件 |
+|---|---|
+| Linux x86_64 | `kugou-tui-<版本>-x86_64-unknown-linux-gnu.tar.gz` |
+| Windows x86_64 | `kugou-tui-<版本>-x86_64-pc-windows-msvc.zip` |
+| macOS arm64 | `kugou-tui-<版本>-aarch64-apple-darwin.tar.gz` |
+
+> Intel Mac 没有预编译包（CI 的 runner 是 arm64），从源码构建即可。
 
 **Linux（x86_64）**：
 
 ```bash
-tar xzf kugou-tui-0.4.2-x86_64-unknown-linux-gnu.tar.gz
-cd kugou-tui-0.4.2-x86_64-unknown-linux-gnu
+tar xzf kugou-tui-0.4.3-x86_64-unknown-linux-gnu.tar.gz
+cd kugou-tui-0.4.3-x86_64-unknown-linux-gnu
 
 # 二进制与三个脚本都链进 PATH。
 # `scripts/kugou-tui` 与二进制同名，所以链过去要改名（同 AUR 包的做法）。
@@ -88,11 +96,20 @@ kugou-tui                     # 开播（也可用 kugou-tui-launch，它会按�
 **Windows（x86_64）**：
 
 ```powershell
-Expand-Archive kugou-tui-0.4.2-x86_64-pc-windows-msvc.zip -DestinationPath .
-cd kugou-tui-0.4.2-x86_64-pc-windows-msvc
+Expand-Archive kugou-tui-0.4.3-x86_64-pc-windows-msvc.zip -DestinationPath .
+cd kugou-tui-0.4.3-x86_64-pc-windows-msvc
 
 .\scripts\kugou-api-install.ps1   # 一次性
 .\scripts\kugou-tui.ps1           # 开播
+```
+
+**macOS（arm64）** —— 脚本是 bash，用法与 Linux 相同：
+
+```bash
+tar xzf kugou-tui-0.4.3-aarch64-apple-darwin.tar.gz
+cd kugou-tui-0.4.3-aarch64-apple-darwin
+./scripts/kugou-api-install kugou
+./scripts/kugou-tui
 ```
 
 > 包除了二进制还带着脚本与全部文档，所以这套流程是自足的。
@@ -100,8 +117,8 @@ cd kugou-tui-0.4.2-x86_64-pc-windows-msvc
 >
 > 它**不含**接口服务本身——那份服务要么这样拉一次，要么用 AUR 包（包里直接带）。
 >
-> zip 里同时带着 bash 版脚本，方便在 Git Bash / WSL 下用；反过来 tarball 里没有
-> PowerShell 脚本——那三个只在 Windows 上有意义。
+> Windows 的 zip 里同时带着 bash 版脚本，方便在 Git Bash / WSL 下用；反过来
+> Linux / macOS 的 tarball 里没有 PowerShell 脚本——那三个只在 Windows 上有意义。
 
 ---
 

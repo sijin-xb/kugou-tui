@@ -29,6 +29,8 @@ pub enum Setting {
     RefreshMs,
     /// 歌词时间偏移。
     LyricOffsetMs,
+    /// 歌词换行过渡的时长上限（`0` = 关闭）。
+    LyricAnimMs,
     /// 列表每页条数。
     PageSize,
     /// 音频缓存上限。
@@ -50,12 +52,13 @@ pub enum Setting {
 }
 
 impl Setting {
-    pub const ALL: [Setting; 14] = [
+    pub const ALL: [Setting; 15] = [
         Self::Theme,
         Self::Quality,
         Self::PlaybackMode,
         Self::RefreshMs,
         Self::LyricOffsetMs,
+        Self::LyricAnimMs,
         Self::PageSize,
         Self::CacheLimitMib,
         Self::BasicColor,
@@ -75,6 +78,7 @@ impl Setting {
             Self::PlaybackMode => "播放模式",
             Self::RefreshMs => "刷新间隔",
             Self::LyricOffsetMs => "歌词偏移",
+            Self::LyricAnimMs => "歌词动画",
             Self::PageSize => "每页条数",
             Self::CacheLimitMib => "缓存上限",
             Self::BasicColor => "16 色模式",
@@ -95,6 +99,7 @@ impl Setting {
             Self::PlaybackMode => "顺序 / 列表循环 / 单曲循环 / 随机",
             Self::RefreshMs => "越小越流畅，也越费 CPU",
             Self::LyricOffsetMs => "正值让歌词提前显示",
+            Self::LyricAnimMs => "换行时的淡入淡出，0 为关闭",
             Self::PageSize => "搜索与歌单一次取多少条",
             Self::CacheLimitMib => "超了自动删最旧的，0 为不限",
             Self::BasicColor => "老终端画不出真彩时打开",
@@ -163,6 +168,13 @@ pub const PAGE_SIZE_OPTIONS: [u32; 4] = [20, 30, 50, 100];
 pub const CACHE_LIMIT_OPTIONS: [u64; 5] = [0, 256, 512, 1024, 2048];
 
 /// 歌词偏移的步进与上下限（毫秒）。
+/// 歌词换行过渡的时长上限候选（毫秒），`0` 表示关闭。
+///
+/// 档位不多是刻意的：这个值只是**上限**（实际按行距自适应），做成精细可调
+/// 反而让人以为调了就能明显不一样。
+pub const LYRIC_ANIM_OPTIONS: [u64; 4] = [0, 120, 200, 300];
+
+/// 歌词时间偏移的步长与上下限（毫秒）。
 pub const LYRIC_OFFSET_STEP: i64 = 100;
 pub const LYRIC_OFFSET_LIMIT: i64 = 5_000;
 
@@ -214,6 +226,13 @@ pub fn value_text(setting: Setting, state: &AppState) -> String {
             1000 / state.config.tick_ms.max(1)
         ),
         Setting::LyricOffsetMs => format!("{:+}ms", state.config.lyric_offset_ms),
+        Setting::LyricAnimMs => {
+            if state.config.lyric_anim_ms == 0 {
+                "关闭".to_string()
+            } else {
+                format!("≤{}ms", state.config.lyric_anim_ms)
+            }
+        }
         Setting::PageSize => format!("{} 条", state.config.page_size),
         Setting::CacheLimitMib => {
             if state.config.cache_limit_mib == 0 {

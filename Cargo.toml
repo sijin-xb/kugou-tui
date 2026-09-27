@@ -1,6 +1,6 @@
 [package]
 name = "kugou-tui"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2024"
 # MSRV 由**依赖**决定，不是本项目代码决定的。当前最高的是 `quantette`（要 1.90，
 # 经 ratatui-image → icy_sixel 引进来），其余：ratatui 0.30 要 1.88、rodio 0.22 要

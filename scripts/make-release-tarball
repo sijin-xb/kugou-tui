@@ -17,8 +17,36 @@
 # 产出：`dist/kugou-tui-<版本>-<三元组>.tar.gz`，末尾打印 sha256。
 set -euo pipefail
 
-repo_dir=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/.." && pwd)
+# 本脚本所在的真实目录。
+#
+# **不用 `readlink -f`**：那是 GNU 的扩展，BSD（macOS）的 readlink 没有 `-f`，
+# 而 CI 要在 macOS 上跑这个脚本产出 aarch64-apple-darwin 的包
+# （见 .github/workflows/release.yml）。所以自己逐层解软链——把脚本软链进 PATH
+# 时也能找对仓库根目录。
+self_dir() {
+  local target="${BASH_SOURCE[0]}"
+  while [ -L "$target" ]; do
+    local link
+    link=$(readlink "$target")
+    case "$link" in
+      /*) target="$link" ;;
+      *) target="$(dirname "$target")/$link" ;;
+    esac
+  done
+  cd -P -- "$(dirname -- "$target")" && pwd
+}
+
+repo_dir=$(cd -- "$(self_dir)/.." && pwd -P)
 cd "$repo_dir"
+
+# 算 sha256。macOS 没有 `sha256sum`（那是 GNU coreutils），那边叫 `shasum -a 256`。
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1"
+  else
+    shasum -a 256 "$1"
+  fi
+}
 
 version=$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
 if [ -z "$version" ]; then
@@ -56,4 +84,4 @@ echo "产出：dist/$name.tar.gz"
 echo "内容："
 tar -tzf "dist/$name.tar.gz" | sed 's/^/  /'
 echo
-sha256sum "dist/$name.tar.gz"
+sha256_of "dist/$name.tar.gz"

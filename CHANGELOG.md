@@ -4,6 +4,87 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.3] - 2026-09-27
+
+### 新增
+
+- **Windows 与 macOS 的发行包**。此前 Release 里只有 Linux 的 tarball——不是漏了，
+  是开发机是 Linux，而 Windows 的 `.exe` 必须在 Windows 上编（MSVC 工具链）、
+  macOS 的二进制必须在 macOS 上编（Apple SDK）。现在交给 CI：
+
+  - `.github/workflows/release.yml`：推 `v*` tag 时在 `windows-latest` 与
+    `macos-latest` 上各编一份、打好包、挂到 GitHub Release 上；
+    也可以 `workflow_dispatch` 手动指定 tag，给**已经发过**的版本补资产。
+  - `scripts/upload-release-asset`：上传那一步单独抽出来，两个平台共用（Windows
+    runner 上的 `shell: bash` 就是 Git Bash）。它处理两件事：**等 Release 出现**
+    （本地发版流程是「推 tag → 建 Release」，tag 一推 CI 就起来了，直接上传会撞上
+    release not found），以及**幂等**（`--clobber`，补资产/重试时覆盖同名文件）。
+  - 两个 job 都会先核对 `--version` 与 tag 一致，checkout 错 ref 时能拦住。
+
+  > Linux 不在这里重复构建：`scripts/release` 已经在本地编好、验好、传上去了。
+
+- **歌词换行的过渡动画**（仿 Apple Music 的逐行切换）。此前换行是**瞬间跳变**：
+  `active_line` 一变，配色与滚动偏移同时硬切，没有任何时间维度的缓动。
+
+  做法是把「离当前行多远」从整数距离换成**两个锚点距离场的插值**——换行时保留旧锚点，
+  按 `t = ease_out_cubic(已过时长 / 总时长)` 在「到旧行距离」与「到新行距离」之间插值：
+
+  ```text
+  d = lerp(|行 - 旧行|, |行 - 新行|, t)
+  色 = mix(mix(text_dim, lyric_far, fade(d)), 高亮色, heat)
+  ```
+
+  `heat` 一个标量同时表达进入与退出：新行 `0 → 1` 点亮，旧行 `1 → 0` 淡出，其余行
+  的明暗层次也跟着平滑重排。**没有新增任何渲染原语**，全部复用既有的 `mix` /
+  `fade_ratio`，逐字扫光原样叠加在 `heat` 之上。
+
+  > **为什么不做「上滑」和「缩放」**：终端没有子单元格定位——一个字符格就是一行，
+  > `Paragraph` 的滚动偏移是整数（没有小数滚动），字体尺寸也固定。所以位置维度
+  > 动不了，能做过渡的只有颜色维度。硬做整行跳只会显得生硬。
+
+  - 时长按行距自适应：`min(配置值, 该行到下一行的间隔 × 0.55)`。快歌的行只有几百
+    毫秒，按上限走会出现「上一次过渡还没走完就该换下一行」。
+  - 一次跨 3 行以上（拖动进度条、点歌词行跳转）**直接吸附**，不逐行淡过去。
+  - 切歌 / 清空歌词会复位过渡状态，新歌第一句不会从上一首的某一行淡过来。
+  - 复用既有的 30fps 提速逻辑（`lyric_visible`），**没有为动画新增计时器**。
+
+- **点击歌词行跳到这一句**。命中区机制（`HitZone` / `HitTarget`）现成可用，新增
+  `HitTarget::LyricLine` 即可；「显示行 → 歌词行」的映射由渲染层每帧回填，与
+  `hit_zones` 同一套约定（只有渲染层知道行几何——译文/音译会让两者不再一一对应）。
+
+  跳转目标要**加回 `lyric_offset_ms`**：当前行是按 `position − lyric_offset_ms` 算的，
+  直接跳到 `line.time_ms` 会正好差一句。这一步漏了不会报错，所以单独抽成
+  `lyric_seek_target` 并加了测试。
+
+- `lyric_anim_ms` 配置项（默认 `200`，`0` = 关闭），设置页有「歌词动画」一项。
+  三种情况会强制关闭，与取值无关：`lite_mode`、16 色模式（没有中间色阶，淡入会
+  退化成「过半时整块硬翻」）、一次跨 3 行以上。
+
+### 变更
+
+- `scripts/make-release-tarball` 改成**在 macOS 上也能跑**（CI 的 macOS 那一栏要用它
+  产出 `aarch64-apple-darwin` 的包）。两处 GNU 专有的东西换掉了：`readlink -f`
+  （BSD 的 readlink 没有 `-f`，改成自己逐层解软链）与 `sha256sum`
+  （macOS 那边叫 `shasum -a 256`）。顺带确认它只用 bash 3.2 就有的语法
+  ——macOS 自带的 bash 就是 3.2。
+
+- `fade_ratio` 的参数从 `usize` 改成 `f32`（过渡期间距离是插值出来的小数）。
+  稳态下传进去的仍是整数值，结果与改造前**逐位相同**——所以既有的配色断言一行未改，
+  另加了一条「过渡走完后与稳态逐格相同」的护栏测试盯着这件事。
+
+### 验证
+
+- `cargo test` **313 passed / 0 failed**（本次新增 20 条）
+- 新增的测试覆盖：进度端点与 ease-out 单调性、四道否决、行距自适应、最后一行兜底、
+  换行中途重定向、显示行映射越界、**交叉淡化两头都对**（旧行变暗 / 新行变亮）、
+  过渡中途两行都是半亮、过渡走完与稳态逐格相同、占位提示不登记命中区、
+  跳转目标加回偏移（三档偏移 + 下溢）
+- `cargo fmt --all --check`、Linux 与 Windows 两个目标的 `clippy -D warnings` 均 exit 0
+- `scripts/make-release-tarball` 实跑过（含软链场景），
+  `scripts/upload-release-asset` 的「glob 无匹配必须报错」分支实测会退出 1
+  ——这条抓出过一个真 bug：`assets=("$pattern")` 加了引号时 bash 不做路径展开，
+  于是那个检查永远不触发，CI 会一片绿而 Release 上什么都没有
+
 ## [0.4.2] - 2026-09-27
 
 ### 新增
@@ -157,6 +238,8 @@
   `build-windows.ps1` 再 `gh release upload`，或让 CI 在打 tag 时上传。
 - **macOS 没有在真机长期使用过**：CI 跑的是 `clippy + test + build`，覆盖不到
   音频设备枚举、CoreAudio 实际出声、iTerm2 图形协议这些真机行为。
+- **Intel Mac 没有预编译包**：CI 的 `macos-latest` 是 arm64，产出的二进制在 Intel
+  机器上跑不了。Intel 用户目前只能从源码构建（`cargo build --release`）。
 
 ## [0.4.1] - 2026-09-26
 

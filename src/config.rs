@@ -94,6 +94,18 @@ pub struct Config {
     /// 歌词时间偏移（毫秒）。正值表示歌词提前显示。
     pub lyric_offset_ms: i64,
 
+    /// 歌词换行过渡的时长上限（毫秒），`0` 表示不做过渡（直接切换）。
+    ///
+    /// 实际时长会按行距自适应：`min(本值, 该行到下一行的间隔 × 0.55)`。快歌的行
+    /// 只有几百毫秒，按本值走会出现「上一次过渡还没走完就该换下一行」——看着不是
+    /// 顺滑，是拖沓。
+    ///
+    /// 另外两种情况会**强制关闭**过渡，与这里的取值无关（见
+    /// `LyricPane::transition_ms_for`）：`lite_mode`（它的卖点就是少重绘）与
+    /// `basic_color`（16 色没有中间色阶，淡入会退化成整块硬翻，比不动画更怪）。
+    #[serde(default = "default_lyric_anim_ms")]
+    pub lyric_anim_ms: u64,
+
     /// 界面刷新间隔（毫秒）。这是控制 CPU 占用的主要旋钮。
     pub tick_ms: u64,
 
@@ -178,6 +190,14 @@ fn default_qr_aspect() -> f32 {
     2.0
 }
 
+/// 歌词换行过渡的默认时长（毫秒）。
+///
+/// 200ms 是照着 Apple Music 的手感取的（它大约 0.3s，但终端一帧 33ms、
+/// 总共只有六七帧，再长就成慢动作了）。
+fn default_lyric_anim_ms() -> u64 {
+    200
+}
+
 fn default_tray() -> bool {
     // 桌面集成是「有更好」，默认开启比默认关闭更符合 kugou-tui 的定位（终端里的
     // 音乐客户端，状态栏上挂个图标是核心使用场景）。配置项里改成 false 即可关。
@@ -245,6 +265,7 @@ impl Default for Config {
             cache_dir: default_cache_dir(),
             cache_limit_mib: DEFAULT_CACHE_LIMIT_MIB,
             lyric_offset_ms: 0,
+            lyric_anim_ms: default_lyric_anim_ms(),
             tick_ms: DEFAULT_TICK_MS,
             page_size: DEFAULT_PAGE_SIZE,
             proxy: None,
@@ -681,6 +702,22 @@ mod tests {
             config.sources.profile(SourceKind::Kugou).api_base,
             "http://127.0.0.1:3000"
         );
+    }
+
+    /// 老配置文件里没有 `lyric_anim_ms`，读进来必须拿到默认值——新增配置项不能
+    /// 让用户手上那份配置突然读不出来。
+    #[test]
+    fn missing_new_fields_fall_back_to_defaults() {
+        let parsed: Config = toml::from_str(
+            r#"
+api_base = "http://127.0.0.1:3000"
+volume = 0.5
+"#,
+        )
+        .expect("老配置应当能读");
+        // 断言字面量而不是那个函数：这里要锁的是「对外承诺的默认值就是 200ms」，
+        // 拿常量比自己跟自己比，改了默认值也照样通过。
+        assert_eq!(parsed.lyric_anim_ms, 200);
     }
 
     #[test]

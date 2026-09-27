@@ -50,27 +50,41 @@
 用 `cargo build --release` 构建，**不能用 makepkg** —— `makepkg` 会带上
 `makepkg.conf` 的 `-march=native`，那样的二进制换台机器就跑不了。
 
-### Windows 的 zip 是另一条路（当前**不**由 `scripts/release` 产出）
+### Windows 与 macOS 的包由 CI 补上
 
-Windows 的发行包是 `kugou-tui-<版本>-x86_64-pc-windows-msvc.zip`，内容与 tarball
-一一对应（二进制 + 三个**bash** 脚本 + 全部文档），由 `scripts/build-windows.ps1` 生成。
+`scripts/release` 跑在开发机上，而那是 Linux——它只能产出
+`x86_64-unknown-linux-gnu` 的 tarball。**另外两个平台编不出来不是漏了，是物理限制**：
+Windows 的 `.exe` 要 MSVC 工具链，macOS 的二进制要 Apple SDK。
 
-**注意它现在还没接进发版流程**，原因是硬性的：那个脚本要在 Windows 上跑
-（它打包的是 MSVC 工具链产出的 `.exe`），而 `scripts/release` 是 bash、跑在开发机
-（Linux）上。所以目前的做法是：
+所以它们交给 `.github/workflows/release.yml`：推 `v*` tag 时在
+`windows-latest` 与 `macos-latest` 上各编一份、打好包、挂到同一个 Release 上。
 
-1. 在 Windows 上 `git checkout v<版本>` → `cargo build --release`
-   → `.\scripts\build-windows.ps1 -SkipBuild`；
-2. 把产出的 zip 用 `gh release upload v<版本> <zip>` 挂到已经建好的 Release 上。
+| 平台 | 产物 | 打包脚本 |
+|---|---|---|
+| Linux x86_64 | `kugou-tui-<版本>-x86_64-unknown-linux-gnu.tar.gz` | `make-release-tarball`（本地跑） |
+| Windows x86_64 | `kugou-tui-<版本>-x86_64-pc-windows-msvc.zip` | `build-windows.ps1`（CI 跑） |
+| macOS arm64 | `kugou-tui-<版本>-aarch64-apple-darwin.tar.gz` | `make-release-tarball`（CI 跑） |
 
-> 想自动化的话，最省事的是让 CI 干：`.github/workflows/ci.yml` 里已经有一栏
-> Windows 在跑 `build-windows.ps1`，加一个「打 tag 时把 zip 作为 artifact 上传、
-> 再 `gh release upload`」的 job 即可。**这一步还没做**——目前的 Release 里
-> 只有 Linux 的 tarball，Windows 用户按 `docs/INSTALL.md` 从源码构建。
+> **Intel Mac 不在覆盖范围**：`macos-latest` 是 arm64 机器，产出的二进制在 Intel
+> 机器上跑不了。要补的话得在同一个 runner 上 `--target x86_64-apple-darwin` 交叉编一份
+> ——那是另一个包名（`x86_64-apple-darwin`），加一个 job 即可，目前没做。
 
-zip 里**没有** PowerShell 脚本，和 tarball 里没有 bash 之外的脚本是同一个道理：
-包里带的是「另一套平台下仍然用得上的东西」（Git Bash / WSL 能跑 bash 版），
-而不是「本平台的原生脚本」——后者由源码仓库提供。
+时序上有个坑：`scripts/release` 的顺序是「推 tag → 建 Release」，而 tag 一推 CI 就
+起来了——**上传前必须等 Release 出现**。这件事连同幂等（`--clobber`）都收在
+`scripts/upload-release-asset` 里，两个平台共用同一个脚本（Windows runner 上的
+`shell: bash` 就是 Git Bash）。两个 job 都会先核对二进制的 `--version` 与 tag 一致，
+checkout 错 ref 时能拦住。
+
+**给已经发过的版本补资产**：`workflow_dispatch` 手动指定 tag 即可，例如 0.4.2 发布时
+这个工作流还不存在：
+
+```bash
+gh workflow run release.yml -f tag=v0.4.2
+```
+
+zip 里同时带着三个 **bash** 脚本（Git Bash / WSL 下仍然用得着），macOS 的 tarball
+同理——包里带的是「另一套平台下也用得上的东西」，而不是「本平台的原生脚本」，
+后者由源码仓库提供。
 
 ---
 
