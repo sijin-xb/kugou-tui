@@ -109,3 +109,51 @@ A：程序开启了鼠标捕获。若你的终端做了额外的鼠标转发（�
 可能会冲突；用终端自身的设置关掉即可。
 
 ---
+
+## 平台相关
+
+**Q：Windows 上怎么装？为什么 `./scripts/kugou-api-install` 跑不了？**
+A：那几个脚本是 bash，PowerShell 里跑不了。Windows 用对应的 `.ps1`：
+
+```powershell
+.\scripts\kugou-api-install.ps1
+.\scripts\kugou-tui.ps1
+```
+
+完整步骤（含工具链前置、终端要求、平台差异表）见
+[INSTALL.md 的「在 Windows 上构建与运行」](INSTALL.md#在-windows-上构建与运行)。
+
+**Q：Windows 上构建报 `linker link.exe not found` / `cmake not found` / `nasm not found`？**
+A：前者是没装 MSVC 工具链——装 Visual Studio 生成工具并勾「使用 C++ 的桌面开发」。
+后两者**不应该出现**：Windows 上 TLS 走系统自带的 SChannel 而不是 rustls，
+`aws-lc-sys` 那坨 C 代码根本不参与编译。真遇到了说明你编的不是这个仓库当前的代码，
+或者手动把 `Cargo.toml` 里的 TLS 后端改回了 `rustls`。
+
+**Q：Windows 上托盘图标 / `playerctl` 怎么没有？**
+A：那两个是 D-Bus 接口（MPRIS、StatusNotifierItem），Windows 没有 session bus，
+相关代码**不参与编译**。不是坏了，是那边没有这套东西——见
+[INSTALL.md 的功能差异表](INSTALL.md#6-与-linux-的功能差异)。`--print-config` 会
+如实打印「系统托盘 : 不可用」。
+
+**Q：Windows 上封面为什么是马赛克一样的色块？**
+A：那是**半块字符画**，不是 bug。程序检测到终端不支持 Kitty / iTerm2 图形协议就
+自动降级，而 Windows Terminal 两者都不支持。想省掉这份开销可以开 `lite_mode`。
+
+**Q：图标变成一堆方块 / 问号？**
+A：终端字体没有对应的字形。程序会先探测有没有 Nerd Font，没有就退回 ASCII 图标；
+但 **Windows 上没有 fontconfig，探测一律落空**，装了 Nerd Font 也不会自动认出来——
+设 `KUGOU_TUI_NERD_FONT=1` 手动打开（Linux / macOS 上也可以用这个变量覆盖探测结果）。
+
+**Q：macOS 支持吗？**
+A：**代码支持，CI 覆盖，但没有在真机长期用过**。macOS 走的是与 Linux 同一套
+`cfg(unix)` 分支，音频走 CoreAudio，构建只需 Xcode 命令行工具。已知差异：
+
+- **没有 MPRIS / 系统托盘**（macOS 默认没有 D-Bus），启动时日志里会有一条 WARN；
+- **没有最小化窗口**（走的是 niri 的 compositor IPC）；
+- 配置在 `~/Library/Application Support/kugou-tui/`，缓存在 `~/Library/Caches/kugou-tui/`
+  （**不是** `~/.config` 与 `~/.cache`）；
+- Terminal.app 下封面退半块字符画，iTerm2 能走图形协议。
+
+细节见 [INSTALL.md 的「在 macOS 上构建与运行」](INSTALL.md#在-macos-上构建与运行)。
+
+---

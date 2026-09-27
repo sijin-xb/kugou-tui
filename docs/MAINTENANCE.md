@@ -18,13 +18,14 @@
 src/
 ├─ main.rs            进程入口：解析 CLI → 装配 App → 跑主循环 → 退出
 ├─ cli.rs             命令行参数（优先级：CLI > 环境变量 > 配置文件 > 默认值）
-├─ config.rs          配置读写、路径（~/.config/kugou-tui/、~/.cache/kugou-tui/）
+├─ config.rs          配置读写、路径（Linux: ~/.config/kugou-tui/、~/.cache/kugou-tui/；
+│                     Windows: %APPDATA%\\kugou-tui\\、%LOCALAPPDATA%\\kugou-tui\\）
 ├─ event.rs           全进程唯一的 EventBus 与 Loaded 事件枚举
 ├─ keymap.rs          按键 → 语义动作（Action）
 ├─ logger.rs          极简文件日志（`tlog!`），DEBUG 需 KUGOU_TUI_DEBUG=1
 ├─ error.rs           AppError 与「重试不重试」的判据
-├─ mpris.rs           桌面集成：MPRIS（playerctl / DMS 等）
-├─ tray.rs            系统托盘
+├─ mpris.rs           桌面集成：MPRIS（playerctl / DMS 等）——**仅 Unix**，见下
+├─ tray.rs            系统托盘——**仅 Unix**，同上
 ├─ api/               接口层（只跟 KuGouMusicApi 说话）
 │  ├─ client.rs       带重试的 HTTP；AppError 归类在这里
 │  ├─ catalog.rs      搜索 / 歌单 / 榜单 / 歌手 / 取播放直链
@@ -110,10 +111,68 @@ audio thread(kugou-audio) ───────────→ 原子量（位�
 
 ---
 
+### 1.6 平台分支在哪
+
+代码里 `cfg` 一共没几处，但每一处都对应一个真实差异，改动时容易漏。清单如下：
+
+| 位置 | 差异 | 为什么不能统一 |
+|---|---|---|
+| `Cargo.toml` 的 `[target.'cfg(windows)']` / `[target.'cfg(unix)']` | TLS 后端（SChannel / rustls）、`zbus`、`libc`、`windows-sys` | Windows 用 rustls 会拖进 `aws-lc-sys`，那要额外装 CMake + NASM；D-Bus 在 Windows 上不存在 |
+| `audio/streaming.rs` | `read_at` 包了一层：Unix `pread` / Windows `seek_read` | Windows 没有 `pread` |
+| `logger.rs` | stderr 重定向：Unix `dup2` / Windows `SetStdHandle` | Windows 没有 fd 表 |
+| `main.rs`、`app/mod.rs`、`app/update.rs` | `mpris` / `tray` 模块、字段、同步逻辑 | 见上（D-Bus） |
+| `config.rs`、`app/settings.rs` | 路径都走 `dirs`，只有 `~` 展开要额外兜一层 | Windows 上没有 `HOME` |
+| `ui/icons.rs` | Nerd Font 探测走 `fc-list`，Windows 上没有 → 回落 ASCII + `KUGOU_TUI_NERD_FONT` 覆盖 | 那边字体清单在注册表里 |
+| `api/model.rs`、`event.rs`、`keymap.rs` | 三处 `#[cfg_attr(not(unix), allow(dead_code))]` | 那些项只由 MPRIS 构造；留 `allow` 而不是 cfg 掉，是为了让枚举/模型在两边形状一致，下游 `match` 不用长平台分支 |
+
+验证 Windows 侧**不需要 Windows 机器**（编译期能查的部分）：
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+cargo check   --target x86_64-pc-windows-msvc --all-targets
+cargo clippy  --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+```
+
+`--all-targets` 会把测试代码也过一遍。**最后一步链接需要 Windows 或 MSVC 工具链**，
+Linux 上跑到 `error: linker link.exe not found` 就说明 Rust 侧全部通过了
+（依赖与自身都编完了，只差链接）。
+
+运行时的部分由 `.github/workflows/ci.yml` 兜住：**Linux / Windows / macOS 三栏**
+各跑一遍 `clippy -D warnings + test + build`，Windows 那栏再跑一次打包脚本。
+**别把它删了**——路径展开、配置目录、缓存文件命名这些差异只有真跑起来才露出来。
+macOS 那栏的意义也是这个：它和 Linux 共用 `cfg(unix)` 分支，但 `dirs` 给的是
+`~/Library/...`、音频走 CoreAudio、拿不到 `fc-list`，不跑就只是「理论可用」。
+
+### 1.7 Windows 侧新增的三个脚本
+
+`scripts/` 下的 bash 脚本在 PowerShell 里跑不了，所以各补了一个对应物：
+
+| Windows | Unix 侧 | 说明 |
+|---|---|---|
+| `kugou-tui.ps1` | `kugou-tui` | 启动器。**刻意不写 `param()` 块**，否则 PowerShell 会把 `-s 海阔天空` 当成写错的参数名；参数全部经 `$args` 原样透传。带 `--dry-run` 只打印决策 |
+| `kugou-api-install.ps1` | `kugou-api-install` | 只 clone + 装依赖，**不启动**——起服务交给启动器，避免两处各写一份 |
+| `build-windows.ps1` | `make-release-tarball` | 构建 + 打包 zip |
+
+三条注意：
+
+* **只用 PowerShell 5.1 的语法**（Windows 自带的就是它）。别用 `$IsWindows`
+  （6.0 才有）、`Start-Process -Environment`（7.4 才有）。平台判断统一用
+  `$env:OS -eq 'Windows_NT'`。
+* `Start-Process` **不允许**把 stdout 与 stderr 重定向到同一个文件，所以服务日志
+  是两个：`api.log` 与 `api.log.err`，报错时两个都打。
+* 启动器里那份配置解析（读 `sources.active` 与 `[sources.<kind>].api_base`）是手写的
+  正则，不是 TOML 解析器。改配置结构时要同步改它——同理，`kugou-api-install.ps1`
+  里钉住的提交必须和 bash 版的 `PINNED[kugou]` 一致（一处钉、一处跟 master 是最坏的组合）。
+
+`docs/INSTALL.md` 的「在 Windows 上构建与运行」一节列了平台能力对照表
+（哪些是降级、哪些是缺失），改动平台分支后记得同步那张表。
+
+---
+
 ## 2. 跑起来 / 怎么验
 
 ```bash
-cargo test                         # 单元测试（约 280 条，秒级）
+cargo test                         # 单元测试（约 290 条，秒级）
 cargo clippy --all-targets         # 发版脚本会跑
 cargo build --release              # 二进制约 7 MB
 ./target/release/kugou-tui --print-config   # 看一眼生效配置、日志路径、缓存目录

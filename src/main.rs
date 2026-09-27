@@ -52,8 +52,12 @@ mod error;
 mod event;
 mod keymap;
 mod logger;
+// MPRIS 与系统托盘都是 D-Bus 上的接口，只在 Unix 桌面上有意义；
+// 非 Unix 平台整个模块（连同 zbus 依赖）都不参与编译，见 Cargo.toml 的说明。
+#[cfg(unix)]
 mod mpris;
 mod source;
+#[cfg(unix)]
 mod tray;
 mod ui;
 mod util;
@@ -193,5 +197,10 @@ fn print_effective_config(config: &Config) {
         "16 色模式 : {}",
         if config.basic_color { "是" } else { "否" }
     );
+    // 托盘与 MPRIS 都是 D-Bus 接口，非 Unix 平台上根本不会编译进去，
+    // 这里如实说明，免得用户对着配置项怀疑「开了怎么没反应」。
+    #[cfg(unix)]
     println!("系统托盘 : {}", if config.tray { "启用" } else { "关闭" });
+    #[cfg(not(unix))]
+    println!("系统托盘 : 不可用（{} 无 D-Bus）", std::env::consts::OS);
 }

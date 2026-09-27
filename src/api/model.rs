@@ -94,6 +94,12 @@ impl Song {
     /// **不替换的话它就是个 404**。早先这段展开只写在 mpris 里（给桌面组件用），
     /// 封面渲染那条路径漏了，结果封面永远加载不出来，界面只能一直显示占位。
     /// 收进这里，谁用谁展开，不会再漏。
+    ///
+    /// 生产代码里目前只有 MPRIS 那条路用它（界面上取封面走的是
+    /// `source::cover_url`，还要过音源自己的过滤）。非 Unix 没有 MPRIS，
+    /// 于是这里只在测试里被调用——留 `allow` 而不是 cfg 掉：模型层不该因为
+    /// 某个平台没有桌面集成就换个形状。
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn cover_url(&self, size: u32) -> Option<String> {
         let url = self.cover.as_ref()?;
         Some(if url.contains("{size}") {
@@ -578,12 +584,12 @@ fn strip_singer_prefix(name: &str, singers: &[Singer]) -> String {
         if candidate.is_empty() {
             continue;
         }
-        if let Some(rest) = name.strip_prefix(candidate) {
-            if let Some(title) = rest.strip_prefix(" - ") {
-                let title = title.trim();
-                if !title.is_empty() {
-                    return title.to_string();
-                }
+        if let Some(rest) = name.strip_prefix(candidate)
+            && let Some(title) = rest.strip_prefix(" - ")
+        {
+            let title = title.trim();
+            if !title.is_empty() {
+                return title.to_string();
             }
         }
     }
@@ -633,24 +639,23 @@ fn parse_singers(value: &Value) -> Vec<Singer> {
         })
         .collect();
 
-    if singers.is_empty() {
-        if let Some(text) = pick_string(value, &["SingerName", "singername", "author_name"]) {
-            singers = split_singer_text(&text);
-        }
+    if singers.is_empty()
+        && let Some(text) = pick_string(value, &["SingerName", "singername", "author_name"])
+    {
+        singers = split_singer_text(&text);
     }
 
     // `filename` 形如 "Beyond - 海阔天空"，歌手名可以从中兜底提取
-    if singers.is_empty() {
-        if let Some(filename) = pick_string(value, &["filename", "audio_name"]) {
-            if let Some((prefix, _)) = filename.split_once(" - ") {
-                let prefix = prefix.trim();
-                if !prefix.is_empty() && prefix != "未知" {
-                    singers.push(Singer {
-                        id: 0,
-                        name: prefix.to_string(),
-                    });
-                }
-            }
+    if singers.is_empty()
+        && let Some(filename) = pick_string(value, &["filename", "audio_name"])
+        && let Some((prefix, _)) = filename.split_once(" - ")
+    {
+        let prefix = prefix.trim();
+        if !prefix.is_empty() && prefix != "未知" {
+            singers.push(Singer {
+                id: 0,
+                name: prefix.to_string(),
+            });
         }
     }
 

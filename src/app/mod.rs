@@ -134,9 +134,13 @@ pub struct App {
     stream_retried: Option<String>,
 
     /// MPRIS 句柄。没有 D-Bus 时为 `None`（不影响播放，只是桌面集成不可用）。
+    ///
+    /// 非 Unix 平台没有 MPRIS 这回事，字段与相关同步逻辑一起条件编译掉。
+    #[cfg(unix)]
     mpris: Option<crate::mpris::MprisHandle>,
 
     /// 托盘句柄。`config.tray == false` 或环境探测失败时为 `None`。
+    #[cfg(unix)]
     tray: Option<crate::tray::TrayHandle>,
 }
 
@@ -200,10 +204,12 @@ impl App {
         let downloader = Downloader::new(config.proxy.as_deref()).context("初始化下载器失败")?;
 
         // 先取一份克隆给 MPRIS：bus 随后会被 move 进 App，之后就借不到了
+        #[cfg(unix)]
         let mpris = crate::mpris::spawn(bus.clone());
 
         // 托盘与 MPRIS 共享同一个 bus（用于派发点击动作），但只读 config 一次——
         // 关掉时干脆不 spawn，省掉那条 DBus 连接。
+        #[cfg(unix)]
         let tray_handle = if config.tray {
             crate::tray::spawn(bus.clone())
         } else {
@@ -226,7 +232,9 @@ impl App {
             pending_device_resume: None,
             active_stream: None,
             stream_retried: None,
+            #[cfg(unix)]
             mpris,
+            #[cfg(unix)]
             tray: tray_handle,
         };
 
@@ -464,10 +472,10 @@ impl App {
             self.state.position_ms = session.position_ms;
             // 记住「这首歌播到哪了」，按 Space 时从这里续（见 toggle_playback）。
             // 位置为 0 就不记，免得续播逻辑白白多一条分支。
-            if session.position_ms > 0 {
-                if let Some(song) = self.state.current.as_ref() {
-                    self.state.resume = Some((song.hash.clone(), session.position_ms));
-                }
+            if session.position_ms > 0
+                && let Some(song) = self.state.current.as_ref()
+            {
+                self.state.resume = Some((song.hash.clone(), session.position_ms));
             }
             self.state
                 .info(format!("已恢复上次会话：{count} 首 · 按 Space 继续播放"));

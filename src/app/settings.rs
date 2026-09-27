@@ -9,6 +9,8 @@
 //! 这里只放**纯数据**：界面怎么画、值怎么落到 [`crate::config::Config`] 上，
 //! 分别归 `ui::views::settings` 与 `app::update`。
 
+use std::path::{Path, PathBuf};
+
 use crate::app::queue::PlaybackMode;
 use crate::app::state::AppState;
 use crate::config::CoverFill;
@@ -263,17 +265,42 @@ pub fn cycle<T: PartialEq + Copy>(options: &[T], current: T, delta: isize) -> Op
 ///
 /// 设为 None 时（配置文件里没填）按 `~/Music` 处理——这是默认下载目录，
 /// 跟**新用户**第一次启动时不应该让程序坏在「路径不存在」上。
+///
+/// # 为什么不能只读 `HOME`
+///
+/// `HOME` 是 Unix 的约定，Windows 上通常**根本没有这个变量**（那边是
+/// `USERPROFILE`）。只认它的话 `~/Music` 会原样留在字符串里，最后落成一个叫
+/// `~` 的目录——下载看着「成功」，用户在自己以为的位置却找不到文件。
+/// 所以先认 `HOME`（Unix 上的行为完全不变），拿不到再交给 [`dirs::home_dir`]：
+/// 它在 Windows 上走 `SHGetKnownFolderPath`，是那边唯一可靠的做法。
 pub fn expand_download_dir(value: Option<&str>) -> String {
+    expand_with_home(value, home_dir().as_deref())
+}
+
+/// 用户主目录。`HOME` 优先（Unix 的约定），拿不到再问 `dirs`。
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+}
+
+/// [`expand_download_dir`] 的纯函数版本：主目录由调用方给。
+///
+/// 抽出来是为了能直接测——测试是**并行**跑的，去改进程级的 `HOME` 会连带影响
+/// 同一进程里其它测试，那是一种偶发失败。
+///
+/// `~/foo` 与 `~\foo` 都认：Windows 上用户很自然会用反斜杠。
+/// `~user/foo` 这种跨用户的写法不处理（两个平台语义都不一样），原样返回，
+/// 让下载器去报「路径不存在」，比在这里猜一个要好。
+fn expand_with_home(value: Option<&str>, home: Option<&Path>) -> String {
     let raw = value.unwrap_or("~/Music");
-    if let Some(suffix) = raw.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            // 不用 `home.display()`：那是 `OsString` 的 Display，要求 Rust 1.87。
-            // 项目 MSRV 是 1.86，用 `to_string_lossy` 更稳。
-            return format!("{}/{}", home.to_string_lossy(), suffix);
-        }
-    } else if let Some(rest) = raw.strip_prefix("~") {
-        // `~user/...`：跨用户跨平台不好处理，保持原样并让下载器报错
-        let _ = rest;
+    let suffix = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\"));
+    if let (Some(suffix), Some(home)) = (suffix, home) {
+        // 用 `to_string_lossy` 而不是 `home.display()`：这里要的就是一个 `String`
+        // （拼进 `format!` 之后还要被上层当字符串用），而 `display()` 给的是
+        // `Display` 适配器，还得再转一道。
+        return format!("{}/{}", home.to_string_lossy(), suffix);
     }
     raw.to_string()
 }
@@ -400,26 +427,60 @@ mod tests {
 
     /// `~/foo` 展开、`None` 兜底成 `~/Music`——这是「首次启动还没填下载目录」
     /// 也能正常工作的基础。
+    ///
+    /// 走纯函数版本、显式传主目录：测试是并行跑的，去改进程级的 `HOME` 会连带
+    /// 影响同进程的其它测试（原来就是这么写的，属于偶发失败的隐患）。
     #[test]
     fn expand_download_dir_handles_all_forms() {
-        // 测试不依赖真实 $HOME（CI 里可能没设）：手动覆盖
-        // SAFETY：测试串行执行
-        unsafe { std::env::set_var("HOME", "/home/tester") };
+        let home = Path::new("/home/tester");
 
-        assert_eq!(expand_download_dir(Some("~/Music")), "/home/tester/Music");
         assert_eq!(
-            expand_download_dir(Some("~/Downloads/Music")),
+            expand_with_home(Some("~/Music"), Some(home)),
+            "/home/tester/Music"
+        );
+        assert_eq!(
+            expand_with_home(Some("~/Downloads/Music"), Some(home)),
             "/home/tester/Downloads/Music"
         );
         assert_eq!(
-            expand_download_dir(None),
+            expand_with_home(None, Some(home)),
             "/home/tester/Music",
             "None 兜底为 ~/Music，第一次启动不该让下载坏在路径上"
         );
         assert_eq!(
-            expand_download_dir(Some("/absolute/path")),
+            expand_with_home(Some("/absolute/path"), Some(home)),
             "/absolute/path",
             "绝对路径原样"
+        );
+    }
+
+    /// Windows 上用户会用反斜杠，`~\Music` 也得展开。
+    #[test]
+    fn expand_download_dir_accepts_backslash_separator() {
+        let home = Path::new(r"C:\Users\tester");
+        assert_eq!(
+            expand_with_home(Some(r"~\Music"), Some(home)),
+            r"C:\Users\tester/Music",
+            "反斜杠写法不能原样漏出去，否则会落成一个叫 `~` 的目录"
+        );
+    }
+
+    /// **拿不到主目录时宁可原样返回，也不能猜。**
+    ///
+    /// 这条锁的是 Windows 上的真实故障：`HOME` 不存在（那边是 `USERPROFILE`），
+    /// 旧实现只认 `HOME`，于是 `~/Music` 原样留着，最后在缓存目录旁边落出一个
+    /// 名字就叫 `~` 的文件夹。
+    #[test]
+    fn expand_download_dir_keeps_raw_when_home_is_unknown() {
+        assert_eq!(
+            expand_with_home(Some("~/Music"), None),
+            "~/Music",
+            "无从展开时原样返回，由调用方报错"
+        );
+        assert_eq!(
+            expand_with_home(Some("~other/Music"), Some(Path::new("/home/tester"))),
+            "~other/Music",
+            "跨用户的写法不猜"
         );
     }
 

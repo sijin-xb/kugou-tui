@@ -80,6 +80,7 @@ fn expand_cover_size(url: &str, size: u32) -> String {
 }
 
 /// 桌面组件（MPRIS）用的封面像素尺寸。控件显示得不大，没必要拉原图。
+#[cfg(unix)]
 const MPRIS_COVER_SIZE: u32 = 400;
 
 /// 图片真实宽高比（宽/高）。
@@ -1250,12 +1251,14 @@ impl App {
     pub fn ensure_tab_loaded(&mut self, tab: Tab) {
         match tab {
             Tab::Playlists
-                if self.state.playlists.list.is_empty() && !self.state.playlists.list.load.is_loading() =>
+                if self.state.playlists.list.is_empty()
+                    && !self.state.playlists.list.load.is_loading() =>
             {
                 self.load_plaza_playlists();
             }
             Tab::Artists
-                if self.state.artists.list.is_empty() && !self.state.artists.list.load.is_loading() =>
+                if self.state.artists.list.is_empty()
+                    && !self.state.artists.list.load.is_loading() =>
             {
                 self.load_artists();
             }
@@ -1551,6 +1554,7 @@ impl App {
     ///
     /// 每次 tick 调一次。开销就是一次互斥锁写入，可忽略；桌面组件的轮询
     /// 频率远低于此，没必要更高频。
+    #[cfg(unix)]
     fn sync_mpris(&mut self) {
         // D-Bus 注册是异步的，尚未成功（或压根没有 session bus）时没必要每帧
         // 构造一份快照——那只是白白做几次字符串克隆。
@@ -1587,6 +1591,7 @@ impl App {
     ///
     /// 设计取舍和 [`Self::sync_mpris`] 一致：只把数据写到快照里，DBus 的属性刷新
     /// 和 `New*` 信号由托盘线程自己轮询+发，避免反向调用主线程。
+    #[cfg(unix)]
     fn sync_tray(&mut self) {
         // 没注册成功时跳过——还没连上 watcher 的进程每帧构造一次快照是白干。
         let Some(handle) = self.tray.as_ref().filter(|handle| handle.is_connected()) else {
@@ -2011,9 +2016,7 @@ impl App {
                     title: "歌单广场".to_string(),
                     items,
                 }),
-                Err(error) => {
-                    bus.fail_loading(LoadingTarget::Playlists, "载入歌单广场失败", error)
-                }
+                Err(error) => bus.fail_loading(LoadingTarget::Playlists, "载入歌单广场失败", error),
             }
         });
     }
@@ -2033,9 +2036,7 @@ impl App {
                 .await
             {
                 Ok(artists) => bus.emit(Loaded::Artists(artists)),
-                Err(error) => {
-                    bus.fail_loading(LoadingTarget::Artists, "载入歌手列表失败", error)
-                }
+                Err(error) => bus.fail_loading(LoadingTarget::Artists, "载入歌手列表失败", error),
             }
         });
     }
@@ -2084,9 +2085,7 @@ impl App {
         self.runtime.spawn(async move {
             match active_source.rank_boards(&api).await {
                 Ok(boards) => bus.emit(Loaded::RankBoards(boards)),
-                Err(error) => {
-                    bus.fail_loading(LoadingTarget::Ranks, "载入排行榜失败", error)
-                }
+                Err(error) => bus.fail_loading(LoadingTarget::Ranks, "载入排行榜失败", error),
             }
         });
     }
@@ -2489,11 +2488,11 @@ impl App {
 
     /// 真正发起扫码请求。与「要不要扫」的判断分开，两条入口共用。
     fn begin_login(&mut self) {
-        if let Some(login) = self.state.login.as_ref() {
-            if !login.finished {
-                self.state.info("登录已在进行中，扫码或按 Esc 取消");
-                return;
-            }
+        if let Some(login) = self.state.login.as_ref()
+            && !login.finished
+        {
+            self.state.info("登录已在进行中，扫码或按 Esc 取消");
+            return;
         }
 
         // 节流：每次取 key 都是向服务端申请一个新的登录会话，短时间内反复申请
@@ -2926,9 +2925,7 @@ impl App {
                 Ok(info) => bus.emit(Loaded::UserInfo(Box::new(info))),
                 // 早先这里只写日志，于是接口挂掉时首页永远显示「加载中…」——
                 // 用户分不清是失败还是慢。失败也得走事件，面板才有出口。
-                Err(error) => {
-                    bus.fail_loading(LoadingTarget::UserInfo, "获取用户资料失败", error)
-                }
+                Err(error) => bus.fail_loading(LoadingTarget::UserInfo, "获取用户资料失败", error),
             }
         });
     }
@@ -2962,9 +2959,7 @@ impl App {
     pub fn fetch_vip_status(&mut self) {
         // 会员接口只有酷狗有。网易云没有对应端点（`/user/vip/detail` 是 404），
         // 去请求只会白打一次接口，所以先问能力再决定。
-        if !self.state.logged_in
-            || !self.state.config.active_source_kind().capability().vip
-        {
+        if !self.state.logged_in || !self.state.config.active_source_kind().capability().vip {
             self.state.vip_info = None;
             return;
         }
@@ -3741,10 +3736,10 @@ impl App {
             }
 
             Loaded::LoginStatus { message } => {
-                if let Some(login) = self.state.login.as_mut() {
-                    if !login.finished {
-                        login.message = message;
-                    }
+                if let Some(login) = self.state.login.as_mut()
+                    && !login.finished
+                {
+                    login.message = message;
                 }
             }
 
@@ -3788,10 +3783,10 @@ impl App {
 
             Loaded::UserInfo(info) => {
                 // 头像地址在资料里，拿到就去取图
-                if let Some(url) = info.pic.clone() {
-                    if !self.state.config.lite_mode {
-                        self.load_avatar(url);
-                    }
+                if let Some(url) = info.pic.clone()
+                    && !self.state.config.lite_mode
+                {
+                    self.load_avatar(url);
                 }
                 self.state.user_info = Some(*info);
                 self.state.user_info_load.succeed();
@@ -4313,19 +4308,23 @@ impl App {
         }
         self.state.advance_visualizer(elapsed);
 
-        self.sync_mpris();
-        self.sync_tray();
+        // 桌面集成只在 Unix 上存在（MPRIS / StatusNotifierItem 都是 D-Bus 接口）
+        #[cfg(unix)]
+        {
+            self.sync_mpris();
+            self.sync_tray();
+        }
 
         if self.state.playback == PlaybackState::Playing {
             self.update_active_lyric();
         }
 
         // 登录中：每约 2 秒轮询一次扫码状态（tick 默认 200ms，10 拍 = 2s）
-        if self.state.login.is_some() && self.state.ticks % 10 == 0 {
+        if self.state.login.is_some() && self.state.ticks.is_multiple_of(10) {
             self.poll_login();
         }
 
-        if self.state.ticks % CACHE_MEASURE_TICKS == 0 {
+        if self.state.ticks.is_multiple_of(CACHE_MEASURE_TICKS) {
             self.refresh_cache_usage();
         }
     }

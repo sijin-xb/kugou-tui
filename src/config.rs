@@ -1,8 +1,15 @@
 //! 配置持久化。
 //!
-//! 落盘位置：`$XDG_CONFIG_HOME/kugou-tui/config.toml`（Linux 下即
-//! `~/.config/kugou-tui/config.toml`）。缓存与日志放在 `$XDG_CACHE_HOME/kugou-tui/`，
-//! 这样备份配置时不会把几百 MB 的音频缓存一起带走。
+//! 落盘位置（两套都是各自平台的正统位置，靠 `dirs` 抹平，这里不写平台分支）：
+//!
+//! | 用途 | Linux / macOS | Windows |
+//! |------|---------------|---------|
+//! | 配置 | `$XDG_CONFIG_HOME/kugou-tui/config.toml`（即 `~/.config/…`） | `%APPDATA%\kugou-tui\config.toml` |
+//! | 缓存 / 日志 | `$XDG_CACHE_HOME/kugou-tui/`（即 `~/.cache/…`） | `%LOCALAPPDATA%\kugou-tui\` |
+//!
+//! 缓存与配置分开放，这样备份配置时不会把几百 MB 的音频缓存一起带走。
+//! 需要整体挪走（便携安装、把配置放 U 盘）时用 `KUGOU_TUI_CONFIG_DIR` 覆盖配置根目录，
+//! 缓存目录仍可用 `--cache-dir` 单独指定。
 //!
 //! 优先级：命令行参数 > 环境变量 > 配置文件 > 内置默认值。
 //! 环境变量由 clap 的 `env` 属性直接读入 [`Cli`]，因此这里只需实现后两级。
@@ -174,7 +181,10 @@ fn default_qr_aspect() -> f32 {
 fn default_tray() -> bool {
     // 桌面集成是「有更好」，默认开启比默认关闭更符合 kugou-tui 的定位（终端里的
     // 音乐客户端，状态栏上挂个图标是核心使用场景）。配置项里改成 false 即可关。
-    true
+    //
+    // 非 Unix 平台上托盘（StatusNotifierItem）与 MPRIS 都是 D-Bus 接口，根本
+    // 不存在，默认就关——免得配置里留一个「开了也不会有反应」的 true。
+    cfg!(unix)
 }
 
 /// 首页那块大封面怎么铺满它的区域。
@@ -506,13 +516,30 @@ pub fn default_cache_dir() -> PathBuf {
         .join(APP_DIR_NAME)
 }
 
+/// 配置根目录。
+///
+/// 可以被 `KUGOU_TUI_CONFIG_DIR` 整个覆盖。两个用途：
+///
+/// * **便携安装**——把程序、配置、缓存一起放 U 盘或绿色目录里，插到哪台机器都一样；
+/// * **可测**——`dirs` 在 Windows 上走的是 Win32 的 Known Folder（`SHGetKnownFolderPath`），
+///   环境变量（`APPDATA` 等）管不着它，没有这个开关就没法在 Windows 上把
+///   「配置能活过一次重启」那条测试隔离到临时目录里，只能跳过。
 fn config_root() -> PathBuf {
+    if let Some(dir) = std::env::var_os("KUGOU_TUI_CONFIG_DIR") {
+        // 空值当作没设：`KUGOU_TUI_CONFIG_DIR=` 这种写法在 shell 里很常见，
+        // 而一个空路径会让配置落到当前目录，比忽略它更难查。
+        if !dir.is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(APP_DIR_NAME)
 }
 
 /// 把 `~` 展开成用户主目录，供配置文件里手写路径时使用。
+///
+/// 两种分隔符都吃：Windows 上用户很自然会写成 `~\Music`。
 pub fn expand_tilde(path: &Path) -> PathBuf {
     let Some(text) = path.to_str() else {
         return path.to_path_buf();
@@ -523,7 +550,7 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
     let Some(home) = dirs::home_dir() else {
         return path.to_path_buf();
     };
-    home.join(rest.trim_start_matches('/'))
+    home.join(rest.trim_start_matches(['/', '\\']))
 }
 
 /// 收紧文件或目录权限。非 Unix 平台上是空操作。
@@ -566,8 +593,13 @@ mod tests {
     /// 启动时 `main.rs` 会无条件 `switch_source(active)`，用**音源档案**覆盖顶层字段。
     /// 所以只写顶层而不回填进档案，重启后登录态就没了（同理 dfid 要重新探测）。
     ///
-    /// 这里跑真实落盘 + 真实 `load()`。为了不碰用户配置，先把 `XDG_CONFIG_HOME`
-    /// 指到临时目录，结束后恢复原值——`catch_unwind` 保证失败时也会恢复。
+    /// 这里跑真实落盘 + 真实 `load()`。为了不碰用户配置，先把
+    /// `KUGOU_TUI_CONFIG_DIR` 指到临时目录，结束后恢复原值——`catch_unwind`
+    /// 保证失败时也会恢复。
+    ///
+    /// **刻意不用 `XDG_CONFIG_HOME`**：那是 XDG 规范，只有 Unix 认；
+    /// Windows 上 `dirs` 走的是 `SHGetKnownFolderPath`，那个环境变量对它无效，
+    /// 于是这条测试会去改写用户真实的 `%APPDATA%\kugou-tui\config.toml`。
     #[test]
     fn login_survives_restart() {
         let temp = std::env::temp_dir().join(format!("kugou-tui-cfgtest-{}", std::process::id()));
@@ -575,8 +607,8 @@ mod tests {
         std::fs::create_dir_all(&temp).expect("建临时配置目录");
 
         // SAFETY: 单测进程内临时改写并恢复；其它测试不读配置路径，无交叉影响。
-        let previous = std::env::var_os("XDG_CONFIG_HOME");
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", &temp) };
+        let previous = std::env::var_os("KUGOU_TUI_CONFIG_DIR");
+        unsafe { std::env::set_var("KUGOU_TUI_CONFIG_DIR", &temp) };
 
         let outcome = std::panic::catch_unwind(|| {
             let mut config = Config::default();
@@ -606,8 +638,8 @@ mod tests {
         });
 
         match previous {
-            Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
-            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+            Some(value) => unsafe { std::env::set_var("KUGOU_TUI_CONFIG_DIR", value) },
+            None => unsafe { std::env::remove_var("KUGOU_TUI_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&temp);
 

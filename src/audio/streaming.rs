@@ -40,9 +40,29 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
+
+/// 从文件的指定偏移读一段，**不依赖文件游标**。
+///
+/// 两个平台各有自己的原语，名字和语义都不同，所以在这里包一层：
+///
+/// * Unix 是 `pread`（`FileExt::read_at`）——定位读，完全不碰文件游标；
+/// * Windows 没有 `pread`，最接近的是 `FileExt::seek_read`，它借 `ReadFile` 的
+///   OVERLAPPED 参数做定位读，代价是**会顺带把文件游标挪到读完之后**。
+///
+/// 游标被挪动在这里无害：这个句柄是只读的落盘文件（`.part`），除了本模块没人
+/// 读它，而播放线程自己的读位置记在 [`StreamingBuffer::pos`] 里，与文件游标无关。
+/// 真正要保住的是「读窗口之外的字节不会打断播放线程」，这一点两边都成立。
+#[cfg(unix)]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::unix::fs::FileExt::read_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+fn read_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    std::os::windows::fs::FileExt::seek_read(file, buf, offset)
+}
 
 /// 等数据的最长时间。超过就当作这次流断了，让上层去决定「续播」还是「报错」。
 const WAIT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -387,7 +407,7 @@ impl Read for StreamingBuffer {
         let mut offset = self.pos;
         let mut filled = 0;
         while filled < want {
-            match file.read_at(&mut buf[filled..want], offset) {
+            match read_at(file, &mut buf[filled..want], offset) {
                 Ok(0) => break,
                 Ok(count) => {
                     filled += count;

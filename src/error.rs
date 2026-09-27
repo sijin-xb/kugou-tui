@@ -149,8 +149,7 @@ impl AppError {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Http(error) => {
-                !error.is_timeout()
-                    && (error.is_connect() || error.is_body() || error.is_decode())
+                !error.is_timeout() && (error.is_connect() || error.is_body() || error.is_decode())
             }
             Self::HttpStatus { status, .. } => {
                 *status == 408 || *status == 429 || (500..600).contains(status)
@@ -237,7 +236,10 @@ mod tests {
     fn other_non_json_bodies_still_hint_at_api_base() {
         for preview in ["（空响应体）", "gateway timeout"] {
             let hint = non_json(preview).user_hint();
-            assert!(hint.contains("api_base"), "preview={preview} 时提示：{hint}");
+            assert!(
+                hint.contains("api_base"),
+                "preview={preview} 时提示：{hint}"
+            );
         }
     }
 
@@ -290,7 +292,10 @@ mod tests {
     fn only_transient_failures_are_retried() {
         // 业务错误码：服务回了话，重发还是这个答复
         for code in [152, 149, 20005, 20017, 31863] {
-            assert!(!api(code).is_transient(), "code={code} 是业务错误，不该重试");
+            assert!(
+                !api(code).is_transient(),
+                "code={code} 是业务错误，不该重试"
+            );
         }
 
         // 服务端明确表示「现在不行，等会儿再来」

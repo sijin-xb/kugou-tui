@@ -3,24 +3,46 @@
 //! 终端里「有没有 Nerd Font」只能问系统，不能问终端——同一个 kitty 在装了
 //! Nerd Font 的机器上是图标，在没装的机器上一屏豆腐块。所以用 fontconfig
 //! 的 `fc-list` 查一次，结果缓存住（`OnceLock`），别每次渲染都 spawn 进程。
+//!
+//! # Windows
+//!
+//! 那边没有 fontconfig，`fc-list` 这个命令根本不存在。字体清单在注册表里
+//! （`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts`），为一个图标
+//! 去读注册表不划算，所以**默认按没有 Nerd Font 处理**（退回 ASCII，不会出错），
+//! 装了 Nerd Font 的用户用 `KUGOU_TUI_NERD_FONT=1` 显式打开。
+//! 这个开关在两个平台上都生效，也方便 Linux 上装了非 fontconfig 字体的人手动覆盖。
 
 use std::sync::OnceLock;
 
 /// 系统是否装了 Nerd Font。只查一次。
+///
+/// 判定顺序：`KUGOU_TUI_NERD_FONT` 显式开关 → fontconfig 探测 → 没有。
 fn has_nerd_font() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        let Ok(output) = std::process::Command::new("fc-list")
-            .arg(":family")
-            .output()
-        else {
-            // 没有 fontconfig（非 Linux 或没装）：当没装，退回 ASCII 更安全
-            return false;
-        };
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.to_lowercase().contains("nerd"))
+        // 显式开关优先：有 fontconfig 但没装 Nerd Font 的人也能靠它强开，
+        // 反过来（装了但 fc-list 查不到）也能靠它兜住。
+        if let Some(value) = std::env::var_os("KUGOU_TUI_NERD_FONT") {
+            return !value.is_empty() && value != "0";
+        }
+        detect_via_fontconfig()
     })
+}
+
+/// 用 fontconfig 的 `fc-list` 找 Nerd Font。
+///
+/// 非 Linux（Windows/macOS）上没有这个命令，`Command` 会返回 `Err`，
+/// 于是当「没装」处理——退回 ASCII 比画一屏豆腐块安全。
+fn detect_via_fontconfig() -> bool {
+    let Ok(output) = std::process::Command::new("fc-list")
+        .arg(":family")
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .any(|line| line.to_lowercase().contains("nerd"))
 }
 
 /// 取一个图标：装了 Nerd Font 就用 `nerd`，否则用 `ascii`。

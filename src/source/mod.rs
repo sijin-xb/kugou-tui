@@ -260,10 +260,10 @@ pub fn cookie_header_for(
     }
 
     // 已经带了 dfid 就别重复拼
-    if let Some(base) = base.as_deref() {
-        if base.split("; ").any(|pair| pair.starts_with("dfid=")) {
-            return Some(base.to_string());
-        }
+    if let Some(base) = base.as_deref()
+        && base.split("; ").any(|pair| pair.starts_with("dfid="))
+    {
+        return Some(base.to_string());
     }
 
     let dfid = device_id.map(str::trim).filter(|dfid| !dfid.is_empty());
@@ -522,10 +522,14 @@ impl SourceKind {
     ) -> Result<Vec<Song>> {
         let mut songs = match (self, playlist) {
             (Self::Kugou | Self::KugouConcept, PlaylistRef::Own(list_id)) => {
-                client.user_playlist_tracks(list_id, page, page_size, fresh).await
+                client
+                    .user_playlist_tracks(list_id, page, page_size, fresh)
+                    .await
             }
             (Self::Kugou | Self::KugouConcept, PlaylistRef::Public(global_id)) => {
-                client.playlist_tracks(global_id, page, page_size, fresh).await
+                client
+                    .playlist_tracks(global_id, page, page_size, fresh)
+                    .await
             }
             // 网易云两种情况都是同一个端点，按 id 取
             (Self::Netease, PlaylistRef::Own(list_id)) => {

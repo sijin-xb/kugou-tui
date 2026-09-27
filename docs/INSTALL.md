@@ -9,12 +9,15 @@
 
 | 项目 | 要求 |
 |---|---|
-| Rust 工具链 | **1.86+**（edition 2024）。下限由 `ratatui-image` 11.x 决定，见 `Cargo.toml` |
+| Rust 工具链 | **1.90+**（edition 2024）。下限由**依赖**顶上去（`quantette` 要 1.90），不是本项目代码决定的，见 `Cargo.toml` |
 | Node.js | 用于运行 KuGouMusicApi（上游 `engines` 要求 **12+**） |
-| 音频输出 | 任意 rodio 支持的后端（Linux 上为 ALSA/PulseAudio） |
+| 音频输出 | 任意 rodio 支持的后端（Linux 上为 ALSA/PulseAudio，Windows 上为 WASAPI，macOS 上为 CoreAudio） |
 | 终端 | 支持 UTF-8；**真彩（24 位）** 才能看到完整的主题配色与逐字渐变，老终端可加 `--basic-color` 退回 16 色 |
-| 操作系统 | **Linux**（在 CachyOS 上实测）。macOS 未验证但理论上可行；**Windows 不行**——`zbus` 在 Windows 上要求 `async-io` 特性，而这里按 `default-features = false` 只开了 `tokio` |
-| D-Bus（可选） | 有 session bus 时自动启用 MPRIS 与系统托盘；没有（纯 tty）则跳过，**不影响播放** |
+| 操作系统 | **Linux**（主力，在 CachyOS 上实测）、**Windows 10/11 x86_64**（见「[在 Windows 上构建与运行](#在-windows-上构建与运行)」）、**macOS**（CI 覆盖但未真机长期使用，见「[在 macOS 上构建与运行](#在-macos-上构建与运行)」） |
+| 构建依赖（Linux） | `alsa-lib` 的开发头文件与 `pkg-config`——`cpal` 通过 `alsa-sys` 链接它。Debian/Ubuntu 上是 `libasound2-dev pkg-config`，Arch 上是 `alsa-lib`。桌面发行版一般已经装好，**干净的容器 / 服务器上不是**，缺了会在 `alsa-sys` 编译时报错 |
+| 构建依赖（Windows） | 只需 **MSVC 工具链**（VS 生成工具 / Build Tools 里的「使用 C++ 的桌面开发」）。**不需要 CMake、NASM 或 OpenSSL** —— 见下文 |
+| 构建依赖（macOS） | 只需 Xcode 命令行工具（`xcode-select --install`） |
+| D-Bus（可选） | 有 session bus 时自动启用 MPRIS 与系统托盘；没有（纯 tty / macOS）则跳过，**不影响播放**。**Windows 上没有这套东西，相关代码不参与编译** |
 | 系统托盘（可选） | 需要状态栏提供 `org.kde.StatusNotifierWatcher`（Quickshell / waybar / KDE 都有）。没有就静默跳过；不需要时可用 `--no-tray` 关闭 |
 
 ---
@@ -31,6 +34,9 @@ cargo build --release
 ```
 
 release 产物约 **7.0 MiB**（7,317,024 字节；`opt-level="z"` + fat LTO + strip）。
+
+Windows 上把 `./target/release/kugou-tui` 换成 `.\target\release\kugou-tui.exe`，
+详细前置与脚本见「[在 Windows 上构建与运行](#在-windows-上构建与运行)」。
 
 ### 路径二：AUR（计划中，尚未上架）
 
@@ -58,11 +64,14 @@ paru -S kugou-tui          # 或 yay -S kugou-tui
 
 ### 路径三：预编译二进制（GitHub Release）
 
-不想装 Rust 工具链的话，直接下 Release 里的 tarball（x86_64 Linux）：
+不想装 Rust 工具链的话，直接下 Release 里的包——**Linux 是 tarball、Windows 是 zip**，
+两者内容一致（二进制 + 三个脚本 + 全部文档）。
+
+**Linux（x86_64）**：
 
 ```bash
-tar xzf kugou-tui-0.4.0-x86_64-unknown-linux-gnu.tar.gz
-cd kugou-tui-0.4.0-x86_64-unknown-linux-gnu
+tar xzf kugou-tui-0.4.2-x86_64-unknown-linux-gnu.tar.gz
+cd kugou-tui-0.4.2-x86_64-unknown-linux-gnu
 
 # 二进制与三个脚本都链进 PATH。
 # `scripts/kugou-tui` 与二进制同名，所以链过去要改名（同 AUR 包的做法）。
@@ -76,10 +85,205 @@ kugou-tui-install-api kugou   # 一次性：拉取并配置接口服务
 kugou-tui                     # 开播（也可用 kugou-tui-launch，它会按需拉起服务）
 ```
 
-> tarball 里除了二进制还带着三个脚本与全部文档，所以这套流程是自足的。
-> `kugou-tui-install-api` 需要 `node` / `npm` / `git` 与网络（它要 clone 服务并装依赖）。
+**Windows（x86_64）**：
+
+```powershell
+Expand-Archive kugou-tui-0.4.2-x86_64-pc-windows-msvc.zip -DestinationPath .
+cd kugou-tui-0.4.2-x86_64-pc-windows-msvc
+
+.\scripts\kugou-api-install.ps1   # 一次性
+.\scripts\kugou-tui.ps1           # 开播
+```
+
+> 包除了二进制还带着脚本与全部文档，所以这套流程是自足的。
+> `kugou-api-install` 需要 `node` / `npm` / `git` 与网络（它要 clone 服务并装依赖）。
 >
 > 它**不含**接口服务本身——那份服务要么这样拉一次，要么用 AUR 包（包里直接带）。
+>
+> zip 里同时带着 bash 版脚本，方便在 Git Bash / WSL 下用；反过来 tarball 里没有
+> PowerShell 脚本——那三个只在 Windows 上有意义。
+
+---
+
+## 在 Windows 上构建与运行
+
+Windows 走的是「自己编一份」，但**日常使用已经不用手动起服务了**：
+`scripts/` 下补了三个 PowerShell 脚本，对应 Unix 侧的三个 bash 脚本。
+
+| Windows | Unix 侧对应 | 干什么 |
+|---|---|---|
+| `scripts/kugou-api-install.ps1` | `kugou-api-install` | 拉取接口服务 + 装依赖（只需一次） |
+| `scripts/kugou-tui.ps1` | `kugou-tui` | 启动器：确保服务在跑，然后进播放器 |
+| `scripts/build-windows.ps1` | `make-release-tarball` | 构建 + 打包 zip |
+
+> 启动和安装**分开了**（bash 侧是 `kugou-api-install` 顺手把服务拉起来）。
+> 这样「怎么起服务」只有启动器一处实现，两边不会各自漂移。
+>
+> 三个脚本都**只依赖 PowerShell 5.1**（Windows 自带的那版），不需要额外装 pwsh 7。
+
+### 1. 装工具链
+
+| 要装的东西 | 怎么装 |
+|---|---|
+| Rust | [rustup.rs](https://rustup.rs) → 默认选 `x86_64-pc-windows-msvc` |
+| MSVC 工具链 | Visual Studio 生成工具，勾「使用 C++ 的桌面开发」；或装了 VS 就有 |
+| Node.js | [nodejs.org](https://nodejs.org)，用于跑接口服务 |
+| Git | [git-scm.com](https://git-scm.com)，安装脚本要用它 clone |
+
+> **不需要 CMake、NASM 或 OpenSSL。** 这一点是刻意保住的：Windows 上 TLS 走
+> 系统自带的 SChannel，而不是 rustls（后者的 `aws-lc-sys` 是 C 代码，要额外装
+> CMake + NASM 才编得过）。见 `Cargo.toml` 里 `cfg(windows)` 那两段注释。
+
+### 2. 构建
+
+```powershell
+git clone https://github.com/sijin-xb/kugou-tui.git
+cd kugou-tui
+cargo build --release
+.\target\release\kugou-tui.exe --help
+```
+
+打包成 zip（对应 Unix 侧的 `make-release-tarball`）：
+
+```powershell
+.\scripts\build-windows.ps1
+# 产物：dist\kugou-tui-<版本>-x86_64-pc-windows-msvc.zip
+```
+
+### 3. 拉取接口服务（只需一次）
+
+和 Linux 一样，数据全部来自第三方的 [KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi)，
+本项目**不含任何接口实现**：
+
+```powershell
+.\scripts\kugou-api-install.ps1
+# 等价于：clone 到 %USERPROFILE%\KuGouMusicApi → 钉到验证过的提交 → npm install --omit=dev
+```
+
+想装到别处就用 `-Dir`，或设 `KUGOU_API_DIR`（启动器也认这个变量）：
+
+```powershell
+.\scripts\kugou-api-install.ps1 -Dir D:\apps\KuGouMusicApi
+.\scripts\kugou-api-install.ps1 netease        # 网易云音源（用不到可以不装）
+```
+
+### 4. 开播
+
+```powershell
+.\scripts\kugou-tui.ps1
+.\scripts\kugou-tui.ps1 -s 海阔天空      # 参数原样透传给播放器
+```
+
+服务没起时启动器会自己拉起来并等它就绪（约 20 秒超时），已经起着就只做一次本地
+探测。想确认它到底在做什么，用 `--dry-run`：
+
+```powershell
+.\scripts\kugou-tui.ps1 --dry-run
+# 配置        : C:\Users\you\AppData\Roaming\kugou-tui\config.toml
+# 当前音源    : kugou_concept
+# 探测地址    : http://127.0.0.1:3001（端口 3001，平台 lite）
+# 服务目录    : C:\Users\you\KuGouMusicApi
+# 服务在跑吗  : 没起
+```
+
+也可以完全手动，两个终端各跑一条：
+
+```powershell
+cd $env:USERPROFILE\KuGouMusicApi; $env:PORT=3000; node app.js
+.\target\release\kugou-tui.exe
+```
+
+### 5. 终端要求
+
+**用 Windows Terminal，不要用旧的「命令提示符」窗口。** 程序需要
+`ENABLE_VIRTUAL_TERMINAL_PROCESSING`（交替屏幕、真彩、鼠标上报）与 UTF-8 输出，
+Windows Terminal 默认满足；老的 conhost 窗口在中文与颜色上会有明显残缺。
+
+封面在 Windows Terminal 里会退回**半块字符画**：它不支持 Kitty / iTerm2 的图形
+协议，程序探测不到就自动降级，属预期行为（想省掉这份开销可以开 `lite_mode`）。
+
+装了 Nerd Font 的话加一个环境变量，图标才不会退成 ASCII：
+
+```powershell
+$env:KUGOU_TUI_NERD_FONT = "1"
+```
+
+### 6. 与 Linux 的功能差异
+
+| 能力 | Linux | Windows |
+|---|---|---|
+| 播放、搜索、歌词、封面、缓存 | ✅ | ✅ 相同 |
+| MPRIS（桌面媒体控件、`playerctl`） | ✅ | ❌ D-Bus 接口，Windows 没有 |
+| 系统托盘（StatusNotifierItem） | ✅ | ❌ 同上 |
+| 最小化窗口 | ✅ 仅 niri 下（触发入口在**托盘菜单**里，不是键盘） | ❌ 走 compositor IPC，Windows 无对应实现 |
+| 配置文件位置 | `~/.config/kugou-tui/config.toml` | `%APPDATA%\kugou-tui\config.toml` |
+| 缓存与日志位置 | `~/.cache/kugou-tui/` | `%LOCALAPPDATA%\kugou-tui\` |
+| 启动器 / 服务安装器 | `scripts/` 下的 bash 版 | `scripts/` 下的 `.ps1` 版（功能对应） |
+
+三条 ❌ 都是**降级而不是故障**：没有 D-Bus 时相关代码不参与编译，界面上也不会
+出现点了没反应的入口。用 `--print-config` 可以直接确认：
+
+```powershell
+.\target\release\kugou-tui.exe --print-config
+# 系统托盘 : 不可用（windows 无 D-Bus）
+```
+
+### 7. 改代码时怎么确认没弄坏 Windows
+
+`.github/workflows/ci.yml` 里有一栏 `windows-latest`，每次推送都会真的在 Windows 上
+跑 `clippy + test + build + 打包`。本地想先查一遍（不需要 Windows 机器）：
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+cargo check  --target x86_64-pc-windows-msvc --all-targets
+cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+```
+
+最后一步链接需要 Windows 或 MSVC 工具链，Linux 上跑到
+`error: linker link.exe not found` 就说明 Rust 侧全部通过了。每一处平台分支
+为什么存在，见 [docs/MAINTENANCE.md](MAINTENANCE.md) 的「1.6 平台分支在哪」。
+
+---
+
+## 在 macOS 上构建与运行
+
+**支持等级：代码走的是与 Linux 同一套 `cfg(unix)` 分支，CI 在 `macos-latest` 上
+跑 `clippy + test + build`，但没有在真机上长期使用过。** 下面是已知的差异与做法。
+
+### 构建
+
+```bash
+# 前置只有 Rust 1.90+ 与 Xcode 命令行工具（xcode-select --install）
+git clone https://github.com/sijin-xb/kugou-tui.git
+cd kugou-tui && cargo build --release
+```
+
+`aws-lc-sys`（随 rustls 引入）是 C 代码，靠 Xcode 的 clang 编译；macOS 不需要
+ALSA 那套依赖，也不需要额外装 CMake（构建脚本在没有 cmake 时走 `cc` 直编）。
+
+### 运行
+
+脚本是 bash，和 Linux 一样用：
+
+```bash
+./scripts/kugou-api-install kugou
+./scripts/kugou-tui
+```
+
+### 与 Linux 的差异
+
+| 项目 | macOS 上的表现 |
+|---|---|
+| 音频后端 | CoreAudio（cpal 自动选），不需要配设备；设置页里的设备列表来自 CoreAudio |
+| MPRIS / 系统托盘 | **不可用**。两者都是 D-Bus 接口，macOS 默认没有 session bus；启动时会往日志写一条 WARN 然后跳过，不影响播放 |
+| 最小化窗口 | 不可用。它走的是 niri 的 compositor IPC，`NIRI_SOCKET` 不存在时入口直接不出现 |
+| 配置文件 | `~/Library/Application Support/kugou-tui/config.toml`（**不是** `~/.config`） |
+| 缓存与日志 | `~/Library/Caches/kugou-tui/` |
+| 默认下载目录 | `~/Music`（`dirs` 的 `audio_dir` 就是它） |
+| 封面 | iTerm2 能识别并走图形协议；Terminal.app 退回半块字符画（预期行为） |
+| Nerd Font 探测 | 没有 fontconfig，`fc-list` 探测一律落空 → 退 ASCII。装了 Nerd Font 就设 `KUGOU_TUI_NERD_FONT=1` |
+
+想确认实际读的是哪个配置文件，用 `--print-config`。
 
 ---
 

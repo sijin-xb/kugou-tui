@@ -4,6 +4,160 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.2] - 2026-09-27
+
+### 新增
+
+- **Windows 支持（10/11，x86_64）**。此前 `docs/INSTALL.md` 直接把 Windows 写成
+  「不行」，理由是 `zbus` 在那边要 `async-io`；实际盘下来问题不止那一条，
+  按「编译不过 → 编译过了但行为不对 → 行为对了但用起来别扭」三层各修了一批：
+
+  1. **编译不过的**（三处，都是硬错误）：
+     - `audio/streaming.rs` 用了 `std::os::unix::fs::FileExt::read_at`（`pread`）。
+       Windows 没有 `pread`，包了一层 `read_at`，那边走 `seek_read`
+       （借 `ReadFile` 的 OVERLAPPED 做定位读）。副作用是会挪文件游标，
+       而那个句柄是只读落盘文件、游标没人用，所以无害——注释里写清了。
+     - `logger.rs` 的 stderr 重定向用了 `libc::dup2` + `STDERR_FILENO`，
+       而 `libc` 在 Windows 上**没有** `STDERR_FILENO`，`std::os::fd` 整个模块
+       也不存在。改成平台分支：Unix 照旧 `dup2`，Windows 用 `SetStdHandle`
+       改 `STD_ERROR_HANDLE`。
+     - `mpris.rs` / `tray.rs` 是 D-Bus 集成，Windows 上既没有 session bus
+       也没有认这两个接口的宿主。连同 `zbus` 依赖一起收敛到 `cfg(unix)`，
+       相关字段与同步逻辑同步条件编译。
+
+  2. **编译过了但行为不对的**：
+     - **下载目录的 `~` 展开在 Windows 上失效**。`app/settings.rs` 只读 `HOME`，
+       而那是 Unix 的约定，Windows 上是 `USERPROFILE`——结果是 `~/Music`
+       原样留着，最后落出一个名字就叫 `~` 的目录，用户在自己以为的位置找不到文件。
+       改成 `HOME` 优先、拿不到再问 `dirs::home_dir()`（Windows 上走
+       `SHGetKnownFolderPath`）。顺带认 `~\Music` 这种反斜杠写法。
+     - **配置落盘位置**：`dirs` 在 Windows 上给的是 `%APPDATA%` / `%LOCALAPPDATA%`，
+       无需平台分支，但文档里一直只写 XDG 路径，容易让人找错地方。
+     - **`--print-config` 谎报托盘状态**：Windows 上会显示「系统托盘 : 启用」，
+       而那份代码压根没编进去。现在如实显示「不可用（windows 无 D-Bus）」，
+       `tray` 的默认值也改成按平台取（非 Unix 默认关）。
+
+  3. **依赖调整**：
+     - TLS 后端按平台分叉：非 Windows 仍是 rustls，**Windows 改用系统自带的
+       SChannel**。这不是性能取舍——rustls 会把 `aws-lc-sys` 拖进来，而那是 C 代码，
+       Windows 下除了 MSVC 还要额外装 **CMake + NASM** 才编得过。换掉之后
+       Windows 的构建前置就只剩「Rust + MSVC 工具链」，证书校验还顺带走了系统根证书库。
+     - `zbus`、`libc` 收敛到 `cfg(unix)`；Windows 侧新增 `windows-sys`
+       （本来就在依赖树里，只是显式声明 `SetStdHandle` 用得到的那几个 feature）。
+
+- `scripts/build-windows.ps1`：Windows 的构建 + 打包脚本（对应 Unix 侧的
+  `make-release-tarball`），产出 `dist\kugou-tui-<版本>-<三元组>.zip`。
+  仓库里其余脚本都是 bash，Windows 下默认跑不了，构建本身两条命令就够、
+  真正容易漏的是打包（发行包必须同时带上那三个 bash 脚本与 `docs/`）。
+
+- `scripts/kugou-tui.ps1` 与 `scripts/kugou-api-install.ps1`：Windows 侧的启动器
+  与服务安装器，对应 bash 的同名脚本。装上后日常使用就是两条命令
+  （`kugou-api-install.ps1` 一次 → `kugou-tui.ps1` 开播），不必再手动开一个终端
+  起 `node app.js`。几个刻意的取舍：
+
+  - 启动器**不写 `param()` 块**：一旦声明了参数，PowerShell 会把 `-s 海阔天空`
+    当成写错的参数名直接报错；没有 `param()` 时全部参数进 `$args`，正好能原样透传。
+  - 安装与启动**分开**（bash 侧是安装器顺手把服务拉起来）：这样「怎么起服务」
+    只有启动器一处实现，两边不会各自漂移。
+  - 只依赖 PowerShell **5.1**（Windows 自带的那版），不要求额外装 pwsh 7；
+    平台判断用 `$env:OS` 而不是 `$IsWindows`（后者 6.0 才有）。
+  - 带 `--dry-run`，只打印「当前音源 / 探测地址 / 服务目录 / 服务在不在跑」，
+    排查「为什么它说服务没起」时不用猜。
+
+- **CI**（`.github/workflows/ci.yml`）：**Linux / Windows / macOS 三个平台**各跑一遍
+  `clippy -D warnings + test + build`，Windows 那一栏再跑一次打包脚本。
+  此前仓库里没有 CI，而 `CONTRIBUTING.md` 却写着「CI 会用同样的命令」——
+  现在这句话成立了。Windows 那一栏是这次的重点：路径展开、配置目录、
+  缓存文件命名这些差异只有真跑起来才露出来，光靠 `cargo check` 保证不了。
+
+- **macOS 进入 CI**，于是「macOS 支持吗」有了可验证的答案，而不是一句「理论上可行」。
+  代码层面它和 Linux 共用 `cfg(unix)` 分支，本来就没有 Linux 专属的调用残留；
+  但**共用不等于验证过**——`dirs` 在那边给的是 `~/Library/...` 而不是 XDG 目录、
+  音频走 CoreAudio、字体探测拿不到 `fc-list`，这些只有真跑一遍测试才看得见。
+  已知差异（无 MPRIS/托盘、无最小化窗口、配置路径不同）见 `docs/INSTALL.md`
+  新增的「在 macOS 上构建与运行」。
+
+- `KUGOU_TUI_CONFIG_DIR`：整体覆盖配置根目录。便携安装（程序与配置一起放 U 盘）
+  用得上；也让「配置能活过一次重启」那条测试能在 Windows 上跑——那边 `dirs`
+  走的是 Win32 Known Folder，`XDG_CONFIG_HOME` 对它无效，没有这个开关就只能跳过测试。
+- `KUGOU_TUI_NERD_FONT`：显式指定有没有 Nerd Font。Windows 没有 fontconfig，
+  `fc-list` 探测一律落空，装了 Nerd Font 的用户靠它把图标打开。
+
+### 变更
+
+- **修正失效的 MSRV 声明：`rust-version` 1.86 → 1.90**。声明 1.86 是错的，而且
+  错得有害——用 1.86 编会收到一长串「某依赖要求更高 rustc」，而不是一句「你需要 1.90」。
+  真实下限由**依赖**顶上去（`quantette` 0.6 要 1.90，经 ratatui-image → icy_sixel 引入；
+  ratatui 0.30 要 1.88、rodio 0.22 要 1.87），已用 `cargo +1.90.0 check --locked
+  --all-targets` 实测确认。README 徽章、`docs/INSTALL.md`、`CONTRIBUTING.md` 与
+  三处源码注释里的旧数字一并改掉。
+
+- **清掉 29 处按真实 MSRV 才暴露的 clippy 建议**。这不是「顺手清理」——那条错误的
+  MSRV 声明同时也把 clippy 的 MSRV 感知 lint 全压住了（它按 `rust-version` 判断哪些
+  新 API 可用），所以声明一改成 1.90，`clippy -D warnings` 立刻红了。三类：
+
+  | lint | 处数 | 改法 |
+  |---|---|---|
+  | `collapsible_if` | 23 | `if let Some(x) = a { if b { .. } }` → `if let Some(x) = a && b { .. }`（let-chain，1.88 起可用） |
+  | `manual_is_multiple_of` | 3 | `n % 2 == 0` → `n.is_multiple_of(2)` |
+  | `chunks_exact_to_as_chunks` | 3 | `bytes.chunks_exact(4)` → `bytes.as_chunks::<4>().0`（元素类型由 `&[u8]` 变成 `&[u8; 4]`） |
+
+  都是 `cargo clippy --fix` 的机器可应用建议，语义等价，改完 293 条测试全过。
+
+- **`cargo fmt --all` 拉平了格式基线**，CI 从此可以跑 `cargo fmt --check`。
+  之前仓库有 38 处不是 rustfmt 干净的（多为手写换行与 rustfmt 的取舍不一致），
+  而 `CONTRIBUTING.md` 却要求贡献者跑 `cargo fmt --all`——两边对不上。
+  这次一并拉平（19 个文件，纯空白），于是那句「CI 会用同样的命令」真正成立。
+
+- `~` 展开的逻辑抽成纯函数（主目录由调用方传入），相关测试不再改写进程级
+  `HOME`——测试是并行跑的，那种写法是偶发失败的隐患。
+- 音频设备打开失败的提示按平台给排查线索（Windows 上提 Windows 音频服务，
+  而不是一直说「检查 PipeWire/ALSA」）。
+- `docs/LICENSES.md` 按新的 `Cargo.lock` 重算（依赖 469 → **478** 个包；
+  宽松许可 455 → **464**）。新增的 `native-tls` / `openssl` / `openssl-sys` 等
+  是 `native-tls` 为「非 Windows、非 macOS」目标声明的 OpenSSL 后端——
+  本项目只在 Windows 下用它（走 SChannel），**Linux 构建根本不编译这几个包**，
+  文档里已注明这一点，免得看表的人以为产物里多了个 OpenSSL。
+
+### 文档
+
+- README 从「Linux 项目」改成**多平台叙述**：安装段按平台分列（预编译包 / 源码构建），
+  并补了一张 Linux / Windows / macOS 的能力对照表。徽章同步（`platform` 与 `rust` 版本）。
+- `docs/INSTALL.md`：新增「在 Windows 上构建与运行」（含 PowerShell 脚本用法、
+  `--dry-run`、终端要求、功能差异表、改代码时怎么确认没弄坏 Windows）与
+  「在 macOS 上构建与运行」两节；环境要求表补上 Linux 的 `alsa-lib` / `pkg-config`
+  前置（干净容器上缺了会在 `alsa-sys` 报错，此前没写）与 macOS 一行。
+- `docs/FAQ.md`：新增「平台相关」一节，回答 Windows 的脚本/工具链/托盘/封面/字体
+  与「macOS 支持吗」。
+- `docs/RELEASE.md`：说明 Windows 的 zip 由 `scripts/build-windows.ps1` 产出、
+  **当前不由 `scripts/release` 自动附带**（那脚本是 bash、跑在 Linux 上），
+  以及挂到 Release 上的手动步骤与将来交给 CI 的做法。
+- `docs/CONFIGURATION.md`：**动作名清单漏了 `toggle_window`**（写 59 个，实际 60 个），
+  已补上并说明它是唯一没有默认键位的动作、且仅在 niri 下生效；`tray` 一段补上
+  非 Unix 平台的表现。
+- 修正「最小化窗口 = `m` 键」的写法：`m` 是**静音**，最小化的入口在**托盘菜单**里
+  （README / INSTALL / CHANGELOG 三处）。
+- `docs/MAINTENANCE.md`：§1.6 补 macOS 一栏与三平台 CI 的说明；新增 §1.7
+  记录 Windows 侧三个脚本的坑（`param()` 与 `$args`、`Start-Process` 的
+  重定向限制、只用 5.1 语法）。
+
+### 已知限制
+
+- Windows 上没有系统托盘、MPRIS，也没有「最小化窗口」（触发入口在托盘菜单里）：
+  前两者是 D-Bus 接口，后者走的是 niri 的 compositor IPC。都是**降级**：
+  相关入口不会出现，不会点了没反应。
+- Windows 上封面只能走半块字符画：Windows Terminal 不支持 Kitty / iTerm2 的图形协议。
+- Windows 侧的 `kugou-tui.ps1` / `kugou-api-install.ps1` 是 bash 版的**对应物而非
+  逐行移植**：只覆盖主流程（当前音源 → 服务目录/端口/`platform` → 探活 → 拉起 →
+  等就绪 → 进播放器），`kugou-api`（`start`/`stop`/`restart`/`status` 四个子命令）
+  没有对应物——启动器已经覆盖了它唯一的日常用途。要停服务就关掉播放器后
+  `Stop-Process -Name node`，或用 `Get-NetTCPConnection -LocalPort 3000` 找到 PID。
+- **Windows 的 zip 还没进发版流程**：Release 里目前只有 Linux 的 tarball，
+  Windows 用户按 `docs/INSTALL.md` 从源码构建。要挂上去得在 Windows 上跑一次
+  `build-windows.ps1` 再 `gh release upload`，或让 CI 在打 tag 时上传。
+- **macOS 没有在真机长期使用过**：CI 跑的是 `clippy + test + build`，覆盖不到
+  音频设备枚举、CoreAudio 实际出声、iTerm2 图形协议这些真机行为。
+
 ## [0.4.1] - 2026-09-26
 
 ### 修复

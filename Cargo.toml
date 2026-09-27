@@ -1,11 +1,19 @@
 [package]
 name = "kugou-tui"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
-# 1.86 是 ratatui-image 11.x 的下限：它要 ratatui 0.30，而支持 ratatui 0.30 的
-# ratatui-image 最低是 10.0.0，MSRV 就是 1.86。不能退回 8.x——8.x 只认
-# ratatui 0.29，会和这里的 0.30 编出两份 ratatui（且不兼容，渲染不进同一个 Frame）。
-rust-version = "1.86"
+# MSRV 由**依赖**决定，不是本项目代码决定的。当前最高的是 `quantette`（要 1.90，
+# 经 ratatui-image → icy_sixel 引进来），其余：ratatui 0.30 要 1.88、rodio 0.22 要
+# 1.87、time 0.3.55 要 1.88。
+#
+# 这个数字会随 `cargo update` 漂，改完依赖记得按真实下限验一遍：
+#   cargo +1.90.0 check --locked --all-targets
+# 声明得比实际低是有害的——用户拿 1.86 编会收到一长串「某依赖要求更高 rustc」，
+# 而不是一句「你需要 1.90」。
+#
+# 也别为了压低它去退依赖：ratatui-image 8.x 只认 ratatui 0.29，会和这里的 0.30
+# 编出两份 ratatui（不兼容，渲染不进同一个 Frame）。
+rust-version = "1.90"
 description = "轻量级酷狗音乐命令行 TUI 播放器，基于 KuGouMusicApi"
 license = "MIT"
 repository = "https://github.com/sijin-xb/kugou-tui"
@@ -38,16 +46,10 @@ tokio = { version = "1", default-features = false, features = [
 ] }
 
 # --- HTTP ---
-# 关闭默认 feature 以剔除 native-tls / system-proxy，改用 rustls，减小体积
-reqwest = { version = "0.13", default-features = false, features = [
-    "rustls",
-    "json",
-    "query",
-    "gzip",
-    "stream",
-    "http2",
-    "charset",
-] }
+# 这里**不声明** reqwest：它的 TLS 后端按平台分叉，放在文件末尾的
+# 「平台相关依赖」一节，免得 `[dependencies]` 里出现两份同名条目看不懂。
+# 公共 feature 是 json / query / gzip / stream / http2 / charset；
+# system-proxy 一律关掉，代理由 config.proxy 显式指定（见 api/client.rs）。
 
 # --- 音频解码与播放 ---
 # 关闭 default 以剔除 recording（录音，不需要）与 dither（抖动，额外引入 rand）
@@ -82,17 +84,14 @@ thiserror = "2"
 anyhow = "1"
 
 # --- 基础设施 ---
+# `dirs` 在两个平台上给的都是各自的「正统」位置：Unix 是 XDG 目录，
+# Windows 是 Known Folder（`%APPDATA%` / `%LOCALAPPDATA%` / 用户主目录），
+# 所以 config.rs 里不需要为路径写平台分支。
 dirs = "7"
 clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.23"
 crossbeam-channel = "0.5"
 qrcode = { version = "0.14.1", default-features = false }
-zbus = { version = "5.13.2", default-features = false, features = ["tokio"] }
-
-# 只为了 `dup2`：把 stderr 接到日志文件上，免得音频后端（libjack / libasound）
-# 的报错打在 TUI 画面上。它本来就在依赖树里（alsa → cpal → rodio），
-# 显式声明不增加任何编译量。
-libc = "0.2"
 
 # --- 终端图片（封面）---
 # 关掉默认的 image-defaults：那会打开 image 的全部格式解码器并拖进 rayon，
@@ -100,6 +99,73 @@ libc = "0.2"
 ratatui-image = { version = "11.1.0", default-features = false, features = [
     "crossterm",
 ] }
+
+# ======================================================================
+# 平台相关依赖
+#
+# 全部集中在这里，是因为「哪个平台要哪个」一眼能对照着看；
+# 散在 `[dependencies]` 中间容易看漏（cargo 也允许，但读起来要来回找）。
+# ======================================================================
+
+# --- HTTP 的 TLS 后端：非 Windows 用 rustls ---
+#
+# rustls + aws-lc-rs，纯 Rust，不依赖系统 OpenSSL，Linux 上静态链接、
+# 免去发行版之间的 OpenSSL 版本差异。
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "json",
+    "query",
+    "gzip",
+    "stream",
+    "http2",
+    "charset",
+] }
+
+# --- HTTP 的 TLS 后端：Windows 用系统自带的 SChannel ---
+#
+# **这不是性能取舍，是「能不能编出来」的问题。** reqwest 的 `rustls` feature 会把
+# aws-lc-rs 拖进来，而 aws-lc-sys 是一坨 C 代码，Windows 下除了 MSVC 工具链还要
+# 额外装 CMake 与 NASM 才编得过。对一个「cargo build 就能用」的终端播放器来说，
+# 这个前置门槛不成比例。SChannel 走 `schannel` crate，是纯 Rust 的 Win32 绑定，
+# 装了 MSVC 工具链就能直接编；附带好处是证书校验走系统根证书库，
+# 企业内网的自签 CA 不用额外配。
+[target.'cfg(windows)'.dependencies]
+reqwest = { version = "0.13", default-features = false, features = [
+    "native-tls",
+    "json",
+    "query",
+    "gzip",
+    "stream",
+    "http2",
+    "charset",
+] }
+
+# 只为了 `SetStdHandle`：Windows 上没有 fd 表，把 stderr 接到日志文件得改
+# Win32 标准句柄（见 logger::redirect_stderr_to_log 的 Windows 分支）。
+# 0.61 本来就在依赖树里（clap → anstream → anstyle-wincon 等），
+# 显式声明不增加任何编译量。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+] }
+
+# --- 桌面集成（MPRIS + 系统托盘）：只在 Unix ---
+#
+# 两者都是 D-Bus 上的接口（`org.mpris.MediaPlayer2` / `org.kde.StatusNotifierItem`），
+# 只在 Unix 桌面上有意义。Windows 既没有 session bus，也没有认这两个接口的宿主，
+# 所以整个依赖连同 `src/mpris.rs`、`src/tray.rs` 一起只在 Unix 上编译——
+# 免得为一个注定连不上的东西多编一份 tokio 异步栈，还在日志里留下一行
+# 让人误以为出了故障的 WARN。
+[target.'cfg(unix)'.dependencies]
+zbus = { version = "5.13.2", default-features = false, features = ["tokio"] }
+
+# 只为了 `dup2`：把 stderr 接到日志文件上，免得音频后端（libjack / libasound）
+# 的报错打在 TUI 画面上。它本来就在依赖树里（alsa → cpal → rodio），
+# 显式声明不增加任何编译量。
+#
+# Unix 专有：Windows 没有 fd 表，同样的目的走 Win32 标准句柄。
+libc = "0.2"
 
 [profile.release]
 opt-level = "z"

@@ -74,6 +74,16 @@ pub fn write(level: &str, message: &str) {
 ///
 /// 接到日志而不是 `/dev/null`：这些报错正是排查「没声音」时的关键线索。
 /// 必须在 `ratatui::init()` 之前调用。
+///
+/// # 两个平台的做法不一样
+///
+/// * **Unix** 有 fd 表，`dup2` 把 fd 2 换成日志文件的副本即可，连 C 库
+///   （上面那两个正是 C 库）都会跟着走。
+/// * **Windows** 没有 fd 表，标准流是三个 Win32 句柄，只能 `SetStdHandle`
+///   把 `STD_ERROR_HANDLE` 指过去。这**只覆盖 Rust 侧的输出**（`eprintln!`、
+///   panic 消息），不覆盖 CRT 的 fd 2。够用是因为 Windows 上的音频后端是
+///   WASAPI（cpal 直接用 `windows` crate 调 COM），不存在上面那种绕过 Rust
+///   直接写 fd 的 C 库——真要写，也是写进 Windows 自己的调试输出通道。
 pub fn redirect_stderr_to_log() {
     // 日志没初始化成功（SINK 没设上）时无从重定向，保持原样。
     let Some(sink) = SINK.get() else {
@@ -83,12 +93,34 @@ pub fn redirect_stderr_to_log() {
         return;
     };
 
-    use std::os::fd::AsRawFd;
-    // SAFETY：`dup2` 只改本进程的 fd 表，失败返回 -1 不破坏其它状态。
-    // 锁守卫随后释放，但 fd 2 已经是独立副本，仍然有效。
-    let result = unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) };
-    if result < 0 {
-        // 这里**不能**用 eprintln!——那正是要拦下来的东西。
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY：`dup2` 只改本进程的 fd 表，失败返回 -1 不破坏其它状态。
+        // 锁守卫随后释放，但 fd 2 已经是独立副本，仍然有效。
+        let result = unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) };
+        if result < 0 {
+            // 这里**不能**用 eprintln!——那正是要拦下来的东西。
+            report_redirect_failure();
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+
+        // SAFETY：句柄来自仍然活着的 `File`（它被 `SINK` 持有到进程结束），
+        // `SetStdHandle` 只是把标准错误指向它，不转移所有权、不关闭任何东西。
+        let ok = unsafe { SetStdHandle(STD_ERROR_HANDLE, file.as_raw_handle() as _) };
+        if ok == 0 {
+            report_redirect_failure();
+        }
+    }
+
+    /// 失败只记一行日志——写不出去也不该把启动带崩。
+    #[cfg(any(unix, windows))]
+    fn report_redirect_failure() {
         write(
             LEVEL_WARN,
             &format!(

@@ -138,8 +138,18 @@ pub fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     // 缓存块在设置页里有。
     let mut connect: Vec<Line> = vec![
         kv("API", api_host(&state.config.api_base), width, theme),
-        kv("音源", state.config.active_source_kind().label(), width, theme),
-        kv("登录", if state.logged_in { "是" } else { "否" }, width, theme),
+        kv(
+            "音源",
+            state.config.active_source_kind().label(),
+            width,
+            theme,
+        ),
+        kv(
+            "登录",
+            if state.logged_in { "是" } else { "否" },
+            width,
+            theme,
+        ),
         kv(
             "指纹",
             if state.config.dfid.is_some() {
@@ -260,8 +270,8 @@ pub fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
 /// 取不到（比如路径以 `..` 结尾）就退回完整路径——宁可让它被侧边栏裁掉，
 /// 也不要显示一个认不出来的空值。
 fn dir_basename(path: &std::path::Path) -> String {
-    // 用 to_string_lossy 而非 OsStr::display()：后者要 Rust 1.87，
-    // 项目 MSRV 是 1.86，用了 clippy 会报 MSRV 错误
+    // 用 to_string_lossy 而不是 OsStr::display()：这里要的是一个 String，
+    // 而 display() 给的是 Display 适配器。
     path.file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_else(|| path.display().to_string())
@@ -352,10 +362,7 @@ pub fn render_prompt(frame: &mut Frame, prompt: &PromptState, theme: &Theme) {
     let line = Line::from(vec![
         Span::styled("> ", theme.title()),
         Span::styled(
-            truncate_to_width(
-                prompt.buffer.text(),
-                inner.width.saturating_sub(2) as usize,
-            ),
+            truncate_to_width(prompt.buffer.text(), inner.width.saturating_sub(2) as usize),
             theme.body(),
         ),
     ]);
@@ -669,8 +676,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &
 
     // 窄终端里「分类」先让位：它是分组标签，不影响「这个键是干嘛的」。
     // 不丢的话三列会互相挤，最坏情况只剩「功能」一列可见（按键被挤成 0 宽）。
-    let show_group =
-        inner.width as usize >= key_col + description_col + group_col + COLUMN_SPACING;
+    let show_group = inner.width as usize >= key_col + description_col + group_col + COLUMN_SPACING;
 
     let rows = displayed[visible.clone()]
         .iter()
@@ -698,10 +704,7 @@ pub fn render_help(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &
         ]
     } else {
         // 只剩两列时让「功能」吃掉剩下的宽度（没有第三列，也就不会留出空档）
-        vec![
-            Constraint::Length(key_col as u16),
-            Constraint::Min(4),
-        ]
+        vec![Constraint::Length(key_col as u16), Constraint::Min(4)]
     };
 
     let table = Table::new(rows, constraints)
@@ -850,7 +853,10 @@ mod tests {
         let state = AppState::new(Config::default());
 
         let text = screen_text(&draw_sidebar(&state, 112, 60));
-        assert!(!text.contains("另有"), "内容全放得下时不该提示有省略：{text}");
+        assert!(
+            !text.contains("另有"),
+            "内容全放得下时不该提示有省略：{text}"
+        );
         for block in ["连接", "播放", "缓存"] {
             assert!(text.contains(block), "60 行终端应显示完整的「{block}」块");
         }
@@ -948,10 +954,7 @@ mod tests {
             text.contains("功能"),
             "窄终端也必须看得到「功能」表头：{text}"
         );
-        assert!(
-            !text.contains("分类"),
-            "放不下时「分类」应整列让位：{text}"
-        );
+        assert!(!text.contains("分类"), "放不下时「分类」应整列让位：{text}");
         // 第一条键位本身要看得到，光有表头没用
         let first_key = CHEATSHEET[0].0;
         let key: String = first_key.chars().filter(|c| !c.is_whitespace()).collect();

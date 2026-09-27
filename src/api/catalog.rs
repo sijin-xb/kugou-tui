@@ -502,18 +502,18 @@ impl ApiClient {
             }
 
             // `fail_process` 会说明卡在哪一步，实测见过 ["pkg","buy"]（需购买/开通）
-            if let Some(process) = data.get("fail_process").and_then(Value::as_array) {
-                if !process.is_empty() {
-                    let steps = process
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    return Err(AppError::NotFound(format!(
-                        "《{}》需要开通或购买（{}）",
-                        song.name, steps
-                    )));
-                }
+            if let Some(process) = data.get("fail_process").and_then(Value::as_array)
+                && !process.is_empty()
+            {
+                let steps = process
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("/");
+                return Err(AppError::NotFound(format!(
+                    "《{}》需要开通或购买（{}）",
+                    song.name, steps
+                )));
             }
         }
 
@@ -927,24 +927,24 @@ fn collect_artists(root: &Value) -> Vec<Artist> {
 /// 用户一个「可能需要 VIP」的笼统提示——但其实是版权问题。提前一步
 /// 把这种响应挡在 URL 解析外面，让上层看到明确的 status 翻译。
 fn extract_stream_url(root: &Value) -> Option<String> {
-    if let Some(status) = root.get("status").and_then(Value::as_i64) {
-        if status != 1 {
-            return None;
-        }
+    if let Some(status) = root.get("status").and_then(Value::as_i64)
+        && status != 1
+    {
+        return None;
     }
 
     const URL_KEYS: &[&str] = &["url", "play_url", "backup_url", "backupUrl"];
 
-    if let Some(items) = root.get("data").and_then(Value::as_array) {
-        if let Some(found) = items.iter().find_map(|item| pick_url(item, URL_KEYS)) {
-            return Some(found);
-        }
+    if let Some(items) = root.get("data").and_then(Value::as_array)
+        && let Some(found) = items.iter().find_map(|item| pick_url(item, URL_KEYS))
+    {
+        return Some(found);
     }
 
-    if let Some(data) = root.get("data") {
-        if let Some(found) = pick_url(data, URL_KEYS) {
-            return Some(found);
-        }
+    if let Some(data) = root.get("data")
+        && let Some(found) = pick_url(data, URL_KEYS)
+    {
+        return Some(found);
     }
 
     pick_url(root, URL_KEYS)
@@ -1323,10 +1323,7 @@ mod tests {
                 ]
             }
         });
-        let names: Vec<String> = collect_artists(&root)
-            .into_iter()
-            .map(|a| a.name)
-            .collect();
+        let names: Vec<String> = collect_artists(&root).into_iter().map(|a| a.name).collect();
         assert_eq!(names, vec!["甲", "乙"]);
     }
 
@@ -1341,10 +1338,7 @@ mod tests {
                 ]
             }
         });
-        let names: Vec<String> = collect_artists(&root)
-            .into_iter()
-            .map(|a| a.name)
-            .collect();
+        let names: Vec<String> = collect_artists(&root).into_iter().map(|a| a.name).collect();
         assert_eq!(names, vec!["周杰伦", "薛之谦"]);
     }
 }

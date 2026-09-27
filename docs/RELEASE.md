@@ -50,6 +50,28 @@
 用 `cargo build --release` 构建，**不能用 makepkg** —— `makepkg` 会带上
 `makepkg.conf` 的 `-march=native`，那样的二进制换台机器就跑不了。
 
+### Windows 的 zip 是另一条路（当前**不**由 `scripts/release` 产出）
+
+Windows 的发行包是 `kugou-tui-<版本>-x86_64-pc-windows-msvc.zip`，内容与 tarball
+一一对应（二进制 + 三个**bash** 脚本 + 全部文档），由 `scripts/build-windows.ps1` 生成。
+
+**注意它现在还没接进发版流程**，原因是硬性的：那个脚本要在 Windows 上跑
+（它打包的是 MSVC 工具链产出的 `.exe`），而 `scripts/release` 是 bash、跑在开发机
+（Linux）上。所以目前的做法是：
+
+1. 在 Windows 上 `git checkout v<版本>` → `cargo build --release`
+   → `.\scripts\build-windows.ps1 -SkipBuild`；
+2. 把产出的 zip 用 `gh release upload v<版本> <zip>` 挂到已经建好的 Release 上。
+
+> 想自动化的话，最省事的是让 CI 干：`.github/workflows/ci.yml` 里已经有一栏
+> Windows 在跑 `build-windows.ps1`，加一个「打 tag 时把 zip 作为 artifact 上传、
+> 再 `gh release upload`」的 job 即可。**这一步还没做**——目前的 Release 里
+> 只有 Linux 的 tarball，Windows 用户按 `docs/INSTALL.md` 从源码构建。
+
+zip 里**没有** PowerShell 脚本，和 tarball 里没有 bash 之外的脚本是同一个道理：
+包里带的是「另一套平台下仍然用得上的东西」（Git Bash / WSL 能跑 bash 版），
+而不是「本平台的原生脚本」——后者由源码仓库提供。
+
 ---
 
 ## 三、推送发布流程的目标仓库

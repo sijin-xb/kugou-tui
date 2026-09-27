@@ -311,6 +311,11 @@ pub enum Event {
     ///
     /// 与 [`Event::Key`] 分开：按键要经主循环按当前焦点翻译，而这里传进来的
     /// 已经是明确的语义动作（播放 / 下一首 …），直接执行即可。
+    ///
+    /// 生产者（`mpris.rs` / `tray.rs`）是 Unix 专有的 D-Bus 集成，非 Unix 上
+    /// 没人构造它——留 `allow` 而不是 cfg 掉，是为了让事件枚举在两边形状一致，
+    /// 主循环那个 `match` 不用长出平台分支。
+    #[cfg_attr(not(unix), allow(dead_code))]
     Action(crate::keymap::Action),
 }
 
@@ -348,12 +353,7 @@ impl EventBus {
     }
 
     /// 上报一次**载入类**请求的失败，顺带收掉对应的「载入中」标记。
-    pub fn fail_loading(
-        &self,
-        target: LoadingTarget,
-        context: impl Into<String>,
-        error: AppError,
-    ) {
+    pub fn fail_loading(&self, target: LoadingTarget, context: impl Into<String>, error: AppError) {
         self.fail_with_target(Some(target), context, error);
     }
 

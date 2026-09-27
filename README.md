@@ -3,8 +3,8 @@
 **在终端里听酷狗：逐字歌词、真频谱，常驻 15 MiB。**
 
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
-![Rust](https://img.shields.io/badge/rust-1.86%2B-orange.svg)
-![Platform](https://img.shields.io/badge/platform-linux-lightgrey.svg)
+![Rust](https://img.shields.io/badge/rust-1.90%2B-orange.svg)
+![Platform](https://img.shields.io/badge/platform-linux%20%7C%20windows-lightgrey.svg)
 
 ### 为什么做这个
 
@@ -32,19 +32,39 @@
 
 ### 安装
 
-从源码构建（AUR 包**计划中，尚未上架**；不想装 Rust 工具链的话，用
-[Release 里的预编译包](https://github.com/sijin-xb/kugou-tui/releases)，它带着脚本与文档，解压即用）：
+支持 **Linux**（主力平台）与 **Windows 10/11 x86_64**；**macOS 理论可用、CI 覆盖但未在真机长期使用**——
+三者的差异见下面的对照表。
+
+**最省事：下预编译包。** [Releases](https://github.com/sijin-xb/kugou-tui/releases) 里有
+Linux tarball 与 Windows zip，都带着脚本与文档：
+
+```bash
+# Linux
+tar xzf kugou-tui-<版本>-x86_64-unknown-linux-gnu.tar.gz
+cd kugou-tui-<版本>-x86_64-unknown-linux-gnu
+./scripts/kugou-api-install kugou   # 一次性：拉取并配置接口服务
+./scripts/kugou-tui                 # 开播（服务没起会自己拉起来）
+```
+
+```powershell
+# Windows（PowerShell）
+Expand-Archive kugou-tui-<版本>-x86_64-pc-windows-msvc.zip -DestinationPath .
+cd kugou-tui-<版本>-x86_64-pc-windows-msvc
+.\scripts\kugou-api-install.ps1
+.\scripts\kugou-tui.ps1
+```
+
+**或者从源码构建**：
+
+| 平台 | 前置 | 命令 |
+|---|---|---|
+| Linux | Rust 1.90+、`alsa-lib` 开发头文件 + `pkg-config` | `cargo build --release` |
+| Windows | Rust 1.90+、MSVC 工具链（**不需要 CMake / NASM / OpenSSL**） | `cargo build --release` |
+| macOS | Rust 1.90+、Xcode 命令行工具（未验证） | `cargo build --release` |
 
 ```bash
 git clone https://github.com/sijin-xb/kugou-tui.git
 cd kugou-tui && cargo build --release
-```
-
-装完第一次运行：
-
-```bash
-./scripts/kugou-api-install kugou   # 拉取并配置酷狗接口服务（约 1 分钟，只需一次）
-./scripts/kugou-tui                 # 开播
 ```
 
 > **本程序不含任何接口实现**，数据全部来自本机的第三方服务
@@ -52,6 +72,25 @@ cd kugou-tui && cargo build --release
 > `kugou-api-install` 就是把「clone → 装依赖 → 配端口」做完，之后启动器会在每次开播前
 > 按需把服务拉起来。想手动来一遍、要装启动器到 `~/.local/bin`、或要部署网易云音源，
 > 见 **[docs/INSTALL.md](docs/INSTALL.md)**。
+
+#### 平台差异
+
+| | Linux | Windows | macOS |
+|---|---|---|---|
+| 播放 / 搜索 / 歌词 / 封面 / 缓存 | ✅ | ✅ | ✅（未实测） |
+| 一键脚本 | `scripts/*`（bash） | `scripts/*.ps1` | `scripts/*`（bash） |
+| 音频后端 | ALSA / PipeWire / PulseAudio | WASAPI | CoreAudio |
+| MPRIS + 系统托盘 | ✅ | ❌ 无 D-Bus | ❌ 无 D-Bus |
+| 最小化窗口（托盘菜单里那一项） | ✅ 仅 niri | ❌ | ❌ |
+| 配置文件 | `~/.config/kugou-tui/` | `%APPDATA%\kugou-tui\` | `~/Library/Application Support/kugou-tui/` |
+| 缓存与日志 | `~/.cache/kugou-tui/` | `%LOCALAPPDATA%\kugou-tui\` | `~/Library/Caches/kugou-tui/` |
+| 终端建议 | 任意现代终端 | **Windows Terminal**（别用旧 conhost） | iTerm2 / Terminal.app |
+
+> 三条 ❌ 都是**降级而不是故障**：没有 D-Bus 时相关代码不参与编译，界面上也不会出现
+> 点了没反应的入口。`kugou-tui --print-config` 会如实打印「系统托盘 : 不可用」。
+>
+> 为什么 Windows 上不需要 CMake / NASM：TLS 走系统自带的 SChannel 而不是 rustls，
+> 于是 `aws-lc-sys` 那坨 C 代码根本不参与编译。见 `Cargo.toml` 里 `cfg(windows)` 的注释。
 
 ### 功能总览
 
@@ -65,7 +104,7 @@ cd kugou-tui && cargo build --release
 | 播放队列 | 追加（`a`）、插播下一首（`i`）、整列表加入（`A`）、移除（`x`）、清空（`X`） |
 | 云端歌单 | 收藏单曲（`s`）、整个队列同步（`S`）、增删歌单（`N` / `D`） |
 | 登录 | 应用内扫码（`L`），二维码直接画在终端里 |
-| 桌面集成 | MPRIS（`playerctl` 可控）+ 系统托盘（右键菜单，Quickshell / waybar / KDE） |
+| 桌面集成 | MPRIS（`playerctl` 可控）+ 系统托盘（右键菜单，Quickshell / waybar / KDE）；**仅 Linux 桌面**——Windows 上不参与编译，macOS 上无 session bus 时自动跳过 |
 | 输入与外观 | 键盘 + 鼠标；6 套主题（真彩 / 16 色各一版）；音频落盘缓存 + LRU 回收 |
 
 完整能力（含网络重试策略、概念版 VIP 自动领取等）见
@@ -97,7 +136,7 @@ cd kugou-tui && cargo build --release
 
 | 文档 | 内容 |
 |---|---|
-| [docs/INSTALL.md](docs/INSTALL.md) | 环境要求、三种安装路径、API 服务部署、启动脚本与环境变量 |
+| [docs/INSTALL.md](docs/INSTALL.md) | 环境要求、安装路径（Linux / Windows）、平台差异、API 服务部署、启动脚本与环境变量 |
 | [KEYBINDINGS.md](KEYBINDINGS.md) | 全部快捷键、鼠标操作、歌曲右键菜单 |
 | [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | 功能一览、界面布局、音源配置、播放队列、登录与云端歌单、桌面集成 |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | 命令行参数、配置文件每一项、会话持久化 |

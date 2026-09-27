@@ -1,0 +1,108 @@
+# 持续集成。
+#
+# # 为什么 Windows 这一栏是重点
+#
+# 「能不能在 Windows 上跑」不是读代码能确认的事：路径展开（`~`）、配置目录、
+# 缓存文件命名、stderr 重定向这些都在**运行时**才露出来，而开发机是 Linux，
+# 光靠 `cargo check` 只能保证编得过。所以这里让两个平台各真的跑一遍测试。
+#
+# 这也是这套 CI 存在的意义：Windows 支持是后加的，没有回归网的话，下一次改动
+# 很容易在不知不觉中把它弄坏（改一行 `std::os::unix`、加一个只认 `HOME` 的路径
+# 拼接就够了）。
+#
+# # 为什么还有 macOS 这一栏
+#
+# macOS 在代码里走的是 `cfg(unix)` 分支，和 Linux 共用绝大多数平台代码，
+# 但**共用不等于验证过**：`dirs` 在那边给的是 `~/Library/...` 而不是 XDG 目录，
+# 音频后端是 CoreAudio 而不是 ALSA，字体探测拿不到 `fc-list`。这些差异只有在
+# 那边真的跑一遍测试才看得见。没有这一栏，README 上就只能写「理论可用」。
+#
+# # 本地等价命令
+#
+# 见 `CONTRIBUTING.md`「提交前请跑这三条」与 `docs/MAINTENANCE.md` §1.6。
+# `cargo fmt --check` 只在 Linux 那一栏跑：格式化与平台无关，三栏各跑一遍是浪费。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支连续推送时取消前一次，省额度也省得看一堆过期结果。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # cpal 在 Linux 上走 ALSA，`alsa-sys` 的构建脚本要靠 pkg-config 找到
+      # alsa-lib 的开发头文件。开发机上这两个是现成的，干净的 CI 容器里不是。
+      - name: 装音频后端依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 格式化与平台无关，只在 Linux 这一栏查一遍。
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+
+  windows:
+    name: Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # **不需要**装 CMake / NASM / OpenSSL：Windows 的 TLS 走系统自带的
+      # SChannel 而不是 rustls，所以 aws-lc-sys 那坨 C 代码根本不参与编译。
+      # 这正是 `Cargo.toml` 里把 TLS 后端按平台分叉的目的，见那两段注释。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+
+      # 顺带验证打包脚本本身：它只能在这边跑（依赖 MSVC 工具链的产物），
+      # 而「打包漏文件」是这个项目真实踩过的坑（0.3.7 那版漏了脚本）。
+      - name: 打包
+        shell: pwsh
+        run: ./scripts/build-windows.ps1 -SkipBuild
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 什么都不用装：Xcode 命令行工具（clang）与 cmake 都在 runner 镜像里，
+      # `aws-lc-sys` 那坨 C 代码因此编得过。macOS 没有 ALSA 那套依赖。
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release

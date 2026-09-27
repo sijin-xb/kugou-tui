@@ -72,11 +72,20 @@ pub enum Action {
     /// MPRIS 的 `Seek` 给的是任意大小的偏移量，不能用「N 次 ±5 秒」去凑——
     /// 拖一次 1 小时的进度条会往事件队列里灌 720 条消息，主循环单帧只消费
     /// 64 条，界面会明显卡住。
+    ///
+    /// 只有 MPRIS 会构造它（键盘没有「跳 12345 毫秒」这种按键，见 `action_from_name`
+    /// 里只映射了 `seek_forward` / `seek_backward`），所以非 Unix 上它是死的。
+    /// 留 `allow` 而不是 cfg 掉：动作表在两边保持同一形状，
+    /// `handle_action` 的 `match` 才能一直是穷尽的。
+    #[cfg_attr(not(unix), allow(dead_code))]
     SeekBy(i64),
     /// 搜索结果「加载更多」：追加下一页。
     LoadMoreSearch,
     /// 绝对定位到指定毫秒。MPRIS 的 SetPosition 需要它——桌面组件拖进度条是"跳到某处"，
     /// 不是"前进/后退几秒"，只有 SeekForward/Backward 是做不到的。
+    ///
+    /// 同 [`Action::SeekBy`]，只有 MPRIS 会构造。
+    #[cfg_attr(not(unix), allow(dead_code))]
     SeekTo(u64),
     VolumeUp,
     VolumeDown,
@@ -768,7 +777,9 @@ mod tests {
     /// `l` 在浏览态是歌词，在输入态必须是字符 `l`。
     #[test]
     fn text_input_mode_gives_plain_characters_to_the_editor() {
-        for c in ['h', 'l', 'm', 'n', 'N', 'r', 't', 'u', 'w', 'y', 'q', 'j', 'k', '?', '/'] {
+        for c in [
+            'h', 'l', 'm', 'n', 'N', 'r', 't', 'u', 'w', 'y', 'q', 'j', 'k', '?', '/',
+        ] {
             let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
             assert_eq!(
                 resolve(key, KeyMode::TextInput),
@@ -902,14 +913,32 @@ mod tests {
     fn display_keys_follow_custom_bindings() {
         use std::collections::HashMap;
         let table: HashMap<(KeyCode, KeyModifiers), Action> = [
-            ((KeyCode::Char('m'), KeyModifiers::NONE), Action::CyclePlaybackMode),
-            ((KeyCode::Char('u'), KeyModifiers::NONE), Action::CycleQuality),
-            ((KeyCode::Char('t'), KeyModifiers::NONE), Action::NewCloudPlaylist),
+            (
+                (KeyCode::Char('m'), KeyModifiers::NONE),
+                Action::CyclePlaybackMode,
+            ),
+            (
+                (KeyCode::Char('u'), KeyModifiers::NONE),
+                Action::CycleQuality,
+            ),
+            (
+                (KeyCode::Char('t'), KeyModifiers::NONE),
+                Action::NewCloudPlaylist,
+            ),
             ((KeyCode::Char('N'), KeyModifiers::NONE), Action::Prev),
             ((KeyCode::Char('r'), KeyModifiers::NONE), Action::Reload),
-            ((KeyCode::Char('h'), KeyModifiers::NONE), Action::SeekBackward),
-            ((KeyCode::Char('l'), KeyModifiers::NONE), Action::SeekForward),
-            ((KeyCode::Char('y'), KeyModifiers::NONE), Action::ToggleLyricPanel),
+            (
+                (KeyCode::Char('h'), KeyModifiers::NONE),
+                Action::SeekBackward,
+            ),
+            (
+                (KeyCode::Char('l'), KeyModifiers::NONE),
+                Action::SeekForward,
+            ),
+            (
+                (KeyCode::Char('y'), KeyModifiers::NONE),
+                Action::ToggleLyricPanel,
+            ),
             ((KeyCode::Char('w'), KeyModifiers::NONE), Action::ToggleMute),
         ]
         .into_iter()
@@ -950,7 +979,10 @@ mod tests {
     #[test]
     fn display_tokens_translate_to_keymap_spelling() {
         assert_eq!(display_token_to_key_name("←").as_deref(), Some("left"));
-        assert_eq!(display_token_to_key_name("S-Tab").as_deref(), Some("backtab"));
+        assert_eq!(
+            display_token_to_key_name("S-Tab").as_deref(),
+            Some("backtab")
+        );
         assert_eq!(display_token_to_key_name("Enter").as_deref(), Some("enter"));
         // 单个字符保留大小写（`q` 与 `Q` 是两个动作）
         assert_eq!(display_token_to_key_name("Q").as_deref(), Some("Q"));
@@ -962,8 +994,14 @@ mod tests {
     #[test]
     fn key_names_render_back_to_display_form() {
         assert_eq!(render_key_name(KeyCode::Left, KeyModifiers::NONE), "←");
-        assert_eq!(render_key_name(KeyCode::BackTab, KeyModifiers::NONE), "S-Tab");
-        assert_eq!(render_key_name(KeyCode::Char(' '), KeyModifiers::NONE), "Space");
+        assert_eq!(
+            render_key_name(KeyCode::BackTab, KeyModifiers::NONE),
+            "S-Tab"
+        );
+        assert_eq!(
+            render_key_name(KeyCode::Char(' '), KeyModifiers::NONE),
+            "Space"
+        );
         assert_eq!(render_key_name(KeyCode::Char('r'), KeyModifiers::NONE), "r");
         assert_eq!(render_key_name(KeyCode::F(1), KeyModifiers::NONE), "F1");
         assert_eq!(

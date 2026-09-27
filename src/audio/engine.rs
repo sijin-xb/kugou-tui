@@ -508,7 +508,13 @@ impl Output {
 }
 
 fn open_failed(error: rodio::DeviceSinkError) -> String {
-    format!("无法打开音频输出设备：{error}。请确认系统音频服务正常（Linux 下检查 PipeWire/ALSA）。")
+    // 排查线索按平台给：写死「检查 PipeWire/ALSA」在 Windows 上只会让人困惑。
+    let hint = if cfg!(windows) {
+        "请确认 Windows 音频服务（Audiosrv）在运行，且输出设备未被独占"
+    } else {
+        "请确认系统音频服务正常（Linux 下检查 PipeWire/ALSA）"
+    };
+    format!("无法打开音频输出设备：{error}。{hint}。")
 }
 
 /// 可用的输出设备：能打开、能出声、名字不重复。
@@ -552,7 +558,8 @@ fn output_devices() -> Vec<rodio::cpal::Device> {
         // 「挤死别人」的问题，维持原有行为。非 Linux 平台拿不到 PCM 名，
         // `sound_server_present` 恒为 false，同样不受影响。
         .filter(|device| {
-            !sound_server_present() || driver_of(device).is_some_and(|driver| is_server_routed(&driver))
+            !sound_server_present()
+                || driver_of(device).is_some_and(|driver| is_server_routed(&driver))
         })
         .filter(|device| device.default_output_config().is_ok())
         .filter(|device| seen.insert(device_name(device).unwrap_or_default()))
@@ -854,13 +861,13 @@ impl Runtime {
             .append(LevelMeter::new(decoder, self.levels.clone()));
         output.player.play();
 
-        if start_at_ms > 0 {
-            if let Err(error) = output.player.try_seek(Duration::from_millis(start_at_ms)) {
-                tlog!(
-                    crate::logger::LEVEL_WARN,
-                    "跳转到 {start_at_ms}ms 失败：{error}"
-                );
-            }
+        if start_at_ms > 0
+            && let Err(error) = output.player.try_seek(Duration::from_millis(start_at_ms))
+        {
+            tlog!(
+                crate::logger::LEVEL_WARN,
+                "跳转到 {start_at_ms}ms 失败：{error}"
+            );
         }
 
         self.loaded = true;
@@ -1169,7 +1176,10 @@ mod tests {
         assert!(is_sound_server_pcm("pulse"));
         // default / sysdefault / 直连硬件都不是服务器本体
         for driver in ["default", "sysdefault", "hw:CARD=Device,DEV=0", "null"] {
-            assert!(!is_sound_server_pcm(driver), "{driver} 不该被认成服务器本体");
+            assert!(
+                !is_sound_server_pcm(driver),
+                "{driver} 不该被认成服务器本体"
+            );
         }
     }
 

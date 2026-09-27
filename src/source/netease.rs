@@ -793,8 +793,7 @@ mod tests {
     #[test]
     fn write_result_rejects_non_200_code() {
         let root = json!({"code": 301, "message": "系统错误", "msg": "需要登录"});
-        let error =
-            check_api_code("/playlist/track/add", &root).expect_err("301 必须被当成失败");
+        let error = check_api_code("/playlist/track/add", &root).expect_err("301 必须被当成失败");
         // 具体原因在 msg 里，别给用户那句没用的「系统错误」
         assert!(
             error.user_hint().contains("需要登录"),
@@ -866,7 +865,10 @@ mod tests {
     #[test]
     fn song_tolerates_missing_fields() {
         assert!(song_from_json(&json!({"name": "没有 id"})).is_none());
-        assert!(song_from_json(&json!({"id": 1})).is_some(), "只有 id 也算一首");
+        assert!(
+            song_from_json(&json!({"id": 1})).is_some(),
+            "只有 id 也算一首"
+        );
         assert!(
             song_from_json(&json!({"id": 1, "ar": [], "al": null})).is_some(),
             "空歌手与空专辑不该 panic"

@@ -25,9 +25,33 @@ kugou-tui --tick-ms 1000        # 省电模式：空闲 CPU 接近零
 kugou-tui -s "海阔天空"          # 启动即搜索（需要登录）
 ```
 
+### 不走命令行参数的环境变量
+
+下面几个只认环境变量，因为它们要么是排查用的开关，要么影响的是「配置文件放哪」——
+后者不可能写在配置文件里。
+
+| 变量 | 作用 |
+|---|---|
+| `KUGOU_TUI_CONFIG_DIR` | **整体覆盖配置根目录**。设成某个路径后，配置读写成 `<该路径>/config.toml`，不再用 `~/.config/kugou-tui`。便携安装（程序与配置一起放 U 盘）时有用；测试也靠它把落盘隔离到临时目录。缓存目录不受影响，仍可用 `--cache-dir` 单独指定 |
+| `KUGOU_TUI_NERD_FONT` | `1` 强制按「装了 Nerd Font」渲染图标，`0` 强制按「没装」渲染 ASCII。留空表示自动探测（Linux 下查 `fc-list`；**Windows 没有 fontconfig，自动探测一律当作没装**，装了 Nerd Font 就得靠这个变量打开） |
+| `KUGOU_TUI_DEBUG` | `1` 打开 DEBUG 级日志（按键、位置同步这类每帧日志默认关着，否则会把日志淹掉） |
+
+```powershell
+# Windows：便携目录 + 打开 Nerd Font 图标
+$env:KUGOU_TUI_CONFIG_DIR = "D:\apps\kugou-tui\config"
+$env:KUGOU_TUI_NERD_FONT  = "1"
+.\kugou-tui.exe
+```
+
 ## 配置文件
 
-首次运行自动生成，路径 `~/.config/kugou-tui/config.toml`（权限 `0600`，因为可能含 cookie）。
+首次运行自动生成。Linux / macOS 下是 `~/.config/kugou-tui/config.toml`，
+Windows 下是 `%APPDATA%\kugou-tui\config.toml`（Unix 上权限 `0600`，因为可能含 cookie）。
+缓存与日志跟着各自的缓存目录走：Linux 是 `~/.cache/kugou-tui/`，
+Windows 是 `%LOCALAPPDATA%\kugou-tui\`。
+
+不确定实际读的是哪个文件时，用 `--print-config` 看（它把配置、日志、缓存三个路径
+连同最终生效的值一起打出来）。
 
 ```toml
 api_base = "http://127.0.0.1:3000"
@@ -130,12 +154,17 @@ aplay -D default /dev/zero -f cd     # 打不开（busy / 无此设备）就是 
 
 `tray` 控制**系统托盘**，默认开启：注册成 `org.kde.StatusNotifierItem` 之后，
 Quickshell / waybar / KDE 之类的状态栏会显示一个图标，**右键弹出菜单**
-（播放 / 暂停、上一首、下一首），鼠标悬停显示当前曲目。下面三种情况会自动跳过
+（播放 / 暂停、上一首、下一首；能控制窗口时还会多一项「最小化 / 显示窗口」——
+那一项**仅 niri 下出现**），鼠标悬停显示当前曲目。下面三种情况会自动跳过
 （各只记一行日志，不影响播放）：
 
 - 没有图形会话（既无 `WAYLAND_DISPLAY` 也无 `DISPLAY`，比如纯 tty、SSH 未转发）
 - 没有 session bus
 - 状态栏没有提供 `org.kde.StatusNotifierWatcher`
+
+> **非 Unix 平台（Windows）上没有这一套**：托盘是 D-Bus 接口，那边相关代码
+> 不参与编译，`tray` 的默认值也自动是 `false`。macOS 上相关代码会编译，但默认
+> 没有 session bus，同样是静默跳过。
 
 改成 `false` 或启动时加 `--no-tray` 即可完全关闭。**改动重启后生效**：KDE 风格的
 watcher 只在进程启动 / 退出时同步托盘项，运行中没法可靠地增删。
@@ -165,7 +194,7 @@ cycle_artist_filter = "ctrl+f"
 | 功能键 | `f1` – `f12` |
 | 带修饰键 | `ctrl+n`、`alt+1`、`shift+tab` |
 
-可用的动作名（59 个，按用途分组）：
+可用的动作名（60 个，按用途分组）：
 
 ```
 # 全局
@@ -186,7 +215,15 @@ clear_cache  toggle_sort_order  open_ranks  open_cloud
 login  claim_vip  cycle_artist_filter
 add_to_cloud  remove_from_cloud  sync_to_cloud  delete_cloud_playlist  new_cloud_playlist
 set_default_source  raise_source_priority  lower_source_priority
+# 窗口（仅 niri）
+toggle_window
 ```
+
+> `toggle_window` 是**唯一没有默认键位**的动作：最小化/显示窗口平时从**托盘菜单**
+> 里点（右键 → 「最小化 / 显示窗口」），想用键盘就得自己在 `[keymap]` 里绑一条，
+> 例如 `toggle_window = "M"`。它在 niri 之外**不生效**——判据是环境变量
+> `NIRI_SOCKET` 是否存在，终端程序没法自己最小化窗口（Wayland 的 xdg-shell
+> 没有这个请求），只能走 compositor 的 IPC。
 
 **非法条目只跳过、不中断启动**，并在日志里记一条 WARN
 （`~/.cache/kugou-tui/kugou-tui.log`）——键位错了只是不顺手，不该让程序起不来：

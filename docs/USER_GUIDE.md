@@ -262,6 +262,15 @@ api_base = "http://127.0.0.1:3001"
 
 ## 桌面集成（MPRIS 与系统托盘）
 
+> **这一节只适用于 Linux 桌面。** MPRIS 与系统托盘都是 D-Bus 上的接口：
+> Windows 没有 session bus，那边相关代码**不参与编译**，界面上也不会出现点了没反应
+> 的入口（`--print-config` 会如实显示「系统托盘 : 不可用」）；macOS 上代码会编译，
+> 但默认没有 session bus，启动时记一条 WARN 后跳过。
+> 其余功能（播放、搜索、歌词、封面、缓存）三个平台完全一致。
+>
+> 下面提到的「最小化 / 显示窗口」同样只在 niri 下出现，触发入口在**托盘菜单**里；
+> 想用键盘绑它，见 [CONFIGURATION.md 的自定义键位](CONFIGURATION.md#自定义键位)。
+
 程序启动时会向 D-Bus session bus 注册 `org.mpris.MediaPlayer2.kugou-tui`。
 注册成功后，桌面环境**自动**识别，无需任何配置：
 

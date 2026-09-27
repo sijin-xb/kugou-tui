@@ -45,11 +45,11 @@ impl Session {
     /// 写会话。失败只记日志：存不下会话不该影响退出。
     pub fn save(&self) {
         let path = Self::path();
-        if let Some(parent) = path.parent() {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                crate::logger::tlog!(crate::logger::LEVEL_WARN, "创建会话目录失败：{error}");
-                return;
-            }
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            crate::logger::tlog!(crate::logger::LEVEL_WARN, "创建会话目录失败：{error}");
+            return;
         }
         match serde_json::to_string(self) {
             Ok(text) => {

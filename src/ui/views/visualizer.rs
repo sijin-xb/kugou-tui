@@ -238,9 +238,7 @@ fn render_idle(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
         PlaybackState::Stopped if state.current.is_some() => {
             &format!("已停止 —— 按 {play_pause} 从头播")
         }
-        PlaybackState::Stopped => {
-            "未在播放 —— 到「歌单」或「排行榜」里按 Enter 播一首"
-        }
+        PlaybackState::Stopped => "未在播放 —— 到「歌单」或「排行榜」里按 Enter 播一首",
         // 走到这里说明是 Playing 但还没采到频谱（刚起播的那一瞬）。
         // 说「已暂停」或「已停止」都是谎话，那就照实说在采数据
         PlaybackState::Loading | PlaybackState::Playing => "正在播放 —— 频谱数据还没到",
@@ -257,15 +255,14 @@ fn render_buffering(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
     // 每 3 拍换一帧，约 600ms 转一圈（按默认 tick），不刺眼
     let glyph = SPINNER[(state.ticks / 3) as usize % SPINNER.len()];
     let mut spans = vec![Span::styled(format!("{glyph} 缓冲中"), theme.now_playing())];
-    if let Some((received, total)) = state.download_progress {
-        if let Some(total) = total
-            && total > 0
-        {
-            spans.push(Span::styled(
-                format!("  {}%", (received * 100 / total).min(100)),
-                theme.dim(),
-            ));
-        }
+    if let Some((received, total)) = state.download_progress
+        && let Some(total) = total
+        && total > 0
+    {
+        spans.push(Span::styled(
+            format!("  {}%", (received * 100 / total).min(100)),
+            theme.dim(),
+        ));
     }
     frame.render_widget(
         ratatui::widgets::Paragraph::new(Line::from(spans)).alignment(Alignment::Center),

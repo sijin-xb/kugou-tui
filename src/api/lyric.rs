@@ -535,15 +535,15 @@ fn attach_translations(lyric: &mut Lyric, krc_text: &str) {
     for (index, line) in lyric.lines.iter_mut().enumerate() {
         // 歌词行 → 它在定时行中的序号 → 再到轨道里取对应项
         let source = ordinals.get(index).copied().unwrap_or(index);
-        if let Some(text) = translation_lines.get(source) {
-            if !text.trim().is_empty() {
-                line.translation = Some((*text).to_string());
-            }
+        if let Some(text) = translation_lines.get(source)
+            && !text.trim().is_empty()
+        {
+            line.translation = Some((*text).to_string());
         }
-        if let Some(text) = romanization_lines.get(source) {
-            if !text.trim().is_empty() {
-                line.romanization = Some((*text).to_string());
-            }
+        if let Some(text) = romanization_lines.get(source)
+            && !text.trim().is_empty()
+        {
+            line.romanization = Some((*text).to_string());
         }
     }
 }
@@ -557,7 +557,7 @@ fn extract_language_payload(text: &str) -> Option<serde_json::Value> {
     // 载荷里偶尔混进换行等字符，先清掉再补 padding
     let cleaned: String = raw.chars().filter(|ch| !ch.is_whitespace()).collect();
     let mut padded = cleaned;
-    while padded.len() % 4 != 0 {
+    while !padded.len().is_multiple_of(4) {
         padded.push('=');
     }
 

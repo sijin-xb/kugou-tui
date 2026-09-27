@@ -18,6 +18,16 @@
 //! 没有 `NIRI_SOCKET` 时 [`available`] 返回 false，调用方据此**不提供入口**
 //! （托盘菜单里干脆不出现那一项，免得点了没反应）。找不到窗口、命令失败都只记
 //! 一行日志，不打扰界面。
+//!
+//! # 非 Linux
+//!
+//! 整套机制依赖 niri 的 IPC socket，Windows / macOS 上 `NIRI_SOCKET` 必然不存在，
+//! [`available`] 恒为 false，于是调用方永远不会走到 [`toggle_minimized`]。
+//! 也就是说**这里不需要平台分支**：降级路径本来就是「不提供入口」。
+//! 真要支持 Windows，得改用 `GetConsoleWindow` + `ShowWindow(SW_MINIMIZE)`，
+//! 那是另一套语义（最小化的是控制台窗口本身，不是终端模拟器的窗口）。
+//! 唯一的例外是 [`set_terminal_title`]——OSC 序列是终端标准，Windows Terminal
+//! 也认，所以那边照常设标题。
 
 use std::process::Command;
 

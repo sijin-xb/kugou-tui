@@ -146,8 +146,7 @@ impl ApiClient {
     /// 所以顺序是：能解析出 JSON 就先看 `error_code`，它才是权威；只有体不可解析时
     /// 才退回用 HTTP 状态码报错。
     pub async fn get_json(&self, path: &str, query: &[(&str, String)]) -> Result<Value> {
-        self.with_retry(|| self.get_json_once(path, query))
-            .await
+        self.with_retry(|| self.get_json_once(path, query)).await
     }
 
     /// 同 [`Self::get_json`]，但在 query 里加时间戳绕开服务端 2 分钟缓存。
@@ -326,7 +325,10 @@ mod tests {
         assert_eq!(RetryPolicy::delay_after(1), Duration::from_millis(300));
         assert_eq!(RetryPolicy::delay_after(2), Duration::from_millis(900));
         // attempt 只会取到 MAX_ATTEMPTS - 1，但函数本身不能因此溢出
-        assert_eq!(RetryPolicy::delay_after(20), Duration::from_millis(300 * 3u64.pow(19)));
+        assert_eq!(
+            RetryPolicy::delay_after(20),
+            Duration::from_millis(300 * 3u64.pow(19))
+        );
     }
 
     /// 端口上跑着别的服务时，响应体是网页——摘要要能让人一眼认出来。

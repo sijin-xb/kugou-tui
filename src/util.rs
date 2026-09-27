@@ -91,15 +91,7 @@ pub fn today_local() -> Option<String> {
 /// 属性名。`Set-Cookie` 里这些描述的是「这个 cookie 怎么存」，不是 cookie 本身，
 /// 回传给服务端只会被当成一串没人认得的 cookie。
 const COOKIE_ATTRIBUTES: [&str; 10] = [
-    "max-age",
-    "expires",
-    "path",
-    "domain",
-    "httponly",
-    "secure",
-    "samesite",
-    "version",
-    "comment",
+    "max-age", "expires", "path", "domain", "httponly", "secure", "samesite", "version", "comment",
     "priority",
 ];
 
@@ -214,7 +206,9 @@ mod tests {
         );
         // 关键断言：服务端按 `;\s+` 切分时，MUSIC_U 必须是独立的一项
         assert!(
-            normalized.split("; ").any(|pair| pair.starts_with("MUSIC_U=")),
+            normalized
+                .split("; ")
+                .any(|pair| pair.starts_with("MUSIC_U=")),
             "MUSIC_U 必须能独立取到，实际：{normalized}"
         );
     }
@@ -229,8 +223,7 @@ mod tests {
     /// 同名 cookie 后写的覆盖先写的，且顺序按首次出现——重排会让 diff 难以比对。
     #[test]
     fn normalize_keeps_last_value_in_first_position() {
-        let normalized =
-            normalize_cookie_header("a=1; b=2; a=3").expect("应当能规范化");
+        let normalized = normalize_cookie_header("a=1; b=2; a=3").expect("应当能规范化");
         assert_eq!(normalized, "a=3; b=2");
     }
 

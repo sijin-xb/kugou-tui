@@ -591,10 +591,21 @@ mod tests {
         assert_eq!(Downloader::extension_from_url("http://x/y.weird"), "mp3");
     }
 
+    /// `.part` 必须落在**目标文件的同一个目录**里。
+    ///
+    /// 期望值用 `join` 拼、不写成字面量 `/tmp/cache/abc-128.mp3.part`：
+    /// `with_file_name` 内部是 `parent().join(...)`，而 Windows 上 `join` 用 `\`
+    /// 拼接，拿字面量比对会在那边假失败。
     #[test]
     fn builds_part_file_beside_target() {
-        let path = temp_path_for(Path::new("/tmp/cache/abc-128.mp3"));
-        assert_eq!(path, PathBuf::from("/tmp/cache/abc-128.mp3.part"));
+        let target = Path::new("/tmp/cache/abc-128.mp3");
+        let path = temp_path_for(target);
+        assert_eq!(path, Path::new("/tmp/cache").join("abc-128.mp3.part"));
+        assert_eq!(
+            path.parent(),
+            target.parent(),
+            "`.part` 必须和正式缓存文件同目录，否则改名会跨文件系统"
+        );
     }
 
     /// 小文件不分块——一次分块要建一次连接，小文件并发反而是负优化。

@@ -620,7 +620,7 @@ fn build_pixmaps() -> anyhow::Result<Vec<Pixmap>> {
         let rgba = sized.into_rgba8();
         let mut bytes = rgba.into_raw();
         // BGRA 转换：每个 4 字节块的第 0、2 位互换。
-        for chunk in bytes.chunks_exact_mut(4) {
+        for chunk in bytes.as_chunks_mut::<4>().0 {
             chunk.swap(0, 2);
         }
         pixmaps.push((size as i32, size as i32, bytes));
@@ -721,7 +721,7 @@ mod tests {
             .expect("应有 64 尺寸的图标");
         assert_eq!(bytes.len(), source.len());
 
-        for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
             let src = &source[index * 4..index * 4 + 4];
             assert_eq!(chunk[0], src[2], "第 {index} 个像素：B 位应取自源的 R");
             assert_eq!(chunk[2], src[0], "第 {index} 个像素：R 位应取自源的 B");
@@ -731,7 +731,11 @@ mod tests {
 
         // 兜底：如果整张图 R 恒等于 B，上面那条断言等于什么都没验证
         assert!(
-            source.chunks_exact(4).any(|pixel| pixel[0] != pixel[2]),
+            source
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[0] != pixel[2]),
             "图标里应当有非灰阶像素，否则字节序断言形同虚设"
         );
     }

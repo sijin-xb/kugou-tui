@@ -254,15 +254,15 @@ pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
         display.push((index, false, line.text.clone()));
         // 译文与音译**都**显示（各占一行），不再二选一。
         // 日语歌尤其需要：原文看不懂，译文管理解，罗马音管跟唱，两者用途不同。
-        if let Some(translation) = line.translation.as_deref() {
-            if !translation.trim().is_empty() {
-                display.push((index, true, translation.to_string()));
-            }
+        if let Some(translation) = line.translation.as_deref()
+            && !translation.trim().is_empty()
+        {
+            display.push((index, true, translation.to_string()));
         }
-        if let Some(romanization) = line.romanization.as_deref() {
-            if !romanization.trim().is_empty() {
-                display.push((index, true, romanization.to_string()));
-            }
+        if let Some(romanization) = line.romanization.as_deref()
+            && !romanization.trim().is_empty()
+        {
+            display.push((index, true, romanization.to_string()));
         }
     }
 
@@ -584,20 +584,20 @@ fn draw_cover_block(
         }
     };
 
-    if let Some(picker) = state.picker.as_ref() {
-        if let Some((protocol, render_area)) = state.cover.fit_to(mode, area, picker) {
-            // `Scale`：允许放大，等比铺到 `render_area`。图的比例已经被
-            // `prepare_cover` 对齐到区域了，所以这里正好铺满、不留边。
-            frame.render_stateful_widget(
-                StatefulImage::default().resize(Resize::Scale(None)),
-                render_area,
-                protocol,
-            );
-            // 编码发生在渲染时（只在区域或图片变化时）。失败只记日志：
-            // 下一帧会重试，不该因为一张图把界面搞崩。
-            if let Some(Err(error)) = protocol.last_encoding_result() {
-                crate::logger::tlog!(crate::logger::LEVEL_WARN, "封面编码失败：{error}");
-            }
+    if let Some(picker) = state.picker.as_ref()
+        && let Some((protocol, render_area)) = state.cover.fit_to(mode, area, picker)
+    {
+        // `Scale`：允许放大，等比铺到 `render_area`。图的比例已经被
+        // `prepare_cover` 对齐到区域了，所以这里正好铺满、不留边。
+        frame.render_stateful_widget(
+            StatefulImage::default().resize(Resize::Scale(None)),
+            render_area,
+            protocol,
+        );
+        // 编码发生在渲染时（只在区域或图片变化时）。失败只记日志：
+        // 下一帧会重试，不该因为一张图把界面搞崩。
+        if let Some(Err(error)) = protocol.last_encoding_result() {
+            crate::logger::tlog!(crate::logger::LEVEL_WARN, "封面编码失败：{error}");
         }
     }
     // 没有终端图形能力（`picker` 为空）或没有原图时留白——画不出东西比画错好
@@ -760,7 +760,11 @@ fn render_account(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &T
     ]));
 
     // 会员摘要（有就显示）。首页宽，用完整形态（带产品名）
-    if let Some(label) = state.vip_info.as_ref().map(crate::api::cloud::VipInfo::label) {
+    if let Some(label) = state
+        .vip_info
+        .as_ref()
+        .map(crate::api::cloud::VipInfo::label)
+    {
         lines.push(Line::from(Span::styled(
             truncate_to_width(&label, text_area.width as usize),
             theme.now_playing(),
@@ -826,10 +830,7 @@ fn render_avatar_initial(frame: &mut Frame, area: Rect, nickname: &str, theme: &
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(initial.to_string(), theme.title())))
             .alignment(Alignment::Center),
-        Rect {
-            height: 1,
-            ..area
-        },
+        Rect { height: 1, ..area },
     );
 }
 
@@ -918,8 +919,7 @@ mod tests {
     #[test]
     fn avatar_falls_back_to_the_nickname_initial() {
         let area = Rect::new(0, 0, AVATAR_COLUMNS, 6);
-        let mut terminal =
-            Terminal::new(TestBackend::new(AVATAR_COLUMNS, 6)).expect("建测试终端");
+        let mut terminal = Terminal::new(TestBackend::new(AVATAR_COLUMNS, 6)).expect("建测试终端");
         let theme = Theme::for_config(ThemeName::Default, false);
 
         terminal
@@ -941,8 +941,7 @@ mod tests {
     #[test]
     fn avatar_fallback_tolerates_an_empty_nickname() {
         let area = Rect::new(0, 0, AVATAR_COLUMNS, 6);
-        let mut terminal =
-            Terminal::new(TestBackend::new(AVATAR_COLUMNS, 6)).expect("建测试终端");
+        let mut terminal = Terminal::new(TestBackend::new(AVATAR_COLUMNS, 6)).expect("建测试终端");
         let theme = Theme::for_config(ThemeName::Default, false);
 
         terminal

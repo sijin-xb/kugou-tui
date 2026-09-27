@@ -5,7 +5,7 @@
 
 ## 先把环境跑起来
 
-1. **Rust 1.86+**（本项目用 edition 2024；下限由 `ratatui-image` 11.x 决定）。
+1. **Rust 1.90+**（本项目用 edition 2024；下限由**依赖**顶上去——`quantette` 要 1.90）。
 2. **Node.js 12+**，用于运行 [KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi)。
    它是**独立仓库**，不在本仓库里（无 submodule、无 vendor），得单独拉一份。
    最省事的是用仓库自带的脚本：
@@ -41,7 +41,27 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-CI 会用同样的命令。**clippy 是 `-D warnings` 的**，任何告警都会让构建失败。
+**clippy 是 `-D warnings` 的**，任何告警都会让构建失败。
+
+CI（`.github/workflows/ci.yml`）在 **Linux / Windows / macOS** 三个平台各跑一遍
+`clippy + test + build`（`cargo fmt --check` 只在 Linux 那一栏跑，格式化与平台无关），
+Windows 那一栏还会跑一次打包脚本。Windows 与 macOS 两栏不是摆设：路径展开、
+配置目录、缓存文件命名、音频后端这些差异只有真跑起来才露出来，而开发机通常是 Linux。
+
+改到平台相关代码时，另外确认一下 Windows 目标能编：
+
+```bash
+rustup target add x86_64-pc-windows-msvc
+cargo check --target x86_64-pc-windows-msvc --all-targets
+```
+
+这份清单（以及每一处平台分支为什么存在）在
+[docs/MAINTENANCE.md](docs/MAINTENANCE.md) 的「1.6 平台分支在哪」。
+
+> MSRV 是 **1.90**，写在 `Cargo.toml` 的 `rust-version` 里。它由**依赖**顶上去
+> （`quantette` 要 1.90），会随 `cargo update` 漂——所以 clippy 是按 1.90 报建议的，
+> 别用更老的写法去绕它。改完依赖想确认下限，跑
+> `cargo +1.90.0 check --locked --all-targets`。
 
 ## 代码结构
 
