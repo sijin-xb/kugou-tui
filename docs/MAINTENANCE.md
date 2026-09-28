@@ -566,8 +566,11 @@ let position_ms = self.last_position_ms;   // 上一帧还在播时的值
   那几十首。判据抽在 `app::update::needs_full_fetch`，有测试钉住。
 - 更根本的一条：**判"还有没有下一页"只能看这一页是不是空**。解析会过滤条目
   （缺 hash、字段类型不对），一页 30 条剩 29 条是常事，按"不满页"停会把列表静默
-  截断。酷狗那侧（`catalog.rs::collect_all_pages`）已经是这个判据；网易云那侧
-  （`source/netease.rs::playlist_tracks_all`）还在用"不满页"，见 §7。
+  截断。**两侧现在是同一个判据**：酷狗在
+  `catalog.rs::collect_all_pages`、网易云在
+  `source/netease.rs::should_continue_paging`（2026-09-28 改的，见 §7）。
+  网易云的判据抽成了自由函数，因为它单测里测不了整条翻页（要 HTTP），
+  而判据本身必须能钉住——见那条测试的注释。
 - **并发翻页的结果必须按页码拼，不能按完成顺序拼。** `JoinSet::join_next()` 给的是
   任务完成顺序，一批页同时发出去谁先回来谁先 append，整表页序就是随机的——榜单
   尤其致命，它的"顺序"就是榜单内容本身。回归测试
@@ -673,7 +676,7 @@ cp src/audio/streaming.rs            > /tmp/mem-repro/src/new.rs
 
 | 位置 | 问题 | 为什么没动 |
 |---|---|---|
-| `source/netease.rs::playlist_tracks_all` | 用「不满一页 ⇒ 结束」停翻页，与酷狗那侧「只有空页才停」的判据冲突。某页只要有一条被解析过滤掉，整张表就被静默截断 | 改了会多打一次越界请求，而**本机跑的是酷狗概念版服务（:3001），网易云那一侧没法实测**——万一越界 offset 让接口报错（而不是返回空数组），就从「截断但能听」变成「整次加载失败」。等能连上网易云服务再改 |
+| ~~`source/netease.rs::playlist_tracks_all`~~**（2026-09-28 已修，留着记结论）** | ~~用「不满一页 ⇒ 结束」停翻页，与酷狗那侧「只有空页才停」的判据冲突；某页只要有一条被解析过滤掉，整张表就被静默截断~~ | 当时的阻碍是「没法实测」，已消除：起了 NeteaseCloudMusicApi（`:3002`）实测越界 offset——`offset=500`（该歌单 200 首）与 `offset=999999` 都返回 `{"songs":[],"code":200}`，**空数组、不是报错**，也没把 offset 夹回末页返回重复内容。判据抽成 `should_continue_paging`（`got > 0`），与酷狗侧一致；回归测试 `paging_stops_only_on_an_empty_page` 在退回旧判据时确实失败。代价：整表加载末尾多一个请求 |
 | `source/netease.rs::plaza_playlists` / `artist_list` | 分类（`_category_id`）与地区（`_kind`）参数被忽略，但界面照常显示选择器 | 界面传下来的是**酷狗**那套分类 id，网易云要的是 `cat` 字符串 / `area`，两套对不上。补映射是新增功能，不是修 bug；先承认它不生效，别让用户以为筛选坏了 |
 | `api/catalog.rs::request_song_url_with_hash` | `Song.album_id` / `album_audio_id` 解析了但没发给 `/song/url` | 2026-09-28 在概念版服务上实测四种参数组合（不带 / 带 `ppage_id` / 带搜索给的 id / 带 `/privilege/lite` 给的 id）**都拿到了直链**，而 `status_reason()` 里记着「带 privilege 那个 id 会 status=3」的反例。传了没有可证明的收益、传错有明确代价，所以一个都不传；结论写在那里的注释里了 |
 | `api/model.rs::normalize_duration` | 用 10000 猜单位：9 秒的短曲（毫秒值 9000）会被当成 9000 秒；2.8 小时的长合集（秒值 10800）会被当成 10.8 秒 | 两个方向都在 1000–9999 这个区间里撞车，而实际接口各自的单位是**已知**的（搜索 `Duration` 秒、歌单 `timelen` 毫秒），这个兜底只在遇到没见过的形状时才生效。改阈值是把错从这个区间挪到那个区间，不是修好；有测试钉着当前行为，等真撞上再说 |

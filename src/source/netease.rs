@@ -764,9 +764,27 @@ pub async fn rank_tracks_all(client: &ApiClient, rank_id: i64) -> Result<Vec<Son
     playlist_tracks_all(client, &rank_id.to_string()).await
 }
 
+/// 翻页还要不要继续：**只有空页才说明真没了**。
+///
+/// 判据只能看「这一页是不是空的」，**不能**看「这一页满不满」。`song_from_json`
+/// 会过滤条目（缺 hash、字段类型不对），500 的页剩 499 条是常事，按「不满页」停
+/// 会把整表静默截断在那一页——用户看到的是一个短了一截的歌单，没有任何报错。
+/// 酷狗那侧（`api::catalog::collect_all_pages`）用的是同一个判据。
+///
+/// 签名里**故意没有** `page_size`：页大小一旦进入判据，上面的截断就回来了。
+///
+/// 多打一次越界请求是安全的，2026-09-28 在 NeteaseCloudMusicApi 上实测：
+/// `/playlist/track/all?id=3778678&limit=500&offset=500`（该歌单 200 首）与
+/// `offset=999999` 都返回 `{"songs":[],"privileges":[],"code":200}`——是**空数组、
+/// 不是报错**，也没有把 offset 夹回最后一页再返回重复内容。代价只是整表加载末尾
+/// 多一个请求，而这个接口一次就要几秒，多一个请求换「列表不再被截断」值得。
+fn should_continue_paging(got: usize) -> bool {
+    got > 0
+}
+
 /// 取一个歌单 / 榜单的**全部**曲目。
 ///
-/// 翻页直到拿不到新数据。单页取 500：**这个接口本身很慢**（实测 145 首要 2.4~3.4 秒，
+/// 翻页直到拿到空页。单页取 500：**这个接口本身很慢**（实测 145 首要 2.4~3.4 秒，
 /// 跟 limit 关系不大，是服务端在逐个补全曲目信息），所以优化点是「少发几次请求」，
 /// 而不是「每次少拿一点」。400 首的歌单这样一次就够。
 ///
@@ -777,10 +795,9 @@ pub async fn playlist_tracks_all(client: &ApiClient, playlist_id: &str) -> Resul
 
     for page in 1..=MAX_TRACK_PAGES {
         let songs = playlist_tracks_page(client, playlist_id, page, PAGE).await?;
-        let got = songs.len() as u32;
+        let got = songs.len();
         all.extend(songs);
-        // 不足一页说明已经取到末尾
-        if got < PAGE {
+        if !should_continue_paging(got) {
             break;
         }
     }
@@ -792,6 +809,62 @@ pub async fn playlist_tracks_all(client: &ApiClient, playlist_id: &str) -> Resul
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 翻页只有**空页**才停：不满一页也必须继续翻。
+    ///
+    /// 这条是 2026-09-28 那次修复的回归测试。旧判据是「`got < PAGE` 就停」，
+    /// 于是只要某页被 `song_from_json` 过滤掉一条（缺 hash、字段类型不对），
+    /// 整表就静默截断在那一页——歌单看着少了一截，而不报任何错。
+    ///
+    /// 退回旧判据的话，下面 `499` 那条会立刻失败。
+    #[test]
+    fn paging_stops_only_on_an_empty_page() {
+        const PAGE: u32 = 500;
+
+        // 空页 → 停。这是唯一的停止条件。
+        assert!(!should_continue_paging(0), "空页必须停");
+
+        // 只要还有一条就得继续翻。
+        for got in [1usize, 2, 29, 499, 500] {
+            assert!(should_continue_paging(got), "{got} 条也该继续翻页");
+        }
+
+        // 与旧判据的对照：这些场景下旧判据会**误停**，把整表截断。
+        // 把它写在测试里，是为了让人一眼看出「旧的那条为什么错」，
+        // 而不是只看到一行 `got > 0`。
+        for got in [1usize, 29, 499] {
+            let old_rule_would_have_stopped = got < PAGE as usize;
+            assert!(
+                old_rule_would_have_stopped && should_continue_paging(got),
+                "{got} 条：旧判据会停（截断列表），新判据必须继续"
+            );
+        }
+
+        // 满页两者一致：这个场景旧判据也是对的，别把它一起改坏。
+        assert!(should_continue_paging(PAGE as usize), "满页当然要继续");
+    }
+
+    /// 越界 offset 的行为是这次敢改判据的前提，把实测结论钉在这里。
+    ///
+    /// 实测（2026-09-28，NeteaseCloudMusicApi，歌单 3778678 共 200 首）：
+    /// `offset=500` 与 `offset=999999` 都返回 `{"songs":[],"code":200}`，
+    /// 即**空数组而不是报错**。所以「继续翻到空页」最多多花一个请求，
+    /// 不会把「加载列表」变成「加载失败」。
+    ///
+    /// 这条断言的是**我们对服务端行为的理解**，不是代码逻辑：哪天上游改成
+    /// 越界就报 400/非 200，`playlist_tracks_all` 的 `?` 会把错误抛上去，
+    /// 那时这里要跟着改（并重新实测），别只改代码不改这条结论。
+    #[test]
+    fn an_out_of_range_page_is_empty_and_therefore_ends_paging() {
+        // 服务端返回空页 → 解析出来 0 条 → 停
+        let songs = extract_list(
+            data_of(&json!({"code": 200, "songs": [], "privileges": []})),
+            &["songs"],
+            song_from_json,
+        );
+        assert!(songs.is_empty(), "越界页解析出来应当是 0 条");
+        assert!(!should_continue_paging(songs.len()), "0 条就该停了");
+    }
 
     /// 歌手的「N 首」必须是**歌曲数**，不能是专辑数。
     ///

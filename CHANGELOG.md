@@ -87,6 +87,28 @@
 
 ### 修复
 
+- **网易云的歌单 / 榜单会被静默截断**（`source/netease.rs`）。`playlist_tracks_all`
+  用「不满一页 ⇒ 结束」停翻页，而 `song_from_json` 会过滤条目（缺 hash、字段类型
+  不对），一页 500 条剩 499 条是常事——只要撞上，整张表就停在那儿，用户看到的是
+  一个短了一截的歌单，没有任何报错。酷狗那侧（`api/catalog.rs::collect_all_pages`）
+  一直是「只有空页才停」，两侧判据不一致本身就是这个 bug 的信号。
+
+  改成「只有空页才停」，判据抽成自由函数 `should_continue_paging`（`got > 0`，
+  签名里**故意没有** `page_size`——页大小一旦进判据，截断就回来了）。
+
+  改它的前提是「越界 offset 到底返回空数组还是报错」，这个之前没法实测（本机只跑着
+  酷狗概念版服务 `:3001`）。这次起了 NeteaseCloudMusicApi（`:3002`）实测：
+  `/playlist/track/all?id=3778678&limit=500&offset=500`（该歌单 200 首）与
+  `offset=999999` 都返回 `{"songs":[],"privileges":[],"code":200}`——**空数组、
+  不报错**，也没有把 offset 夹回末页返回重复内容。所以多打一次越界请求是安全的，
+  代价只是整表加载末尾多一个请求（这个接口一次就要几秒）。
+
+  回归测试 `paging_stops_only_on_an_empty_page`：把判据退回 `got >= 500` 时它当场
+  失败（`1 条也该继续翻页`）。另有一条 `an_out_of_range_page_is_empty_and_
+  therefore_ends_paging` 把上面那段**服务端行为的实测结论**钉住——哪天上游改成
+  越界就报非 200，`playlist_tracks_all` 的 `?` 会把错误抛上去，那时要重新实测
+  并改这条。`docs/MAINTENANCE.md` §5、§7 同步。
+
 - **`;`（打开歌曲右键菜单）改不了键位**（`keymap.rs`）。它在 `resolve_normal` 与
   `CHEATSHEET` 里都有，帮助面板也照常显示，`docs/CONFIGURATION.md` 的键位表里也列着，
   但 `action_from_name` 的动作名表里**没有 `context_menu`**——用户照文档写
