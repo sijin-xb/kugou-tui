@@ -222,14 +222,14 @@ cycle_artist_filter = "ctrl+f"
 | 功能键 | `f1` – `f12` |
 | 带修饰键 | `ctrl+n`、`alt+1`、`shift+tab` |
 
-可用的动作名（60 个，按用途分组）：
+可用的动作名（61 个，按用途分组）：
 
 ```
 # 全局
 quit  force_quit  help  toggle_sidebar  switch_source
 # 导航
 move_up  move_down  move_top  move_bottom  page_up  page_down
-focus_next  focus_prev  submit  cancel
+focus_next  focus_prev  submit  cancel  context_menu
 backspace  delete  cursor_left  cursor_right  cursor_home  cursor_end
 # 播放
 play_pause  next  prev  seek_forward  seek_backward

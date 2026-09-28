@@ -154,8 +154,13 @@ KuGouMusicApi 是逆向封装，**响应结构会漂移，文档也和实测不�
 3. `event.rs` 的 `Loaded` 枚举加一个变体。
 4. `app/update.rs` 加 fetch 方法 + `Loaded` 分支的处理。
 5. 需要新按键的话：`keymap.rs` 加 `Action` 变体、按键映射、`CHEATSHEET` 条目，
-   以及 `action_from_name` 里的动作名（用户靠这个名字在 `[keymap]` 里重绑）；
+   以及 `REBINDABLE` 里的动作名（用户靠这个名字在 `[keymap]` 里重绑）；
    最后同步 `docs/CONFIGURATION.md` 的「自定义键位」动作名清单。
+   **漏了动作名的话测试会当场告诉你**——`every_cheatsheet_shortcut_can_be_rebound_by_name`
+   拿 `CHEATSHEET` 与 `REBINDABLE` 两份名单对着数。这条测试是补出来的：
+   `context_menu`（`;` 打开歌曲右键菜单）曾经有键位、帮助面板也照常显示，
+   但名字表里没有它，于是用户改不动、日志还说「未知动作」。
+   （`docs/CONFIGURATION.md` 那份清单只能靠人同步，测试管不到。）
 6. 需要展示的话：`app/state.rs` 加列表字段，`ui/` 加渲染。
 7. 补单元测试——尤其是解析部分。
 

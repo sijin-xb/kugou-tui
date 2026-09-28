@@ -220,74 +220,97 @@ pub fn install_custom(bindings: &BTreeMap<String, String>) -> usize {
     installed
 }
 
-/// 动作名（snake_case）→ [`Action`]。
+/// 动作名（snake_case）→ [`Action`]：用户靠这个名字在 `[keymap]` 里重绑。
 ///
-/// 带参数的动作（`SwitchTab` / `SeekTo` / `SeekBy` / `Char`）不在其中：
-/// 它们的值来自运行时，配置文件里写不出完整语义。
+/// # 这是唯一的一份名单，而且它是**数据**
+///
+/// 名单写成 `const` 而不是 `match`，为的是能被枚举——测试拿它跟 [`CHEATSHEET`]
+/// 交叉核对：帮助面板里**每一个**有默认键位的动作，都必须在这里有名字。
+/// `CHEATSHEET` 是独立的一份名单（用户看得见的键），所以它能查出漏项。
+///
+/// 这个漏项真的发生过：`context_menu`（`;` 打开歌曲右键菜单）在 `resolve_normal`
+/// 与 `CHEATSHEET` 里都有，帮助面板也照常显示，但名字表里没有它——于是用户照着
+/// 文档去 `[keymap]` 里写 `context_menu = "m"` 时得到的是「未知动作 context_menu」，
+/// 而那个动作明明存在。`CONTRIBUTING.md` 把「记得同步这张表」写成了一条人工步骤，
+/// 见 `every_cheatsheet_shortcut_can_be_rebound_by_name`——那条测试把它变成机械检查。
+///
+/// **带参数的动作不在其中**：`Char` / `Digit` / `SeekTo` / `SeekBy` 的值来自运行时
+/// （`SwitchTab` 那类「需要数字」的写法同理），配置文件里写不出完整语义。
+/// `None` 是内部占位，也不在。
+const REBINDABLE: &[(&str, Action)] = &[
+    // ---- 全局 ----
+    ("quit", Action::Quit),
+    ("force_quit", Action::ForceQuit),
+    ("help", Action::Help),
+    ("toggle_window", Action::ToggleWindow),
+    // ---- 列表导航 ----
+    ("move_up", Action::MoveUp),
+    ("move_down", Action::MoveDown),
+    ("move_top", Action::MoveTop),
+    ("move_bottom", Action::MoveBottom),
+    ("page_up", Action::PageUp),
+    ("page_down", Action::PageDown),
+    ("focus_next", Action::FocusNext),
+    ("focus_prev", Action::FocusPrev),
+    ("submit", Action::Submit),
+    ("cancel", Action::Cancel),
+    ("context_menu", Action::ContextMenu),
+    // ---- 文本编辑 ----
+    ("backspace", Action::Backspace),
+    ("delete", Action::Delete),
+    ("cursor_left", Action::CursorLeft),
+    ("cursor_right", Action::CursorRight),
+    ("cursor_home", Action::CursorHome),
+    ("cursor_end", Action::CursorEnd),
+    // ---- 播放控制 ----
+    ("play_pause", Action::PlayPause),
+    ("next", Action::Next),
+    ("prev", Action::Prev),
+    ("seek_forward", Action::SeekForward),
+    ("seek_backward", Action::SeekBackward),
+    ("load_more_search", Action::LoadMoreSearch),
+    ("volume_up", Action::VolumeUp),
+    ("volume_down", Action::VolumeDown),
+    ("toggle_mute", Action::ToggleMute),
+    ("cycle_playback_mode", Action::CyclePlaybackMode),
+    ("cycle_quality", Action::CycleQuality),
+    ("toggle_lyric_panel", Action::ToggleLyricPanel),
+    ("lyric_delay", Action::LyricDelay),
+    ("lyric_advance", Action::LyricAdvance),
+    // ---- 业务 ----
+    ("open_search", Action::OpenSearch),
+    ("open_settings", Action::OpenSettings),
+    ("download_current", Action::DownloadCurrent),
+    ("reload", Action::Reload),
+    ("queue_append", Action::QueueAppend),
+    ("add_all_to_queue", Action::AddAllToQueue),
+    ("queue_play_next", Action::QueuePlayNext),
+    ("remove_from_queue", Action::RemoveFromQueue),
+    ("clear_queue", Action::ClearQueue),
+    ("clear_cache", Action::ClearCache),
+    ("toggle_sort_order", Action::ToggleSortOrder),
+    ("open_ranks", Action::OpenRanks),
+    ("open_cloud", Action::OpenCloud),
+    ("login", Action::Login),
+    ("claim_vip", Action::ClaimVip),
+    ("cycle_artist_filter", Action::CycleArtistFilter),
+    ("sync_to_cloud", Action::SyncToCloud),
+    ("add_to_cloud", Action::AddToCloud),
+    ("remove_from_cloud", Action::RemoveFromCloud),
+    ("delete_cloud_playlist", Action::DeleteCloudPlaylist),
+    ("new_cloud_playlist", Action::NewCloudPlaylist),
+    ("toggle_sidebar", Action::ToggleSidebar),
+    ("switch_source", Action::SwitchSource),
+    ("set_default_source", Action::SetDefaultSource),
+    ("raise_source_priority", Action::RaiseSourcePriority),
+    ("lower_source_priority", Action::LowerSourcePriority),
+];
+
 pub fn action_from_name(name: &str) -> Option<Action> {
-    Some(match name {
-        "quit" => Action::Quit,
-        "force_quit" => Action::ForceQuit,
-        "help" => Action::Help,
-        "toggle_window" => Action::ToggleWindow,
-        "move_up" => Action::MoveUp,
-        "move_down" => Action::MoveDown,
-        "move_top" => Action::MoveTop,
-        "move_bottom" => Action::MoveBottom,
-        "page_up" => Action::PageUp,
-        "page_down" => Action::PageDown,
-        "focus_next" => Action::FocusNext,
-        "focus_prev" => Action::FocusPrev,
-        "submit" => Action::Submit,
-        "cancel" => Action::Cancel,
-        "backspace" => Action::Backspace,
-        "delete" => Action::Delete,
-        "cursor_left" => Action::CursorLeft,
-        "cursor_right" => Action::CursorRight,
-        "cursor_home" => Action::CursorHome,
-        "cursor_end" => Action::CursorEnd,
-        "play_pause" => Action::PlayPause,
-        "next" => Action::Next,
-        "prev" => Action::Prev,
-        "seek_forward" => Action::SeekForward,
-        "seek_backward" => Action::SeekBackward,
-        "load_more_search" => Action::LoadMoreSearch,
-        "volume_up" => Action::VolumeUp,
-        "volume_down" => Action::VolumeDown,
-        "toggle_mute" => Action::ToggleMute,
-        "cycle_playback_mode" => Action::CyclePlaybackMode,
-        "cycle_quality" => Action::CycleQuality,
-        "toggle_lyric_panel" => Action::ToggleLyricPanel,
-        "lyric_delay" => Action::LyricDelay,
-        "lyric_advance" => Action::LyricAdvance,
-        "open_search" => Action::OpenSearch,
-        "open_settings" => Action::OpenSettings,
-        "download_current" => Action::DownloadCurrent,
-        "reload" => Action::Reload,
-        "queue_append" => Action::QueueAppend,
-        "add_all_to_queue" => Action::AddAllToQueue,
-        "queue_play_next" => Action::QueuePlayNext,
-        "remove_from_queue" => Action::RemoveFromQueue,
-        "clear_queue" => Action::ClearQueue,
-        "clear_cache" => Action::ClearCache,
-        "toggle_sort_order" => Action::ToggleSortOrder,
-        "open_ranks" => Action::OpenRanks,
-        "open_cloud" => Action::OpenCloud,
-        "login" => Action::Login,
-        "claim_vip" => Action::ClaimVip,
-        "cycle_artist_filter" => Action::CycleArtistFilter,
-        "sync_to_cloud" => Action::SyncToCloud,
-        "add_to_cloud" => Action::AddToCloud,
-        "remove_from_cloud" => Action::RemoveFromCloud,
-        "delete_cloud_playlist" => Action::DeleteCloudPlaylist,
-        "new_cloud_playlist" => Action::NewCloudPlaylist,
-        "toggle_sidebar" => Action::ToggleSidebar,
-        "switch_source" => Action::SwitchSource,
-        "set_default_source" => Action::SetDefaultSource,
-        "raise_source_priority" => Action::RaiseSourcePriority,
-        "lower_source_priority" => Action::LowerSourcePriority,
-        _ => return None,
-    })
+    REBINDABLE
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, action)| *action)
 }
 
 /// 解析按键名 → (键码, 修饰键)。
@@ -887,6 +910,79 @@ mod tests {
             "帮助面板里这些键其实没绑定：{}",
             unbound.join("、")
         );
+    }
+
+    /// 帮助面板里**每一个**有默认键位的动作，都必须能用名字重绑。
+    ///
+    /// 这挡的是一类「两份名单不同步」的缺陷，而且它真的发生过：`context_menu`
+    /// （`;` 打开歌曲右键菜单）在 `resolve_normal` 与 `CHEATSHEET` 里都有，帮助面板
+    /// 也照常显示，但 `action_from_name` 里没有它的名字——用户照文档写
+    /// `context_menu = "m"` 得到的是「未知动作 context_menu」，而那个动作明明存在。
+    /// `CONTRIBUTING.md` 把「记得同步这张表」写成了一条人工步骤，这条测试把它
+    /// 变成机械检查。
+    ///
+    /// 为什么这个方向能自动查、而上面那条的**反方向**（绑了但面板没写）不能：
+    /// `CHEATSHEET` 与 `REBINDABLE` 都是数据，两边可以对着数；`resolve_normal`
+    /// 是带区间与 guard 的 match，枚举不出它绑了哪些键。
+    #[test]
+    fn every_cheatsheet_shortcut_can_be_rebound_by_name() {
+        let mut missing = Vec::new();
+        for (keys, description, _) in CHEATSHEET {
+            for token in keys.split(" / ").map(str::trim).filter(|t| !t.is_empty()) {
+                let Some(action) = resolve_displayed_token(token) else {
+                    // `1..9` 这类范围 token、以及没绑定的键，本来就不该有名字
+                    continue;
+                };
+                // 带参数的动作**按设计**没有名字：值来自运行时，配置文件里写不出
+                // 完整语义。数字键（`0` / `1..9` 切标签页）就落在这一类里。
+                //
+                // 这份例外清单故意写得显式：将来真加了新的带参数动作、又给了它默认
+                // 键位，这条测试会**失败**，逼着人明确回答「它到底该不该能重绑」，
+                // 而不是静默漏过去。
+                if matches!(
+                    action,
+                    Action::Char(_) | Action::Digit(_) | Action::SeekTo(_) | Action::SeekBy(_)
+                ) {
+                    continue;
+                }
+                if !REBINDABLE.iter().any(|(_, bound)| *bound == action) {
+                    missing.push(format!("「{token}」（{description}）→ {action:?}"));
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "这些动作在帮助面板里有默认键位，却绑不了名字（用户改不动它）：{}",
+            missing.join("、")
+        );
+    }
+
+    /// 名字表本身要是干净的：不重名、全小写 snake_case。
+    ///
+    /// 重名会让 `action_from_name` 静默取到**先出现**的那条——`find` 就是这语义——
+    /// 于是后写的那条永远不生效，而配置文件里看着完全正常。
+    #[test]
+    fn the_rebindable_name_table_is_clean() {
+        let mut seen = std::collections::HashMap::new();
+        for (name, action) in REBINDABLE {
+            assert!(
+                !name.is_empty()
+                    && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                    && !name.starts_with('_')
+                    && !name.ends_with('_'),
+                "动作名应当是小写 snake_case：{name:?}"
+            );
+            if let Some(previous) = seen.insert(*name, action) {
+                panic!("动作名 {name:?} 重复：{previous:?} 与 {action:?}");
+            }
+        }
+        assert_eq!(
+            action_from_name("quit"),
+            Some(Action::Quit),
+            "查表本身要能用"
+        );
+        assert_eq!(action_from_name("不存在的动作"), None);
     }
 
     /// 没装自定义表时，改写函数必须原样返回，不做任何猜测。

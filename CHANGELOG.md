@@ -87,6 +87,19 @@
 
 ### 修复
 
+- **`;`（打开歌曲右键菜单）改不了键位**（`keymap.rs`）。它在 `resolve_normal` 与
+  `CHEATSHEET` 里都有，帮助面板也照常显示，`docs/CONFIGURATION.md` 的键位表里也列着，
+  但 `action_from_name` 的动作名表里**没有 `context_menu`**——用户照文档写
+  `context_menu = "m"` 时得到的是「未知动作 context_menu」，而那个动作明明存在。
+  `CONTRIBUTING.md` 把「记得同步这张表」写成了一条人工步骤，这次就漏了。
+
+  动作名表从 `match` 改成了 `const REBINDABLE`（数据），于是「帮助面板里有默认键位的
+  动作，是否都能绑上名字」可以机械检查：新测试拿 `CHEATSHEET` 与 `REBINDABLE`
+  两份名单对着数，去掉修复后它会精确报出
+  `「;」（打开歌曲右键菜单）→ ContextMenu`。另加一条表本身的自检
+  （不重名、全小写 snake_case）——重名会让 `find` 静默取到先出现的那条。
+  `docs/CONFIGURATION.md` 的清单与计数（60 → 61）一并跟上。
+
 - **歌词译文会整体串位一行**（`api/lyric.rs`）。`parse_lrc` 与 `attach_translations`
   各写了一份「这一行算不算歌词」的判据：前者看 `parse_krc_words` 的返回值是否为空，
   后者看 `clean_krc_markup` 是否为空。两者在「`<` 之前有字、却没有配对的 `>`」的行上
