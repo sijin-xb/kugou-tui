@@ -78,8 +78,8 @@ paru -S kugou-tui          # 或 yay -S kugou-tui
 **Linux（x86_64）**：
 
 ```bash
-tar xzf kugou-tui-0.4.3-x86_64-unknown-linux-gnu.tar.gz
-cd kugou-tui-0.4.3-x86_64-unknown-linux-gnu
+tar xzf kugou-tui-0.4.4-x86_64-unknown-linux-gnu.tar.gz
+cd kugou-tui-0.4.4-x86_64-unknown-linux-gnu
 
 # 二进制与三个脚本都链进 PATH。
 # `scripts/kugou-tui` 与二进制同名，所以链过去要改名（同 AUR 包的做法）。
@@ -96,8 +96,8 @@ kugou-tui                     # 开播（也可用 kugou-tui-launch，它会按�
 **Windows（x86_64）**：
 
 ```powershell
-Expand-Archive kugou-tui-0.4.3-x86_64-pc-windows-msvc.zip -DestinationPath .
-cd kugou-tui-0.4.3-x86_64-pc-windows-msvc
+Expand-Archive kugou-tui-0.4.4-x86_64-pc-windows-msvc.zip -DestinationPath .
+cd kugou-tui-0.4.4-x86_64-pc-windows-msvc
 
 .\scripts\kugou-api-install.ps1   # 一次性
 .\scripts\kugou-tui.ps1           # 开播
@@ -106,8 +106,8 @@ cd kugou-tui-0.4.3-x86_64-pc-windows-msvc
 **macOS（arm64）** —— 脚本是 bash，用法与 Linux 相同：
 
 ```bash
-tar xzf kugou-tui-0.4.3-aarch64-apple-darwin.tar.gz
-cd kugou-tui-0.4.3-aarch64-apple-darwin
+tar xzf kugou-tui-0.4.4-aarch64-apple-darwin.tar.gz
+cd kugou-tui-0.4.4-aarch64-apple-darwin
 ./scripts/kugou-api-install kugou
 ./scripts/kugou-tui
 ```
