@@ -50,8 +50,14 @@ permissions:
   contents: write
 
 env:
-  # tag 推送时用 `github.ref_name`；手动触发时用它给的输入。
+  # 要发的 tag：tag 推送时用 `github.ref_name`，手动补资产时用它给的输入。
   TAG: ${{ inputs.tag || github.ref_name }}
+  # checkout 用哪个 ref。**故意不用 `inputs.tag || 'main'` 写进 `with.ref`**：
+  # `workflow_dispatch` 的输入在 job 的 `with:` 阶段还没展开成值，表达式会被当成
+  # 字面量字符串传下去——checkout 收到 `ref: v0.4.6` 就直接 checkout 了那个 tag，
+  # 补资产路径又回到「用当时那份代码编译」的老问题上。改用下面的
+  # "选择 checkout 的 ref" 步骤显式分支，那里表达式的上下文与普通 shell 里一致。
+  CHECKOUT_REF: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref_name }}
 
 jobs:
   # 先建 Release，再让三个平台往里挂资产。
@@ -71,9 +77,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # 也要 `inputs.tag || 'main'`：`scripts/release-notes` 只在 main 上
-          # 更新，老 tag 里的那份可能还不认识这个版本号。
-          ref: ${{ inputs.tag || 'main' }}
+          # 手动补资产时也要用 main：`scripts/release-notes` 只在 main 上更新，
+          # 老 tag 里的那份可能还不认识要补的版本号。
+          ref: ${{ env.CHECKOUT_REF }}
 
       - name: 建 Release（已存在则跳过）
         env:
@@ -185,9 +191,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # `v*` tag 推送时发的是 tag 那次提交，正是我们要发的版本；
-          # 手动补资产（workflow_dispatch）时才 checkout main，取最新的构建修复。
-          ref: ${{ inputs.tag || 'main' }}
+          # 见文件开头 `CHECKOUT_REF` 的说明：手动补资产（workflow_dispatch）时
+          # 走 main，取最新的构建修复；tag 推送时仍是 tag 自己那次提交。
+          ref: ${{ env.CHECKOUT_REF }}
 
       # 什么都不用装：Xcode 命令行工具（clang）与 cmake 都在 runner 镜像里，
       # `aws-lc-sys` 那坨 C 代码因此编得过。macOS 没有 ALSA 那套依赖。
