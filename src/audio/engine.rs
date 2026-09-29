@@ -864,8 +864,11 @@ impl Runtime {
         // 全堆，把上一首（下载、解码、封面）攒下的空闲页还给 OS——RSS 随之
         // 落回去，而不是停在历史峰值。**离散事件，不是定时器**：增长已被上限
         // 治住（流式只留 4 MiB 窗口、下载走落盘），这里只是把「还了自由但没还
-        // 给 OS」的页交还。仅 Unix（Windows 的 MSVC 堆本来就积极归还）。
-        #[cfg(unix)]
+        // 给 OS」的页交还。
+        //
+        // 门控精确到 glibc：`malloc_trim` 是 glibc 专有，Darwin 的 libc 里没有，
+        // 用 `cfg(unix)` 会让 macOS 构建直接失败。Windows 的 MSVC 堆本来就积极归还。
+        #[cfg(target_env = "gnu")]
         unsafe {
             libc::malloc_trim(0);
         }

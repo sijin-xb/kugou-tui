@@ -77,8 +77,12 @@ fn main() -> anyhow::Result<()> {
     // 它的大小，之后同样大的块改从 arena 里切——free 只是把页还进 arena，RSS 从此
     // 抬到历史峰值不回落，「听歌听多了破一百 MB」的病根之一。把阈值钉死在 1 MiB，
     // 大块一律 mmap：munmap 即还 OS，不经过 arena。配套的换歌边界 trim 见
-    // `engine.rs::load`。仅 Unix（Windows 的 MSVC 堆本来就积极归还）。
-    #[cfg(unix)]
+    // `engine.rs::load`。
+    //
+    // 门控必须精确到 glibc：`mallopt` / `M_MMAP_THRESHOLD` 是 glibc 专有符号，
+    // Darwin（macOS）同属 Unix 但 libc 里没有这两样，用 `cfg(unix)` 会直接编译失败。
+    // Windows 的 MSVC 堆本来就积极归还，同样不需要。
+    #[cfg(target_env = "gnu")]
     unsafe {
         // M_MMAP_THRESHOLD 的惯例写法是传 -3（glibc 的内部编号）
         libc::mallopt(libc::M_MMAP_THRESHOLD, 1024 * 1024);
