@@ -5,6 +5,7 @@
 //! * [`cache`] —— 磁盘缓存与容量回收，决定「文件放在哪、满了删谁」；
 //! * [`download`] —— 把直链下载成缓存文件，决定「怎么拿数据」；
 //! * [`downmix`] —— 多声道 → 立体声下混，决定「多声道文件怎么出声」；
+//! * [`resample`] —— 抗混叠重采样，决定「hi-res 母版降设备率怎么不失真」；
 //! * [`engine`] —— 独占音频线程的播放引擎，决定「怎么出声」。
 //!
 //! 它们之间没有直接依赖：主线程负责编排
@@ -28,6 +29,7 @@ pub mod download;
 pub mod downmix;
 pub mod engine;
 pub mod levels;
+pub mod resample;
 pub mod spectrum;
 pub mod streaming;
 

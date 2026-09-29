@@ -201,6 +201,17 @@ impl StreamingBuffer {
         inner.flushed
     }
 
+    /// 建一个**读指针归零**的克隆（其余状态与落盘句柄都共享）。
+    ///
+    /// seek 回退重建解码器时用（见 `engine::Runtime::reload_at`）：原缓冲的读
+    /// 指针停在老解码器读取的位置上，直接克隆会让新解码器从半截开始读，
+    /// 「跳回前面」就又成了向后 seek——正是这次重建要绕开的东西。
+    pub fn reader_from_start(&self) -> Self {
+        let mut reader = self.clone();
+        reader.pos = 0;
+        reader
+    }
+
     /// 下载任务是否已经收工（成功、失败、取消都算）。
     ///
     /// 判断「还有没有可能等到更多数据」用它；判断「这首是不是完整下好了」
@@ -674,6 +685,31 @@ mod tests {
         assert_eq!(buffer.buffered_bytes(), before);
 
         cleanup(&path);
+    }
+
+    /// `reader_from_start` 必须归零读指针、共享数据。
+    ///
+    /// 它是 seek 回退的基石：读指针没归零，重建出的解码器就从半截开始，
+    /// 「跳回前面」依旧是向后 seek——修的那个 bug 原样复现。
+    #[test]
+    fn reader_from_start_resets_the_read_position_only() {
+        let buffer = StreamingBuffer::new(Some(4));
+        buffer.push(b"abcd");
+        buffer.finish(None);
+
+        // 把原缓冲的读指针推进到 2
+        let mut original = buffer.clone();
+        let mut two = [0u8; 2];
+        let read = original.read(&mut two).expect("读两字节");
+        assert_eq!(read, 2, "应读到 2 字节");
+
+        let mut reader = buffer.reader_from_start();
+        let mut out = [0u8; 4];
+        assert_eq!(reader.read(&mut out).unwrap(), 4, "归零后从头可读");
+        assert_eq!(&out, b"abcd");
+
+        // 数据与完成标记共享：原缓冲的 finish 对新读者同样生效
+        assert!(reader.is_finished());
     }
 
     /// `is_finished` 与 `is_complete` 的分工：前者说"任务收工了"，后者说
