@@ -71,7 +71,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          # 也要 `inputs.tag || 'main'`：`scripts/release-notes` 只在 main 上
+          # 更新，老 tag 里的那份可能还不认识这个版本号。
+          ref: ${{ inputs.tag || 'main' }}
 
       - name: 建 Release（已存在则跳过）
         env:
@@ -183,7 +185,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          # `v*` tag 推送时发的是 tag 那次提交，正是我们要发的版本；
+          # 手动补资产（workflow_dispatch）时才 checkout main，取最新的构建修复。
+          ref: ${{ inputs.tag || 'main' }}
 
       # 什么都不用装：Xcode 命令行工具（clang）与 cmake 都在 runner 镜像里，
       # `aws-lc-sys` 那坨 C 代码因此编得过。macOS 没有 ALSA 那套依赖。
