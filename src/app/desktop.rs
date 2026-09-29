@@ -67,6 +67,7 @@ impl App {
             return;
         };
 
+        let muted = self.state.is_muted();
         let info = match self.state.current.as_ref() {
             Some(song) => crate::tray::TrayInfo {
                 title: song.name.clone(),
@@ -76,9 +77,11 @@ impl App {
                     .map(|singer| singer.name.clone())
                     .collect(),
                 status: self.state.playback,
+                muted,
             },
             None => crate::tray::TrayInfo {
                 status: self.state.playback,
+                muted,
                 ..Default::default()
             },
         };

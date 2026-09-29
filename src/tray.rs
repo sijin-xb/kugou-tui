@@ -1,24 +1,27 @@
 //! 系统托盘（KDE/MATE 风格的 StatusNotifierItem）。
 //!
 //! 把播放器注册成 DBus 上的 `org.kde.StatusNotifierItem`，让 waybar / Quickshell /
-//! KDE 之类能识别并显示它。宿主收到右键（中右键在 KDE 里走 SecondaryActivate，
-//! 部分宿主走 ContextMenu）会派发一次 `PlayPause` 动作进事件总线，等同于按空格。
+//! KDE 之类能识别并显示它。全部交互最终都折算成 [`Action`] 投进事件总线，等同按键：
+//!
+//! * **滚轮**（垂直）调音量、（水平）快进 / 快退——托盘图标上不用展开菜单就能操作；
+//! * **右键菜单**（DBusMenu）：播放 / 暂停（措辞跟着状态走）、上一首 / 下一首、
+//!   静音、退出；跑在 niri 下时多一项「最小化 / 显示窗口」；
+//! * **中键**（KDE 走 `SecondaryActivate`）与部分宿主的 `ContextMenu` → 播放 / 暂停。
+//!
+//! # 图标跟随播放状态
+//!
+//! 播放 / 加载时用正常的音符图标；暂停 / 停止时换**调暗**的同一张图（只压 alpha，
+//! 颜色不变），并广播 `NewIcon`。托盘上「还在不在放」不用点开就知道。
 //!
 //! # 自适配：三层降级，每层都静默跳过、不影响播放
 //!
 //! 1. 没有图形会话（无 `WAYLAND_DISPLAY` 也无 `DISPLAY`）→ 完全不连 DBus；
 //! 2. session bus 不可用（纯 tty、容器里没挂 bus）→ zbus 报 Err，记 WARN；
 //! 3. 没有 `StatusNotifierWatcher`（非 KDE/Quickshell 桌面）→
-//!    `RegisterStatusNotifierItem` 调用失败，记 WARN。
+//!    注册失败，**每 5 秒重试一次**而不是放弃——面板常常比播放器后启动。
 //!
-//! 任一情况 `TrayHandle::is_connected()` 都会返回 false，主循环跳过同步。
-//!
-//! # 不实现菜单
-//!
-//! DBusMenu 是 `com.canonical.dbusmenu`，要单独注册一个接口并实现几百行 XML 树。
-//! 那个体量对「最小化托盘」过头了。`Menu` 属性返回 `/` 表示无菜单，左键 `Activate`
-//! 按用户要求留空。把交互都收在 `SecondaryActivate` / `ContextMenu`，让中右键
-//! 触发播放/暂停——比「什么都不做」更趁手、又不至于把菜单那套拉进来。
+//! 后两种情况 `TrayHandle::is_connected()` 返回 false，主循环跳过同步；
+//! 一旦 watcher 出现并注册成功，它会翻回 true，托盘自动出现。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -34,12 +37,21 @@ use crate::audio::engine::PlaybackState;
 use crate::event::{Event, EventBus};
 use crate::keymap::Action;
 
-/// 嵌入的图标（64×64 RGBA，源 SVG 在 `assets/tray.svg`）。运行时再缩放到目标尺寸。
+/// 嵌入的图标（256×256 RGBA，源 SVG 在 `assets/tray.svg`）。运行时再缩放到目标尺寸。
 const ICON_PNG: &[u8] = include_bytes!("../assets/tray-icon.png");
 
-/// 提供给宿主挑选的多尺寸图标。22 是 KDE「最小托盘尺寸」，64 是 Quickshell 在高分
-/// 屏下的常用值——宿主挑一个合适的，剩下的忽略。少给尺寸会让某些宿主退回到空白。
-const ICON_SIZES: [u32; 2] = [22, 64];
+/// 提供给宿主挑选的多尺寸图标。源图 256px，往下的每一档都从它重采样。
+///
+/// 覆盖三档主流托盘的常用值：16 / 22 / 24（KDE「最小托盘尺寸」与 waybar 常见的
+/// 22、GNOME 扩展偏好的 16）、32 / 48（普通与高分屏面板）、64（Quickshell 高分屏）。
+/// 多给只是启动期多几次重采样，宿主挑一个合适的，剩下的忽略；
+/// 少给尺寸会让某些宿主拿最接近的一档硬放大，糊成一团。
+const ICON_SIZES: [u32; 6] = [16, 22, 24, 32, 48, 64];
+
+/// 暂停 / 停止时图标整体压暗到这个不透明度。
+///
+/// 取 0.45：在深浅面板上都看得出「变灰了」，又没暗到像程序退出了。
+const DIM_ALPHA: f32 = 0.45;
 
 /// 一张图标位图：`(宽, 高, ARGB32 像素)`，对应 SNI 的 `a(iiay)`。
 ///
@@ -72,6 +84,8 @@ pub struct TrayInfo {
     pub title: String,
     pub artists: Vec<String>,
     pub status: PlaybackState,
+    /// 是否静音。托盘菜单的「静音 / 取消静音」措辞跟着它走。
+    pub muted: bool,
 }
 
 /// 主循环持有它，每帧调 [`Self::update`] 刷一次。
@@ -98,10 +112,12 @@ impl TrayHandle {
 struct Item {
     info: Arc<Mutex<TrayInfo>>,
     bus: EventBus,
-    /// 启动时一次性预渲染的多尺寸图标。`IconPixmap` 属性直接返回它，零拷贝是不可能的
-    /// （`Vec<u8>` 得克隆出去给 zbus），但启动期以外不会改。
-    pixmaps: Vec<Pixmap>,
-    /// ToolTip 用的单个图标。规范 ToolTip 只放一份图标，64 看着比 22 清楚。
+    /// 启动时一次性预渲染的多尺寸图标（播放 / 加载态）。`IconPixmap` 属性直接返回它，
+    /// 零拷贝是不可能的（`Vec<u8>` 得克隆出去给 zbus），但启动期以外不会改。
+    pixmaps_bright: Vec<Pixmap>,
+    /// 同一套图的调暗版（暂停 / 停止态）：只压 alpha，颜色不变。
+    pixmaps_dim: Vec<Pixmap>,
+    /// ToolTip 用的单个图标。规范 ToolTip 只放一份图标，用最大那档看着最清楚。
     tooltip_pixmap: Vec<Pixmap>,
 }
 
@@ -113,6 +129,33 @@ impl Item {
             Err(poisoned) => f(&poisoned.into_inner()),
         }
     }
+
+    /// 当前该用亮图标还是暗图标。
+    fn icon_is_dim(&self) -> bool {
+        self.with_info(|info| icon_should_dim(&info.status))
+    }
+}
+
+/// 暂停 / 停止时托盘图标换调暗版。
+///
+/// `Loading` 算「即将出声」，跟播放一样用亮图——缓冲的那两秒图标灰掉，
+/// 看起来反而像程序卡住。
+fn icon_should_dim(state: &PlaybackState) -> bool {
+    matches!(state, PlaybackState::Paused | PlaybackState::Stopped)
+}
+
+/// 把一整套图标压暗：RGB 原样，alpha 乘 [`DIM_ALPHA`]。
+fn dim_pixmaps(pixmaps: &[Pixmap]) -> Vec<Pixmap> {
+    pixmaps
+        .iter()
+        .map(|(width, height, bytes)| {
+            let mut bytes = bytes.clone();
+            for chunk in bytes.as_chunks_mut::<4>().0 {
+                chunk[3] = (f32::from(chunk[3]) * DIM_ALPHA).round() as u8;
+            }
+            (*width, *height, bytes)
+        })
+        .collect()
 }
 
 #[interface(name = "org.kde.StatusNotifierItem")]
@@ -154,9 +197,14 @@ impl Item {
         String::new()
     }
 
+    /// 图标跟着播放状态走：播放 / 加载亮，暂停 / 停止暗。
     #[zbus(property)]
     async fn icon_pixmap(&self) -> Vec<Pixmap> {
-        self.pixmaps.clone()
+        if self.icon_is_dim() {
+            self.pixmaps_dim.clone()
+        } else {
+            self.pixmaps_bright.clone()
+        }
     }
 
     // 下面三组属性规范列了但我们用不到——全部返回空，避免宿主读到奇怪默认值。
@@ -231,8 +279,18 @@ impl Item {
         self.bus.send(Event::Action(Action::PlayPause));
     }
 
-    /// 滚轮。最常见的语义是音量，但项目里音量按 `=`/`-`/数字，没在滚轮上做。
-    async fn scroll(&self, _delta: i32, _direction: &str) {}
+    /// 滚轮：垂直调音量，水平快进 / 快退。只看符号——宿主给的 delta 绝对值
+    /// 含义不一（有的 ±1，有的 ±120），按格数缩放只会时大时小。
+    async fn scroll(&self, delta: i32, direction: &str) {
+        let action = match (direction, delta) {
+            ("vertical", d) if d > 0 => Action::VolumeUp,
+            ("vertical", d) if d < 0 => Action::VolumeDown,
+            ("horizontal", d) if d > 0 => Action::SeekForward,
+            ("horizontal", d) if d < 0 => Action::SeekBackward,
+            _ => return, // 斜向滚轮与零位移不做任何事
+        };
+        self.bus.send(Event::Action(action));
+    }
 
     async fn open(&self, _uri: &str) {}
 
@@ -269,39 +327,96 @@ impl Item {
 /// 整个跳过。这正是「点了没反应」的直接原因。
 const MENU_PATH: &str = "/StatusNotifierItem/menu";
 
-/// 一条菜单项：`(id, 标签, 点击后派发的动作)`。id 从 1 起——0 是 DBusMenu
-/// 规定的虚拟根节点。
-type MenuEntry = (i32, &'static str, Action);
+/// 菜单项 id。固定常量而不是散落的字面量：`entry_label` 与信号循环都按 id
+/// 找「播放 / 暂停」「静音」这两项动态标签，写错一个数字就是菜单点错动作。
+const ID_PLAY_PAUSE: i32 = 1;
+const ID_PREV: i32 = 2;
+const ID_NEXT: i32 = 3;
+const ID_SEPARATOR: i32 = 4;
+const ID_MUTE: i32 = 5;
+const ID_WINDOW: i32 = 6;
+/// 「退出」的 id 取决于有没有窗口项：两项都要出现，id 就得接在不同位置——
+/// 重复 id 会让宿主的菜单项互相覆盖。
+const ID_QUIT_AFTER_WINDOW: i32 = 7;
+const ID_QUIT: i32 = 6;
+
+/// 一条菜单项：`(id, 静态文案, 点击后派发的动作)`。
+///
+/// `action` 为 `None` 表示**分隔线**（属性 `type = separator`），不派发任何动作。
+/// 静态文案只是兜底：id [`ID_PLAY_PAUSE`] 与 [`ID_MUTE`] 的实际显示由
+/// [`entry_label`] 按当前播放状态算（播放↔暂停、静音↔取消静音）。
+type MenuEntry = (i32, &'static str, Option<Action>);
 
 /// 菜单项。
 ///
-/// `window_control` 为假（当前会话不是 niri）时**最后一项根本不出现**：
-/// 一个点了没反应的菜单项比没有它更糟。
-///
-/// 没做成动态（跟着播放状态把措辞在「播放 / 暂停」之间切）：那要维护 revision
-/// 并广播 `ItemsPropertiesUpdated`，而「播放 / 暂停」这个说法两种状态下都成立。
+/// `window_control` 为假（当前会话不是 niri）时**「最小化 / 显示窗口」根本不出现**：
+/// 一个点了没反应的菜单项比没有它更糟。「退出」用 [`Action::Quit`] 走正常退出
+/// 流程（先保存配置与播放进度），与按 `q` 等价。
 fn menu_entries(window_control: bool) -> Vec<MenuEntry> {
     let mut entries: Vec<MenuEntry> = vec![
-        (1, "播放 / 暂停", Action::PlayPause),
-        (2, "上一首", Action::Prev),
-        (3, "下一首", Action::Next),
+        (ID_PLAY_PAUSE, "播放 / 暂停", Some(Action::PlayPause)),
+        (ID_PREV, "上一首", Some(Action::Prev)),
+        (ID_NEXT, "下一首", Some(Action::Next)),
+        (ID_SEPARATOR, "", None),
+        (ID_MUTE, "静音", Some(Action::ToggleMute)),
     ];
     if window_control {
-        // 一个开关项而不是「最小化」「显示」两项：niri 的 toggle 一次搞定，
-        // 菜单里也不用让用户先判断当前是哪种状态。
-        entries.push((4, "最小化 / 显示窗口", Action::ToggleWindow));
+        entries.push((ID_WINDOW, "最小化 / 显示窗口", Some(Action::ToggleWindow)));
+        entries.push((ID_QUIT_AFTER_WINDOW, "退出", Some(Action::Quit)));
+    } else {
+        entries.push((ID_QUIT, "退出", Some(Action::Quit)));
     }
     entries
 }
 
+/// 一条菜单项**实际显示**的标签。
+///
+/// 「播放 / 暂停」「静音」跟着状态切换措辞，其余原样返回静态文案。
+fn entry_label(entry: &MenuEntry, info: &TrayInfo) -> String {
+    match entry.0 {
+        ID_PLAY_PAUSE => {
+            if info.status == PlaybackState::Playing {
+                "暂停"
+            } else {
+                "播放"
+            }
+        }
+        ID_MUTE => {
+            if info.muted {
+                "取消静音"
+            } else {
+                "静音"
+            }
+        }
+        _ => entry.1,
+    }
+    .to_string()
+}
+
+/// 只有这两个 id 的标签是动态的。信号循环广播 `ItemsPropertiesUpdated` 时按它过滤，
+/// 状态没变就不打扰宿主。
+const DYNAMIC_LABEL_IDS: [i32; 2] = [ID_PLAY_PAUSE, ID_MUTE];
+
 struct Menu {
     bus: EventBus,
     entries: Vec<MenuEntry>,
+    /// 与 [`Item`] 共享的状态快照：动态标签从这里读。
+    info: Arc<Mutex<TrayInfo>>,
+    /// 布局版本号。标签变化时 +1 并广播 `LayoutUpdated`，宿主才知道要重拉。
+    revision: Arc<AtomicU32>,
 }
 
 impl Menu {
     fn find(&self, id: i32) -> Option<&MenuEntry> {
         self.entries.iter().find(|entry| entry.0 == id)
+    }
+
+    /// 拿快照。与 `Item::with_info` 同一套锁中毒策略。
+    fn with_info<R>(&self, f: impl FnOnce(&TrayInfo) -> R) -> R {
+        match self.info.lock() {
+            Ok(guard) => f(&guard),
+            Err(poisoned) => f(&poisoned.into_inner()),
+        }
     }
 }
 
@@ -335,15 +450,21 @@ impl Menu {
         _property_names: Vec<String>,
     ) -> MenuLayout {
         let children: Vec<OwnedValue> = if parent_id == 0 {
-            self.entries
-                .iter()
-                .map(|(id, label, _)| layout_node(*id, label))
-                .collect()
+            self.with_info(|info| {
+                self.entries
+                    .iter()
+                    .map(|entry| layout_node(entry, info))
+                    .collect()
+            })
         } else {
             Vec::new()
         };
-        // revision 恒为 0：树是静态的，宿主取一次就够
-        (0, (parent_id, HashMap::new(), children))
+        // revision 跟着动态标签走：状态没变时它不动，宿主取一次就够；
+        // 变了信号循环会 +1 并广播 `LayoutUpdated`。
+        (
+            self.revision.load(Ordering::Relaxed),
+            (parent_id, HashMap::new(), children),
+        )
     }
 
     async fn get_group_properties(
@@ -351,26 +472,31 @@ impl Menu {
         ids: Vec<i32>,
         _property_names: Vec<String>,
     ) -> Vec<(i32, HashMap<String, OwnedValue>)> {
-        ids.into_iter()
-            .filter_map(|id| {
-                self.find(id)
-                    .map(|(id, label, _)| (*id, item_properties(label)))
-            })
-            .collect()
+        self.with_info(|info| {
+            ids.into_iter()
+                .filter_map(|id| {
+                    self.find(id)
+                        .map(|entry| (entry.0, item_properties(entry, info)))
+                })
+                .collect()
+        })
     }
 
     async fn get_property(&self, id: i32, name: String) -> OwnedValue {
-        self.find(id)
-            .and_then(|(_, label, _)| item_properties(label).remove(&name))
-            .unwrap_or_else(|| owned_str(""))
+        self.with_info(|info| {
+            self.find(id)
+                .and_then(|entry| item_properties(entry, info).remove(&name))
+                .unwrap_or_else(|| owned_str(""))
+        })
     }
 
     /// 点击。宿主只发 `clicked` 这一个事件 id，其余（`opened` / `closed` 等）忽略。
+    /// 分隔线（`action` 为 `None`）点不出事件，天然落在 `find` 的 `None` 分支里。
     async fn event(&self, id: i32, event_id: String, _data: OwnedValue, _timestamp: u32) {
         if event_id != "clicked" {
             return;
         }
-        if let Some((_, _, action)) = self.find(id) {
+        if let Some((_, _, Some(action))) = self.find(id) {
             self.bus.send(Event::Action(*action));
         }
     }
@@ -398,11 +524,17 @@ impl Menu {
     ) -> zbus::Result<()>;
 }
 
-/// 一条菜单项的属性。`label` / `enabled` / `visible` 缺一个，多数宿主就不显示它。
-fn item_properties(label: &str) -> HashMap<String, OwnedValue> {
+/// 一条菜单项的属性。`label` / `enabled` / `visible` 缺一个，多数宿主就不显示它；
+/// 分隔线按规范只认 `type = separator`，宿主画横线、忽略其余属性。
+fn item_properties(entry: &MenuEntry, info: &TrayInfo) -> HashMap<String, OwnedValue> {
     let mut map = HashMap::new();
-    map.insert("label".to_string(), owned_str(label));
-    map.insert("enabled".to_string(), owned_bool(true));
+    if entry.2.is_none() {
+        map.insert("type".to_string(), owned_str("separator"));
+        map.insert("enabled".to_string(), owned_bool(false));
+    } else {
+        map.insert("label".to_string(), owned_str(&entry_label(entry, info)));
+        map.insert("enabled".to_string(), owned_bool(true));
+    }
     map.insert("visible".to_string(), owned_bool(true));
     map
 }
@@ -411,11 +543,15 @@ fn item_properties(label: &str) -> HashMap<String, OwnedValue> {
 ///
 /// 必须手工拼 `Value::Structure`：zvariant 只给**固定几个**元组实现了 `Type`，
 /// `(i32, a{sv}, av)` 这种嵌套组合不在其中，直接 `try_from` 元组会编译不过。
-fn layout_node(id: i32, label: &str) -> OwnedValue {
+fn layout_node(entry: &MenuEntry, info: &TrayInfo) -> OwnedValue {
     // 字段必须给**具体类型**。写成 `Value::from(id)` 之类的话，每个字段自己又是个
     // variant，整个节点会变成 `(vvv)` 而不是规范要的 `(ia{sv}av)`——宿主按规范去解析
     // 会拿到对不上的类型，实测 Quickshell 直接崩（不是报错，是进程挂掉）。
-    let structure = Structure::from((id, item_properties(label), Vec::<OwnedValue>::new()));
+    let structure = Structure::from((
+        entry.0,
+        item_properties(entry, info),
+        Vec::<OwnedValue>::new(),
+    ));
     OwnedValue::try_from(Value::Structure(structure)).unwrap_or_else(|_| owned_str(""))
 }
 
@@ -464,8 +600,10 @@ pub fn spawn(bus: EventBus) -> Option<TrayHandle> {
 
     let info = Arc::new(Mutex::new(TrayInfo::default()));
     let connected = Arc::new(AtomicBool::new(false));
+    let revision = Arc::new(AtomicU32::new(0));
     let info_thread = Arc::clone(&info);
     let connected_thread = Arc::clone(&connected);
+    let revision_thread = Arc::clone(&revision);
     let pid = std::process::id();
     // 规范给的 bus name 形状是 `...-<pid>-<n>`。实例号不是摆设：同一进程里注册
     // 第二份（测试并发跑、或将来真的有多个托盘项）时，少了它第二个会撞名、
@@ -484,15 +622,19 @@ pub fn spawn(bus: EventBus) -> Option<TrayHandle> {
 
         runtime.block_on(async move {
             // 菜单和托盘项共用一条事件总线：点菜单项要能把动作投进主循环
+            let entries = menu_entries(crate::window::available());
             let menu = Menu {
                 bus: bus.clone(),
-                entries: menu_entries(crate::window::available()),
+                entries: entries.clone(),
+                info: Arc::clone(&info_thread),
+                revision: Arc::clone(&revision_thread),
             };
 
             let item = Item {
                 info: Arc::clone(&info_thread),
                 bus,
-                pixmaps: pixmaps.clone(),
+                pixmaps_bright: pixmaps.clone(),
+                pixmaps_dim: dim_pixmaps(&pixmaps),
                 tooltip_pixmap: tooltip_pixmap.clone(),
             };
 
@@ -504,30 +646,79 @@ pub fn spawn(bus: EventBus) -> Option<TrayHandle> {
                     .build()
                     .await?;
 
-                // 向 watcher 报到。失败常见原因：Quickshell 没跑 / KDE plasma 进程没起。
-                // connection 已建立，但没人知道我们——直接走完信号循环也只会空转，
-                // 所以 watcher 失败视为整体失败，drop connection 释放 bus name。
-                connection
-                    .call_method(
-                        Some(WATCHER_DEST),
-                        WATCHER_PATH,
-                        Some(WATCHER_IFACE),
-                        "RegisterStatusNotifierItem",
-                        &(bus_name.as_str(),),
-                    )
-                    .await?;
+                // watcher 代理是惰性的：此刻面板没起也不会失败，真正的探测在下面的循环里。
+                let watcher =
+                    zbus::Proxy::new(&connection, WATCHER_DEST, WATCHER_PATH, WATCHER_IFACE)
+                        .await?;
 
-                connected_thread.store(true, Ordering::Relaxed);
-
-                let iface = connection
+                let item_iface = connection
                     .object_server()
                     .interface::<_, Item>(OBJECT_PATH)
+                    .await?;
+                let menu_iface = connection
+                    .object_server()
+                    .interface::<_, Menu>(MENU_PATH)
                     .await?;
 
                 let mut last_status = String::new();
                 let mut last_tooltip = String::new();
+                let mut last_icon_dim = false;
+                // 动态菜单标签跟随的两个开关：（在播放, 已静音）
+                let mut last_menu_state = (false, false);
+                // 注册状态只记录**翻转**：面板没起的 5 秒一轮重试不刷日志
+                let mut was_connected = false;
+                // 自愈节拍：每 HEAL_EVERY 拍（0.5s × 10 = 5s）对一次账。第 1 拍立即注册，
+                // 正常启动时托盘不比原来慢。
+                const HEAL_EVERY: u64 = 10;
+                let mut ticks: u64 = 0;
 
                 loop {
+                    ticks += 1;
+
+                    // ---- 注册与自愈 ----
+                    //
+                    // 三种情况都要（重）注册：启动时面板还没起；面板重启把 watcher
+                    // 连带换了一轮；watcher 无声地把我们丢了。判据是
+                    // `RegisteredStatusNotifierItems` 里还有没有自己的 bus name——
+                    // 已在列表里就不再调 `RegisterStatusNotifierItem`，重复注册是
+                    // 多余调用，还可能让 watcher 发重复信号。
+                    if ticks % HEAL_EVERY == 1 {
+                        let known = watcher
+                            .get_property::<Vec<String>>("RegisteredStatusNotifierItems")
+                            .await
+                            .map(|items| items.iter().any(|item| item == &bus_name))
+                            .unwrap_or(false);
+                        if !known {
+                            match watcher
+                                .call_method("RegisterStatusNotifierItem", &(bus_name.as_str(),))
+                                .await
+                            {
+                                Ok(_) => {
+                                    if !was_connected {
+                                        crate::logger::tlog!(
+                                            crate::logger::LEVEL_INFO,
+                                            "系统托盘已注册：{bus_name}"
+                                        );
+                                    }
+                                    was_connected = true;
+                                    connected_thread.store(true, Ordering::Relaxed);
+                                }
+                                Err(_) => {
+                                    // 常见原因：Quickshell / KDE 的托盘宿主还没起。
+                                    // 静默重试，只在翻转时记一条。
+                                    if was_connected {
+                                        crate::logger::tlog!(
+                                            crate::logger::LEVEL_WARN,
+                                            "托盘宿主已消失，转入后台重连"
+                                        );
+                                    }
+                                    was_connected = false;
+                                    connected_thread.store(false, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+
                     let current = match info_thread.lock() {
                         Ok(guard) => Some(guard.clone()),
                         Err(poisoned) => Some(poisoned.into_inner().clone()),
@@ -542,13 +733,16 @@ pub fn spawn(bus: EventBus) -> Option<TrayHandle> {
 
                     let cur_status = status_label(&current.status).to_string();
                     let cur_tooltip = format_tooltip(&current.title, &current.artists);
+                    let cur_icon_dim = icon_should_dim(&current.status);
+                    let cur_menu_state = (current.status == PlaybackState::Playing, current.muted);
 
-                    // 状态变了 → 发 `NewStatus` 信号，宿主可能换 active/passive 颜色；
-                    // tooltip 变了 → 发 `NewToolTip`，鼠标悬停才会更新。
+                    // 状态变了 → 发 `NewStatus`，宿主可能换 active/passive 颜色；
+                    // 图标档位变了 → `NewIcon`，暂停 / 停止时托盘换调暗的那套图；
+                    // tooltip 变了 → `NewToolTip`，鼠标悬停才会更新。
                     // 频率 0.5s：托盘本身不需要更实时，省点锁开销。
                     if cur_status != last_status {
                         last_status = cur_status.clone();
-                        let ctxt = iface.signal_emitter();
+                        let ctxt = item_iface.signal_emitter();
                         // `#[zbus(signal)]` 宏把信号方法生成在 `ItemSignals` trait 上，
                         // 默认不可见的关联函数。直接按 `Item::new_status(ctxt, ...)`
                         // 静态调用最简洁。
@@ -556,8 +750,36 @@ pub fn spawn(bus: EventBus) -> Option<TrayHandle> {
                     }
                     if cur_tooltip != last_tooltip {
                         last_tooltip = cur_tooltip;
-                        let ctxt = iface.signal_emitter();
+                        let ctxt = item_iface.signal_emitter();
                         let _ = Item::new_tool_tip(ctxt).await;
+                    }
+                    if cur_icon_dim != last_icon_dim {
+                        last_icon_dim = cur_icon_dim;
+                        let ctxt = item_iface.signal_emitter();
+                        let _ = Item::new_icon(ctxt).await;
+                    }
+
+                    // 动态菜单标签：播放↔暂停、静音↔取消静音。只给这两个 id 发
+                    // `ItemsPropertiesUpdated`，再广播一次 `LayoutUpdated` 让宿主知道
+                    // revision 变了——两者缺一，有的宿主只认其中一个。
+                    if cur_menu_state != last_menu_state {
+                        last_menu_state = cur_menu_state;
+                        let new_revision = revision_thread.fetch_add(1, Ordering::Relaxed) + 1;
+                        let updated: Vec<(i32, HashMap<String, OwnedValue>)> = entries
+                            .iter()
+                            .filter(|entry| DYNAMIC_LABEL_IDS.contains(&entry.0))
+                            .map(|entry| {
+                                let mut props = HashMap::new();
+                                props.insert(
+                                    "label".to_string(),
+                                    owned_str(&entry_label(entry, &current)),
+                                );
+                                (entry.0, props)
+                            })
+                            .collect();
+                        let ctxt = menu_iface.signal_emitter();
+                        let _ = Menu::items_properties_updated(ctxt, updated, Vec::new()).await;
+                        let _ = Menu::layout_updated(ctxt, new_revision, 0).await;
                     }
 
                     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -571,7 +793,7 @@ pub fn spawn(bus: EventBus) -> Option<TrayHandle> {
             if let Err(error) = result {
                 crate::logger::tlog!(
                     crate::logger::LEVEL_WARN,
-                    "系统托盘注册失败（不影响播放）：{error}"
+                    "系统托盘连接失败（不影响播放）：{error}"
                 );
             }
         });
@@ -654,25 +876,100 @@ mod tests {
     /// 菜单项：能控制窗口时多一项「最小化 / 显示窗口」，不能时**整项不出现**。
     ///
     /// 「点了没反应」比「没有这一项」更糟，所以不可用时是去掉而不是置灰。
+    /// 「退出」两种形态下都有——托盘上是唯一的图形化退出入口，不能跟着窗口
+    /// 控制一起消失。
     #[test]
     fn menu_gains_the_window_entry_only_when_controllable() {
         let plain = menu_entries(false);
         let full = menu_entries(true);
 
-        assert_eq!(plain.len(), 3, "不是 niri 时只有播放控制三项");
-        assert_eq!(full.len(), 4);
-        assert_eq!(plain, full[..3].to_vec(), "前三项不该受窗口控制能力影响");
+        assert_eq!(
+            plain.len(),
+            6,
+            "不带窗口控制：播放三项 + 分隔线 + 静音 + 退出"
+        );
+        assert_eq!(full.len(), 7);
+        // 前 5 项（含分隔线）不受窗口控制能力影响
+        assert_eq!(plain[..5], full[..5]);
 
-        let (id, label, action) = full[3];
-        assert_eq!(id, 4, "新项 id 要接在现有项之后，别和前三项撞");
-        assert_eq!(label, "最小化 / 显示窗口");
-        assert_eq!(action, Action::ToggleWindow);
+        // full 里多出的是「最小化 / 显示窗口」+「退出」，plain 里直接是「退出」
+        assert_eq!(
+            full[5],
+            (ID_WINDOW, "最小化 / 显示窗口", Some(Action::ToggleWindow))
+        );
+        assert_eq!(full[6].2, Some(Action::Quit), "最后一项应是退出");
+        assert_eq!(plain[5].2, Some(Action::Quit), "最后一项应是退出");
+
+        // 两条链路的分隔线都在「下一首」与「静音」之间，且不派发动作
+        assert_eq!(plain[3], (ID_SEPARATOR, "", None));
+        assert_eq!(full[3], (ID_SEPARATOR, "", None));
 
         // id 必须唯一：重复 id 会让宿主的菜单项互相覆盖
-        let mut ids: Vec<i32> = full.iter().map(|(id, _, _)| *id).collect();
-        ids.sort_unstable();
-        ids.dedup();
-        assert_eq!(ids.len(), full.len(), "菜单项 id 不能重复");
+        for entries in [&plain, &full] {
+            let mut ids: Vec<i32> = entries.iter().map(|(id, _, _)| *id).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), entries.len(), "菜单项 id 不能重复");
+        }
+    }
+
+    /// 「播放 / 暂停」「静音」的标签必须跟着状态走，其余项原样。
+    #[test]
+    fn play_pause_and_mute_labels_follow_the_state() {
+        let mut info = TrayInfo::default();
+        let entries = menu_entries(false);
+        let find = |id: i32| entries.iter().find(|entry| entry.0 == id).unwrap();
+
+        info.status = PlaybackState::Playing;
+        assert_eq!(entry_label(find(ID_PLAY_PAUSE), &info), "暂停");
+        info.status = PlaybackState::Paused;
+        assert_eq!(entry_label(find(ID_PLAY_PAUSE), &info), "播放");
+        info.status = PlaybackState::Loading;
+        assert_eq!(entry_label(find(ID_PLAY_PAUSE), &info), "播放");
+
+        assert_eq!(entry_label(find(ID_MUTE), &info), "静音");
+        info.muted = true;
+        assert_eq!(entry_label(find(ID_MUTE), &info), "取消静音");
+
+        let prev = find(ID_PREV);
+        assert_eq!(entry_label(prev, &info), "上一首", "静态项不受状态影响");
+    }
+
+    /// 分隔线必须带 `type = separator`，普通项必须带 label。
+    ///
+    /// 少了 `type`，宿主会把分隔线画成一条空白（更糟的是有的宿主当成可点的
+    /// 空项）；少了 `label`，普通项整条消失。
+    #[test]
+    fn separator_is_typed_and_plain_items_are_labelled() {
+        let info = TrayInfo::default();
+        let entries = menu_entries(false);
+
+        let separator = entries
+            .iter()
+            .find(|entry| entry.0 == ID_SEPARATOR)
+            .unwrap();
+        let props = item_properties(separator, &info);
+        assert_eq!(
+            props
+                .get("type")
+                .and_then(|value| String::try_from(value.clone()).ok()),
+            Some("separator".to_string()),
+            "分隔线必须声明 type = separator"
+        );
+
+        let play = entries
+            .iter()
+            .find(|entry| entry.0 == ID_PLAY_PAUSE)
+            .unwrap();
+        let props = item_properties(play, &info);
+        assert!(
+            props.contains_key("label"),
+            "普通项必须有 label，否则宿主不显示"
+        );
+        assert!(
+            !props.contains_key("type"),
+            "普通项不能带 type，否则会被当成特殊项"
+        );
     }
 
     /// `GetLayout` 的节点必须是 `(ia{sv}av)`。
@@ -682,7 +979,9 @@ mod tests {
     /// 能在测试里拦住这种错，不用等真实状态栏炸一次才发现。
     #[test]
     fn menu_node_has_the_spec_signature() {
-        let node = layout_node(1, "播放 / 暂停");
+        let info = TrayInfo::default();
+        let entry = (ID_PLAY_PAUSE, "播放 / 暂停", Some(Action::PlayPause));
+        let node = layout_node(&entry, &info);
         assert_eq!(
             node.value_signature().to_string(),
             "(ia{sv}av)",
@@ -693,7 +992,8 @@ mod tests {
     /// 图标字节序：SNI 要 BGRA，image 给的是 RGBA。
     ///
     /// 错了不会报错、图标也不会消失，只会**变色**（而且是那种「看着像渲染
-    /// 问题」的变色），是最难靠肉眼定位的一类 bug。所以这里逐字节比对。
+    /// 问题」的变色），是最难靠肉眼定位的一类 bug。所以这里逐字节比对——
+    /// 每一档尺寸都和「源图走同一条缩放管线」的结果对照。
     #[test]
     fn pixmaps_are_bgra_and_sized_as_requested() {
         let pixmaps = build_pixmaps().expect("嵌入的 PNG 应当能解码");
@@ -710,34 +1010,75 @@ mod tests {
             );
         }
 
-        // 64 那一份与源图同尺寸，可以逐字节比对
-        let source = image::load_from_memory(ICON_PNG)
-            .expect("源 PNG 应能解码")
-            .into_rgba8()
-            .into_raw();
-        let (_, _, bytes) = pixmaps
-            .iter()
-            .find(|(width, _, _)| *width == 64)
-            .expect("应有 64 尺寸的图标");
-        assert_eq!(bytes.len(), source.len());
-
-        for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
-            let src = &source[index * 4..index * 4 + 4];
-            assert_eq!(chunk[0], src[2], "第 {index} 个像素：B 位应取自源的 R");
-            assert_eq!(chunk[2], src[0], "第 {index} 个像素：R 位应取自源的 B");
-            assert_eq!(chunk[1], src[1], "第 {index} 个像素：G 位不变");
-            assert_eq!(chunk[3], src[3], "第 {index} 个像素：A 位不变");
+        let source = image::load_from_memory(ICON_PNG).expect("源 PNG 应能解码");
+        for (width, height, bytes) in pixmaps.iter() {
+            let expected = source
+                .resize_exact(
+                    *width as u32,
+                    *height as u32,
+                    image::imageops::FilterType::Lanczos3,
+                )
+                .into_rgba8()
+                .into_raw();
+            assert_eq!(bytes.len(), expected.len());
+            for (index, chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
+                let src = &expected[index * 4..index * 4 + 4];
+                assert_eq!(
+                    chunk[0], src[2],
+                    "{width}px 第 {index} 个像素：B 位应取自源的 R"
+                );
+                assert_eq!(
+                    chunk[2], src[0],
+                    "{width}px 第 {index} 个像素：R 位应取自源的 B"
+                );
+                assert_eq!(chunk[1], src[1], "{width}px 第 {index} 个像素：G 位不变");
+                assert_eq!(chunk[3], src[3], "{width}px 第 {index} 个像素：A 位不变");
+            }
         }
 
         // 兜底：如果整张图 R 恒等于 B，上面那条断言等于什么都没验证
         assert!(
-            source
+            image::load_from_memory(ICON_PNG)
+                .expect("源 PNG 应能解码")
+                .into_rgba8()
+                .into_raw()
                 .as_chunks::<4>()
                 .0
                 .iter()
                 .any(|pixel| pixel[0] != pixel[2]),
             "图标里应当有非灰阶像素，否则字节序断言形同虚设"
         );
+    }
+
+    /// 调暗版只压 alpha，RGB 一个字节都不能动——颜色变了就成了另一张图。
+    #[test]
+    fn dim_pixmaps_shrink_alpha_and_keep_colors() {
+        let bright = build_pixmaps().expect("嵌入的 PNG 应当能解码");
+        let dim = dim_pixmaps(&bright);
+
+        assert_eq!(bright.len(), dim.len(), "尺寸档数不变");
+        let mut darkened = false;
+        for ((bw, bh, bb), (dw, dh, db)) in bright.iter().zip(&dim) {
+            assert_eq!((bw, bh), (dw, dh));
+            for (b, d) in bb.as_chunks::<4>().0.iter().zip(db.as_chunks::<4>().0) {
+                assert_eq!(&b[..3], &d[..3], "RGB 必须原样");
+                let expected = (f32::from(b[3]) * DIM_ALPHA).round() as u8;
+                assert_eq!(d[3], expected, "alpha 应乘 {DIM_ALPHA}");
+                if b[3] != d[3] {
+                    darkened = true;
+                }
+            }
+        }
+        assert!(darkened, "至少要有一个像素被压暗，否则调暗等于没调");
+    }
+
+    /// 图标档位：播放 / 加载亮，暂停 / 停止暗。
+    #[test]
+    fn icon_dims_only_when_playback_is_idle() {
+        assert!(!icon_should_dim(&PlaybackState::Playing));
+        assert!(!icon_should_dim(&PlaybackState::Loading));
+        assert!(icon_should_dim(&PlaybackState::Paused));
+        assert!(icon_should_dim(&PlaybackState::Stopped));
     }
 
     /// 端到端：真在 session bus 上注册一次，再从 watcher 那边把名字查回来。
@@ -830,7 +1171,11 @@ mod tests {
             .block_on(item.get_property("IconPixmap"))
             .expect("IconPixmap 属性应当可读");
         assert_eq!(pixmaps.len(), ICON_SIZES.len(), "应提供多尺寸图标");
-        assert_eq!(pixmaps.first().map(|entry| entry.0), Some(22));
+        assert_eq!(
+            pixmaps.first().map(|entry| entry.0),
+            Some(16),
+            "最小一档是 16"
+        );
         assert!(
             pixmaps
                 .iter()
@@ -899,14 +1244,17 @@ mod tests {
             .expect("GetLayout 应可调用");
         let (revision, (root_id, _root_props, children)): MenuLayout =
             layout.body().deserialize().expect("GetLayout 应返回布局");
-        assert_eq!(revision, 0, "静态菜单的 revision 恒为 0");
+        assert_eq!(revision, 0, "默认状态（停止、未静音）下 revision 还是初值");
         assert_eq!(root_id, 0, "根节点 id 按规范是 0");
         // 菜单项在 spawn 时按「能不能控制窗口」定下来了，这里取同一份来对照。
         let entries = menu_entries(crate::window::available());
         assert_eq!(children.len(), entries.len(), "菜单项数量应一致");
 
         // 逐项读 label：这是宿主真正画出来的文字，缺了就是一条空白。
-        for (id, label, _) in &entries {
+        // 播放 / 暂停、静音两项的标签由 `entry_label` 按状态解析——默认停止、
+        // 未静音，应分别显示「播放」「静音」。
+        let snapshot = TrayInfo::default();
+        for (id, _, _) in &entries {
             let reply = runtime
                 .block_on(connection.call_method(
                     Some(expected.as_str()),
@@ -918,8 +1266,29 @@ mod tests {
                 .expect("GetProperty 应可调用");
             let got: OwnedValue = reply.body().deserialize().expect("label 应是变体");
             let got = String::try_from(got).expect("label 应是字符串");
-            assert_eq!(&got, label, "id {id} 的 label");
+            let entry = entries
+                .iter()
+                .find(|entry| entry.0 == *id)
+                .expect("id 应在菜单里");
+            assert_eq!(&got, &entry_label(entry, &snapshot), "id {id} 的 label");
         }
+
+        // 分隔线必须能读到 type = separator，宿主才画得出横线。
+        let reply = runtime
+            .block_on(connection.call_method(
+                Some(expected.as_str()),
+                MENU_PATH,
+                Some("com.canonical.dbusmenu"),
+                "GetProperty",
+                &(ID_SEPARATOR, "type"),
+            ))
+            .expect("GetProperty 应可调用");
+        let got: OwnedValue = reply.body().deserialize().expect("type 应是变体");
+        assert_eq!(
+            String::try_from(got).as_deref(),
+            Ok("separator"),
+            "分隔线的 type 属性"
+        );
 
         // 点第一项（播放 / 暂停）应当派发 PlayPause。
         runtime
@@ -935,6 +1304,67 @@ mod tests {
             Ok(Event::Action(Action::PlayPause)) => {}
             other => panic!("点「播放 / 暂停」应派发 PlayPause，实际：{other:?}"),
         }
+
+        // 点「退出」应当派发 Quit——托盘菜单是唯一的图形化退出入口。
+        let quit_id = entries.last().expect("菜单不应为空").0;
+        runtime
+            .block_on(connection.call_method(
+                Some(expected.as_str()),
+                MENU_PATH,
+                Some("com.canonical.dbusmenu"),
+                "Event",
+                &(quit_id, "clicked", Value::from(0i32), 0u32),
+            ))
+            .expect("Event 应可调用");
+        match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(Event::Action(Action::Quit)) => {}
+            other => panic!("点「退出」应派发 Quit，实际：{other:?}"),
+        }
+
+        // 滚轮：垂直方向调音量（只看符号），宿主给的 delta 绝对值不统一。
+        for (delta, wanted) in [(5i32, Action::VolumeUp), (-5, Action::VolumeDown)] {
+            runtime
+                .block_on(connection.call_method(
+                    Some(expected.as_str()),
+                    OBJECT_PATH,
+                    Some("org.kde.StatusNotifierItem"),
+                    "Scroll",
+                    &(delta, "vertical"),
+                ))
+                .unwrap_or_else(|error| panic!("Scroll 应可调用：{error}"));
+            match receiver.recv_timeout(Duration::from_secs(1)) {
+                Ok(Event::Action(action)) if action == wanted => {}
+                other => panic!("向上/向下滚应派发 {wanted:?}，实际：{other:?}"),
+            }
+        }
+
+        // 水平滚轮是快进 / 快退；零位移不派发任何动作。
+        runtime
+            .block_on(connection.call_method(
+                Some(expected.as_str()),
+                OBJECT_PATH,
+                Some("org.kde.StatusNotifierItem"),
+                "Scroll",
+                &(2i32, "horizontal"),
+            ))
+            .expect("Scroll 应可调用");
+        match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(Event::Action(Action::SeekForward)) => {}
+            other => panic!("向右滚应派发 SeekForward，实际：{other:?}"),
+        }
+        runtime
+            .block_on(connection.call_method(
+                Some(expected.as_str()),
+                OBJECT_PATH,
+                Some("org.kde.StatusNotifierItem"),
+                "Scroll",
+                &(0i32, "vertical"),
+            ))
+            .expect("Scroll 应可调用");
+        assert!(
+            receiver.recv_timeout(Duration::from_millis(300)).is_err(),
+            "零位移的滚动不该派发动作"
+        );
     }
 
     /// 不在图形会话里跑也能正常工作——避免有人在 CI 里跑测试时整个进程崩溃。
