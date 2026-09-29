@@ -291,6 +291,13 @@ pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
     let max_offset = display.len().saturating_sub(viewport);
     let offset = focus_display.saturating_sub(viewport / 2).min(max_offset);
 
+    // 内容整体下沉的行数：`offset` 被 `focus_display - viewport/2` 压到 0 时，
+    // `skip(offset)` 之后内容从区域的**第一行**开始排，不可能上移——于是可视首行
+    // 对应的是 `first_display`（不是 `offset`）。底部同理：`offset` 撞上
+    // `max_offset` 之后内容型对齐，末行显示的是最后一句，不是 `offset + viewport`。
+    // 命中区两个都要按它算（见本函数末尾），否则末屏与首屏的点击必然错位。
+    let first_display = offset.min(focus_display);
+
     // 逐字着色要用当前播放位置，取一次即可（毫秒）
     let position_ms = state.position_ms;
 
@@ -414,7 +421,37 @@ pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
     //
     // 登记在最后：`hit_test` 取**后登记**的优先，这样歌词面板上浮出的右键菜单
     // 之类小区域不会被它盖住。范围只到 `lyric_area`，不会吃掉别的面板的点击。
-    state.add_hit_zone(lyric_area, HitTarget::LyricLine, offset, display.len());
+    //
+    // **只登记真正画出来的那些行**——这是「点歌词总是差好几行」的根治。
+    // `hit_zones` 的 row 是**屏幕行号**，`index_at` 先做 `row - rect.top()`；
+    // `Rect` 只能记一个 `top`，所以两个「上沿」不同的东西必然错位：
+    //
+    //   * `lyric_area` 这里是**内容区**（`block.inner(area)`，已扣掉边框）；
+    //     而它的来源 `render_lyric_panel` 会先被 `draw_cover_block` 让出一块
+    //     封面缩略图——内容区上沿比整块面板低 6~32 行。顶部的歌词行因此不是从
+    //     区域第一行开始排的，点击坐标必须跟着下移同样的行数。
+    //   * 歌词末尾滚动时 `offset` 被 `max_offset` 截断，`Paragraph` 的内容却从
+    //     区域第一行开始排——`skip(offset)` 与可视首行不再一一对应。
+    //   * 歌词只有一行时按区间折算出来的行数会大于真实内容，下方空白也成了可点区。
+    //
+    // 行数取「可视行」与「内容剩余行」的小者；上沿取内容区顶加**实际内边距**
+    // （`offset < first_display` 时内容整体下移的行数）。两处都从这一帧真正渲染的
+    // 布局反推，不以区域形状为假设——终端最大化 / 最小化改变的是这里，改错了
+    // 就是「换个窗口大小偏移量还变」。
+    //
+    // 注意 `lyric_area` 已经是内容区（边框已扣）：上沿**不能再减边框**，
+    // 否则整块命中区上移一行，点第 N 行会落到第 N-1 行——2026-09-29 的 pty
+    // 逐行对照实验（点击 8 行、8 行全部偏一句）钉的就是这一处。
+    let pad = offset.saturating_sub(first_display);
+    let content_rows = viewport.saturating_sub(pad);
+    let rows = content_rows.min(display.len().saturating_sub(offset));
+    let top = lyric_area.y.saturating_add(pad as u16);
+    state.add_hit_zone(
+        Rect::new(lyric_area.x, top, lyric_area.width, rows as u16),
+        HitTarget::LyricLine,
+        offset,
+        display.len(),
+    );
 }
 
 /// 某个歌词行在**显示行**里的位置（译文/音译会让两者不再一一对应）。
@@ -1946,5 +1983,81 @@ mod tests {
 
         assert!(state.hit_test(5, ACTIVE_ROW).is_none(), "占位提示不该可点");
         assert!(state.lyric.display_line_index.is_empty());
+    }
+
+    /// 末屏（`offset` 已撞上 `max_offset`）点击必须落在**屏幕行下半段**。
+    ///
+    /// 这是「听后半首歌时点歌词总是跳到别的句」的直接回归：内容型对齐之后
+    /// `offset ≠ 可视首行`，老的「`rect.top()` = 面板上沿」会把整块命中区
+    /// 下移 `max_offset - offset`（这块区域里是 3 行），点屏幕第 k 行得到的是
+    /// 第 k − 3 行的歌词。
+    #[test]
+    fn late_song_clicks_do_not_shift_by_the_offset_gap() {
+        let theme = Theme::for_config(ThemeName::Default, false);
+        let mut state = AppState::new(crate::config::Config::default());
+        state.lyric.lyric = many_lines(15, 1_000);
+        // 最后一句：focus_display = 14，viewport = 7，max_offset = 8
+        state.lyric.active_line = Some(14);
+        state.position_ms = 1_300;
+
+        state.begin_frame();
+        render_lyric_into(&mut state, 40, 9, &theme);
+
+        let zone = state
+            .hit_test(5, ACTIVE_ROW)
+            .expect("歌词区应当登记了命中区");
+        assert_eq!(
+            zone.first_index, 8,
+            "末屏的 offset 停在 max_offset = 8（内容型对齐），不是 11"
+        );
+        // 屏幕最底那一行（区域 0..7 的第 6 行）显示的是第 14 句，也就是最后一句
+        let bottom = zone.rect.bottom() - 1;
+        let display = zone.index_at(bottom).expect("最底一行仍在命中区内");
+        assert_eq!(display, 14, "最底一行应当就是当前（最后）一句");
+        assert_eq!(
+            state.lyric.line_index_at_display(display),
+            Some(14),
+            "点最底一行要跳到第 14 句——错位时这里会得到第 11 句"
+        );
+        assert_eq!(
+            zone.rect.top(),
+            1,
+            "区域 y=0、边框 1 行 → 内容区从第 1 行起（`block.inner` 已扣边框）"
+        );
+        assert_eq!(zone.rect.bottom(), 8, "命中区覆盖可视的 7 行，不含底部边框");
+    }
+
+    /// 命中区的上沿必须锚在**内容区**：`render_lyric` 自己画边框，所以
+    /// 内容首行 = `area.y + 1`；命中区上沿必须正好是它，多一行少一行都会
+    /// 让「点第 N 行」落到隔壁句。
+    #[test]
+    fn hit_zone_top_anchors_to_the_first_content_row() {
+        let theme = Theme::for_config(ThemeName::Default, false);
+        let mut state = AppState::new(crate::config::Config::default());
+        state.lyric.lyric = many_lines(15, 1_000);
+        state.lyric.active_line = Some(7);
+        state.position_ms = 1_300;
+
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // 内容区上沿 26（外层已扣边框）
+        let content_top = 26u16;
+        let mut terminal = Terminal::new(TestBackend::new(60, 40)).expect("测试后端可用");
+        let mut zone_top = None;
+        terminal
+            .draw(|frame| {
+                render_lyric(frame, Rect::new(0, content_top, 40, 9), &mut state, &theme);
+                zone_top = state
+                    .hit_test(5, content_top + 4)
+                    .map(|zone| zone.rect.top());
+            })
+            .expect("绘制成功");
+
+        assert_eq!(
+            zone_top,
+            Some(content_top + 1),
+            "`render_lyric` 自己画边框：内容区上沿 = area.y + 1，命中区必须与之一致"
+        );
     }
 }

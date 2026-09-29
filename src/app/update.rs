@@ -922,6 +922,16 @@ impl App {
             Action::FocusNext => self.state.cycle_focus(true),
             Action::FocusPrev => self.state.cycle_focus(false),
 
+            // 首页 / 可视化没有可导航的列表，↑↓ 在这两页原本是空的——划给播放
+            // 控制：这两页正是「看着歌词 / 频谱听歌」的页面，切歌是最高频的操作。
+            // 有列表的页面（搜索 / 歌单 / 歌手 / 榜单 / 云端 / 队列 / 设置）↑↓
+            // 依旧是列表导航，抢走它等于抢走核心交互。
+            Action::MoveDown if matches!(self.state.tab, Tab::Home | Tab::Visualizer) => {
+                self.next_track(true);
+            }
+            Action::MoveUp if matches!(self.state.tab, Tab::Home | Tab::Visualizer) => {
+                self.previous_track();
+            }
             Action::MoveDown => self.move_selection(1),
             Action::MoveUp => self.move_selection(-1),
             Action::MoveTop => self.move_selection_edge(true),
