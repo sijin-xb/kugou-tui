@@ -116,6 +116,26 @@ git tag -a v0.5.0 -m "…" && git push origin v0.5.0
 > **只推 tag 的代价**：AUR 的 `PKGBUILD` / `.SRCINFO` 不会更新，`CHANGELOG.md` 也不会
 > 被校验。要同时发 AUR 就得跑 `scripts/release`，或者事后手动更新 `~/aur/kugou-tui`。
 
+### 当前状态：AUR 尚未上架，发版一律加 `--no-aur`
+
+AUR 上**还没有 `kugou-tui` 这个包**（`aur.archlinux.org/packages/kugou-tui` 返回 404），
+本地 `~/aur/kugou-tui` 也只是一份没有 `.git` 的草稿目录。因此：
+
+- 发版命令固定为 `./scripts/release --no-aur`；
+- 不加 `--no-aur` 会在前置检查里直接中止（脚本会检查 `$aur_dir/.git` 是否存在），
+  这是有意的——否则流程会先推 main、打 tag（**不可撤销**），再在第 9 步的
+  `git add` 上撞"不是 Git 仓库"，代价白付。
+
+要在 AUR 上架需要先做这几件外部动作（都不在这个仓库里）：
+
+1. 在 AUR 注册账号，把 `~/.ssh/aur.pub` 贴到 My Account → SSH Public Key；
+2. `git clone ssh://aur@aur.archlinux.org/kugou-tui.git`（首次由 AUR 建仓）；
+3. 把本地 `~/aur/kugou-tui` 的 `PKGBUILD` / `.SRCINFO` / `LICENSE` /
+   `kugou-api-package-lock.json` 放进那个仓库并推上去。
+
+做完之后把本文档的这一节删掉，并把 `docs/INSTALL.md` 的「路径二：AUR（计划中，
+尚未上架）」改成正常说明。
+
 **给已经发过的版本补资产**：`workflow_dispatch` 手动指定 tag 即可，例如 0.4.2 发布时
 这个工作流还不存在：
 
