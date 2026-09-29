@@ -1059,13 +1059,22 @@ fn classify_drain(stream: Option<&crate::audio::streaming::StreamingBuffer>) -> 
 /// 时是 EOF 还是阻塞等下载」。但 `Decoder<File>` 和 `Decoder<StreamingBuffer>`
 /// 是两个不同类型，没法放进同一个变量——统一装箱成 `Box<dyn Source>`（rodio 为
 /// `Box<dyn Source>` 实现了 Source，可以照样 append 给播放器）。
+///
+/// # 两个出口都必须过 [`downmix::to_stereo`]
+///
+/// 这不是可选的美化：酷狗存在**前两个声道不是这首歌**的多声道无损文件（实测
+/// 《东京不太热 (DJ Z新豪版)》的 `flac` 档是 4.0，歌在后两个声道里），而 rodio 在
+/// 把源归一化到立体声输出时是「只留每帧前 N 个样本、其余丢弃」。少了这一层，
+/// 用户听到的就是另一段音频——见 [`crate::audio::downmix`] 顶部的实测数据。
+///
+/// 单声道与立体声在这里是恒等变换（`downmix` 内部直接透传），所以不影响绝大多数歌。
 fn build_decoder(source: AudioSource) -> Result<Box<dyn Source<Item = f32> + Send>, String> {
     match source {
         AudioSource::File(path) => {
             let file = std::fs::File::open(&path)
                 .map_err(|error| format!("打开音频文件 {} 失败：{error}", path.display()))?;
             rodio::Decoder::try_from(file)
-                .map(|decoder| Box::new(decoder) as Box<dyn Source<Item = f32> + Send>)
+                .map(crate::audio::downmix::to_stereo)
                 .map_err(|error| {
                     format!(
                         "解码 {} 失败：{error}。该文件可能不是有效音频，或格式不受支持。",
@@ -1074,7 +1083,7 @@ fn build_decoder(source: AudioSource) -> Result<Box<dyn Source<Item = f32> + Sen
                 })
         }
         AudioSource::Stream(buffer) => rodio::Decoder::new(buffer)
-            .map(|decoder| Box::new(decoder) as Box<dyn Source<Item = f32> + Send>)
+            .map(crate::audio::downmix::to_stereo)
             .map_err(|error| {
                 format!("解码流失败：{error}。数据可能不是有效音频，或格式不受支持。")
             }),
@@ -1205,5 +1214,69 @@ mod tests {
         ] {
             assert!(!is_server_routed(driver), "{driver} 直连硬件，必须被过滤");
         }
+    }
+
+    /// 手写一个 4 声道 16 bit PCM 的 WAV。
+    ///
+    /// 测试要的是一份**真的能被解码器读进来**的多声道文件，而仓库里没有 FLAC 编码器，
+    /// 手写 WAV 头是唯一不引新依赖的办法（和 `audio/download.rs` 里手写假服务端同一个思路）。
+    fn write_four_channel_wav(path: &std::path::Path, frames: &[[i16; 4]]) {
+        let (channels, rate, bits): (u16, u32, u16) = (4, 8000, 16);
+        let block_align = channels * bits / 8;
+        let data_len = (frames.len() * block_align as usize) as u32;
+
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&rate.to_le_bytes());
+        bytes.extend_from_slice(&(rate * block_align as u32).to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&bits.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for frame in frames {
+            for sample in frame {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        std::fs::write(path, bytes).expect("写入测试 wav");
+    }
+
+    /// **守护测试**：`build_decoder` 交出去的源必须是 ≤2 声道。
+    ///
+    /// 少了 `downmix::to_stereo` 这一层，这里会拿到 4 声道，而 rodio 的
+    /// `ChannelCountConverter` 会把后两个声道直接丢掉——实测
+    /// 《东京不太热 (DJ Z新豪版)》的 `flac` 档正好是「歌在后两个声道」的 4.0 文件，
+    /// 丢掉的后果是用户听到的**不是这首歌**。谁把下混层拆掉，这条立刻失败。
+    ///
+    /// 数值也要对：4 声道 `[8192, -8192, 24576, -24576]` 下混后
+    /// L = (8192+24576)/2 = 16384 → 0.5，R = (−8192−24576)/2 = −16384 → −0.5。
+    #[test]
+    fn decoded_multichannel_files_are_downmixed_to_stereo() {
+        let path = std::env::temp_dir().join(format!(
+            "kugou-tui-downmix-guard-{}.wav",
+            std::process::id()
+        ));
+        let frames = [[8192i16, -8192, 24576, -24576]; 64];
+        write_four_channel_wav(&path, &frames);
+
+        let decoder = build_decoder(AudioSource::File(path.clone())).expect("解码 4 声道 wav");
+        assert_eq!(
+            decoder.channels().get(),
+            2,
+            "多声道文件必须先下混成立体声，否则 rodio 会丢掉后两个声道"
+        );
+
+        let out: Vec<f32> = decoder.take(2).collect();
+        assert_eq!(out.len(), 2, "应当能读出立体声帧");
+        assert!((out[0] - 0.5).abs() < 0.01, "L 声道算错了：{}", out[0]);
+        assert!((out[1] + 0.5).abs() < 0.01, "R 声道算错了：{}", out[1]);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

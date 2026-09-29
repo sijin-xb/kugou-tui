@@ -470,12 +470,23 @@ impl ApiClient {
                 }
             };
             if let Some(url) = extract_stream_url(&response) {
-                let degraded = q != quality && VIPER_QUALITIES.contains(&quality);
+                // 拿到直链不等于拿到了**用户要的那一档**：服务端会静默降级
+                // （请求 flac 回 mp3/128 kbps，`status` 仍是 1）。这里顺手核一次，
+                // 让界面能照实说，而不是标着 flac 放 128。
+                let (ext_name, bit_rate) = actual_audio_format(&response);
+                let mut notes = Vec::new();
+                if q != quality && VIPER_QUALITIES.contains(&quality) {
+                    notes.push(format!(
+                        "{quality} 不可用（需要蝰蛇 VIP），已降级到标准 {q}"
+                    ));
+                }
+                if let Some(note) = downgrade_note(quality, ext_name.as_deref(), bit_rate) {
+                    notes.push(note);
+                }
                 return Ok(StreamUrl {
                     url,
                     is_trial: false,
-                    reason: degraded
-                        .then(|| format!("{quality} 不可用（需要蝰蛇 VIP），已降级到标准 {q}")),
+                    reason: (!notes.is_empty()).then(|| notes.join("；")),
                 });
             }
             last_full = Some(response);
@@ -580,7 +591,7 @@ impl ApiClient {
                 return Self::fallback_candidates(song, quality);
             }
         };
-        let candidates = parse_quality_candidates(&response, quality);
+        let candidates = parse_quality_candidates(&response, quality, &song.hash);
         if candidates.is_empty() {
             // 服务端认这个 hash 但没给任何可用档位——多半是下架歌曲。
             // 换这一首歌的其它 hash 再试，别只咬着失效的那个。
@@ -769,65 +780,142 @@ struct QualityCandidate {
 /// 服务端响应（参见 MoeKoeMusic 的 `getQualityOptions`）：
 /// ```text
 /// data: [
-///   {hash, quality, level, relate_goods: [{...}, ...]},
+///   {hash, quality, level, album_audio_id, relate_goods: [{...}, ...]},
 ///   ...
 /// ]
 /// ```
 /// `level == 0` 表示没权限，跳过。每首歌可能有多个 variant（自己 + relate_goods），
 /// 每个 variant 是不同的 hash（同一首歌的 128 和 flac 完全是两个文件指纹）。
-fn parse_quality_candidates(response: &Value, requested: &str) -> Vec<QualityCandidate> {
-    // 先收集每个 quality 任意一个有权限的 variant（一首歌同 quality 的不同 variant
+///
+/// # 为什么要按 `album_audio_id` 分两遍
+///
+/// 请求时是把「主 hash + `audio_info` 里那几个 hash」逗号拼接一起发的
+/// （见 [`ApiClient::request_privilege_lite`]），响应因此可能是**多个 item**，
+/// 每个 item 自带一组 variant。把全部 item 的 variant 混进一张表（老写法）意味着
+/// **谁先出现谁赢**——而服务端并不保证 item 的顺序，一旦某个 hash 指向的是
+/// **另一个版本**（同曲不同版 / 翻唱 / 铃声），就可能挑到别的版本的文件。
+///
+/// 所以分两遍：
+///
+/// 1. **只认与主 item 同一个 `album_audio_id` 的 item**——那是同一首歌的不同档位；
+/// 2. 第 1 遍一个候选都没拿到时才放开到全部 item。这一路必须留着：
+///    「搜索给的 hash 已下架、歌在 `audio_info` 的另一个 hash 下」靠的就是它。
+///
+/// 两遍都空就返回空，由调用方退回 [`ApiClient::fallback_candidates`]。
+fn parse_quality_candidates(
+    response: &Value,
+    requested: &str,
+    primary_hash: &str,
+) -> Vec<QualityCandidate> {
+    let items = collect_privilege_items(response);
+
+    // 主 item = hash 与歌曲自己的 hash 相同的那个。服务端没回它（或压根没给 hash）
+    // 时用第一个——`album_audio_id` 缺失时两边都是空串，等于退回老行为。
+    let primary = items
+        .iter()
+        .find(|item| item.hash.eq_ignore_ascii_case(primary_hash))
+        .or_else(|| items.first())
+        .map(|item| item.album_audio_id.clone())
+        .unwrap_or_default();
+
+    let chosen = pick_by_quality(&items, Some(&primary), requested);
+    if chosen.is_empty() {
+        return pick_by_quality(&items, None, requested);
+    }
+    chosen
+}
+
+/// `data[]` 里的一个条目。
+struct PrivilegeItem {
+    /// 这个条目的主 hash。用来认出「哪个条目对应我们问的那首歌」。
+    hash: String,
+    album_audio_id: String,
+    /// 有权限的 variant：(quality, hash)。顺序保持服务端给的——先自己、后 relate_goods。
+    variants: Vec<(String, String)>,
+}
+
+/// 把 `/privilege/lite` 的响应切成条目。
+fn collect_privilege_items(response: &Value) -> Vec<PrivilegeItem> {
+    let mut items = Vec::new();
+    let Some(list) = response.get("data").and_then(Value::as_array) else {
+        return items;
+    };
+    for item in list {
+        let mut variants = Vec::new();
+        push_variant(&mut variants, item);
+        if let Some(related) = item.get("relate_goods").and_then(Value::as_array) {
+            for variant in related {
+                push_variant(&mut variants, variant);
+            }
+        }
+        items.push(PrivilegeItem {
+            hash: pick_string(item, &["hash"]).unwrap_or_default(),
+            album_audio_id: pick_string(item, &["album_audio_id", "audio_id"])
+                .or_else(|| {
+                    pick_i64(item, &["album_audio_id", "audio_id"]).map(|id| id.to_string())
+                })
+                .unwrap_or_default(),
+            variants,
+        });
+    }
+    items
+}
+
+/// 收下一个 variant（如果它有权限、档位认识、字段齐全）。
+fn push_variant(variants: &mut Vec<(String, String)>, variant: &Value) {
+    // level == 0 = 没权限（VIP 限制）。缺失也按有权限处理——
+    // 服务端有时会省略该字段，默认开放是合理的猜测。
+    if matches!(variant.get("level").and_then(Value::as_i64), Some(0)) {
+        return;
+    }
+    let Some(quality) = variant.get("quality").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(hash) = variant.get("hash").and_then(Value::as_str) else {
+        return;
+    };
+    if !PRIVILEGE_FALLBACK_CHAIN.contains(&quality) {
+        return;
+    }
+    variants.push((quality.to_string(), hash.to_string()));
+}
+
+/// 按 quality 归并条目里的 variant，再按降级链排序。
+///
+/// `only_album_audio_id` 为 `Some` 时只认该 `album_audio_id` 的条目；
+/// 为 `None` 时是「放开到全部」的第二遍。
+fn pick_by_quality(
+    items: &[PrivilegeItem],
+    only_album_audio_id: Option<&str>,
+    requested: &str,
+) -> Vec<QualityCandidate> {
+    // 每个 quality 取第一个有权限的 variant（同一首歌同 quality 的不同 variant
     // 都给同一个 hash，取第一个就行）。
-    //
-    // 顺带把服务端给的 `album_audio_id` 也捎上——它是"用户买的究竟是哪个版本"
-    // 的凭据，`/song/url` 认这个。实测同一首歌带上真实值就能拿到直链，
-    // 带搜索结果里那个 `MixSongID` 只能拿试听。
-    let mut available: std::collections::HashMap<&str, (&str, String)> =
+    let mut available: std::collections::HashMap<&str, (&str, &str)> =
         std::collections::HashMap::new();
-    if let Some(items) = response.get("data").and_then(Value::as_array) {
-        for item in items {
-            // 自己 + relate_goods 都是同一首歌的不同 variant
-            let mut variants: Vec<&Value> = vec![item];
-            if let Some(related) = item.get("relate_goods").and_then(Value::as_array) {
-                variants.extend(related.iter());
-            }
-            for variant in variants {
-                // level == 0 = 没权限（VIP 限制）。缺失也按有权限处理——
-                // 服务端有时会省略该字段，默认开放是合理的猜测。
-                let has_level = !matches!(variant.get("level").and_then(Value::as_i64), Some(0));
-                if !has_level {
-                    continue;
-                }
-                let Some(quality) = variant.get("quality").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(hash) = variant.get("hash").and_then(Value::as_str) else {
-                    continue;
-                };
-                if !PRIVILEGE_FALLBACK_CHAIN.contains(&quality) {
-                    continue;
-                }
-                let album_audio_id = pick_string(variant, &["album_audio_id", "audio_id"])
-                    .or_else(|| {
-                        pick_i64(variant, &["album_audio_id", "audio_id"]).map(|id| id.to_string())
-                    })
-                    .unwrap_or_default();
-                available.entry(quality).or_insert((hash, album_audio_id));
-            }
+    for item in items {
+        if let Some(only) = only_album_audio_id
+            && item.album_audio_id != only
+        {
+            continue;
+        }
+        for (quality, hash) in &item.variants {
+            available
+                .entry(quality.as_str())
+                .or_insert((hash.as_str(), item.album_audio_id.as_str()));
         }
     }
 
     // 按降级链顺序取每个 quality 对应的 variant
-    let chain = fallback_chain(requested);
-    chain
+    fallback_chain(requested)
         .into_iter()
         .filter_map(|quality| {
             available
                 .get(quality)
                 .map(|(hash, album_audio_id)| QualityCandidate {
                     hash: (*hash).to_string(),
-                    quality: (*quality).to_string(),
-                    album_audio_id: album_audio_id.clone(),
+                    quality: quality.to_string(),
+                    album_audio_id: (*album_audio_id).to_string(),
                 })
         })
         .collect()
@@ -1001,6 +1089,85 @@ fn pick_url(value: &Value, keys: &[&str]) -> Option<String> {
 fn is_http_url(text: &str) -> bool {
     let trimmed = text.trim();
     trimmed.starts_with("http://") || trimmed.starts_with("https://")
+}
+
+/// 服务端**实际**给的容器与码率。取不到就是 `None`。
+///
+/// 键在顶层（实测 `/song/url` 的 `extName` / `bitRate` 都平铺在最外层），
+/// 但也见过塞进 `data` 的布局，两层都读一次。
+fn actual_audio_format(root: &Value) -> (Option<String>, Option<i64>) {
+    let data = root.get("data").unwrap_or(root);
+    let ext_name = pick_string(root, &["extName", "extname"])
+        .or_else(|| pick_string(data, &["extName", "extname"]));
+    let bit_rate =
+        pick_i64(root, &["bitRate", "bitrate"]).or_else(|| pick_i64(data, &["bitRate", "bitrate"]));
+    (ext_name, bit_rate)
+}
+
+/// 用户请求的档位，粗排成 1/2/4。
+///
+/// **只用来判断「实际给的比要的低」**，不是精确映射。`flac` 与 `high` 同级：
+/// `/song/url` 只回 `extName` + `bitRate`，而实测同一首歌 `quality=flac` 给 16 bit
+/// flac、`quality=high` 给 24 bit flac，两者的 `extName` 都是 `flac`——分不出来就不猜。
+/// `super` 与蝰蛇系列在接口层没有可对照的容器/码率，一律返回 `None`（不参与比较）。
+fn requested_tier(requested: &str) -> Option<u8> {
+    match requested {
+        "128" => Some(1),
+        "320" => Some(2),
+        "flac" | "high" => Some(4),
+        _ => None,
+    }
+}
+
+/// 服务端实际给的档位。规则同 [`requested_tier`]。
+///
+/// mp3 必须**报了码率**才下结论：不报码率时 128 与 320 在响应里长得一样，
+/// 硬猜会把「320 正常返回」误报成降级。
+///
+/// `mp4` / `m4a` 按「有损」参与比较。这一条不是我们自己测到的，来源是参照实现：
+/// moekoemusic 专门挡了 `extName == 'mp4'`（命中就换下一档），说明服务端确实会在
+/// 无损请求上回 mp4。我们**不**放弃它（rodio 开着 mp4 特性，放得了 AAC），
+/// 但要如实报出来——用户设的是无损，拿到的不该是 AAC 还一声不响。
+fn actual_tier(ext_name: &str, bit_rate: Option<i64>) -> Option<u8> {
+    match ext_name {
+        "mp3" => bit_rate.map(|rate| if rate >= 280_000 { 2 } else { 1 }),
+        "flac" => Some(4),
+        "mp4" | "m4a" => Some(2),
+        _ => None,
+    }
+}
+
+/// 服务端实际给的音频是不是**比用户要的那档低**。是就给一句人话，否则 `None`。
+///
+/// # 为什么必须查这一下
+///
+/// `/song/url` 会**静默降级**，而且 `status` 仍然是 1。2026-09-29 实测
+/// 《东京不太热》原版（`hash=EC8FF9465087CFCFE71AB1F26347E9E6`，没有无损档）：
+///
+/// ```text
+/// GET /song/url?hash=EC8FF946…&quality=flac
+/// → status=1  extName=mp3  bitRate=128000  fileSize=3749296
+/// ```
+///
+/// 只看 `status` 的话，界面会一直标着「flac」，用户实际听的是 128 kbps——
+/// 而且永远查不出来。对照 moekoemusic：它至少挡了 `extName == 'mp4'`。
+fn downgrade_note(
+    requested: &str,
+    ext_name: Option<&str>,
+    bit_rate: Option<i64>,
+) -> Option<String> {
+    let want = requested_tier(requested)?;
+    let ext_name = ext_name?;
+    let got = actual_tier(ext_name, bit_rate)?;
+    if got >= want {
+        return None;
+    }
+    let kbps = bit_rate
+        .map(|rate| format!("{} kbps ", rate / 1000))
+        .unwrap_or_default();
+    Some(format!(
+        "音质已降级：请求 {requested}，服务端实际给了 {kbps}{ext_name}"
+    ))
 }
 
 #[cfg(test)]
@@ -1202,7 +1369,7 @@ mod tests {
                 },
             ],
         });
-        let candidates = parse_quality_candidates(&response, "flac");
+        let candidates = parse_quality_candidates(&response, "flac", "h_128");
         assert_eq!(
             candidates,
             vec![
@@ -1234,7 +1401,7 @@ mod tests {
                 ],
             }],
         });
-        let candidates = parse_quality_candidates(&response, "128");
+        let candidates = parse_quality_candidates(&response, "128", "h_128");
         assert_eq!(
             candidates,
             vec![QualityCandidate {
@@ -1257,7 +1424,7 @@ mod tests {
                 "relate_goods": [],
             }],
         });
-        let candidates = parse_quality_candidates(&response, "high_res_thing");
+        let candidates = parse_quality_candidates(&response, "high_res_thing", "h_128");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].quality, "128");
     }
@@ -1265,11 +1432,146 @@ mod tests {
     /// 响应里压根没 data，返回空列表——上层会回退到「原 hash + 用户选的音质」。
     #[test]
     fn privilege_candidates_returns_empty_for_unrecognized_response() {
-        let candidates = parse_quality_candidates(&json!({}), "flac");
+        let candidates = parse_quality_candidates(&json!({}), "flac", "");
         assert!(candidates.is_empty());
 
-        let candidates = parse_quality_candidates(&json!({"data": "garbage"}), "flac");
+        let candidates = parse_quality_candidates(&json!({"data": "garbage"}), "flac", "");
         assert!(candidates.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // 按 album_audio_id 分组：不许跨版本串味
+    //
+    // 请求里把主 hash 与 `audio_info` 那几个 hash 一起发，响应就是多个 item。
+    // 老写法把全部 item 的 variant 混进一张表、谁先出现谁赢，而**服务端不保证
+    // item 顺序**——某个 hash 一旦指向同曲的另一个版本（不同版 / 翻唱 / 铃声），
+    // 就可能挑到别的版本的文件。下面三条钉住新判据。
+    // ------------------------------------------------------------------
+
+    /// 主 hash 那一版没有无损档时，**不许**从别的版本那里借一个 flac 过来。
+    ///
+    /// 这条在修复前会失败：老代码 `available.entry(quality).or_insert(...)` 按
+    /// 出现顺序取第一个，`data[0]` 是另一个版本，于是返回了它的 `WRONG_FLAC`。
+    #[test]
+    fn candidates_never_borrow_a_quality_from_another_version() {
+        let response = json!({
+            "data": [
+                // 排在前面的是**另一个版本**（album_audio_id 不同）
+                {
+                    "hash": "ALT_128", "quality": "128", "level": 2, "album_audio_id": 9,
+                    "relate_goods": [
+                        {"hash": "WRONG_FLAC", "quality": "flac", "level": 5, "album_audio_id": 9}
+                    ]
+                },
+                // 我们要的那一版：只有 128，没有无损
+                {
+                    "hash": "MAIN_128", "quality": "128", "level": 2, "album_audio_id": 7,
+                    "relate_goods": []
+                }
+            ]
+        });
+        let candidates = parse_quality_candidates(&response, "flac", "MAIN_128");
+        assert_eq!(
+            candidates,
+            vec![QualityCandidate {
+                hash: "MAIN_128".to_string(),
+                quality: "128".to_string(),
+                album_audio_id: "7".to_string(),
+            }],
+            "只允许在本版本内降级，不能跨版本借用别的文件"
+        );
+    }
+
+    /// item 顺序颠倒也不能改变结果——判据认的是 hash，不是位置。
+    #[test]
+    fn candidates_identify_the_primary_item_by_hash_not_by_position() {
+        let response = json!({
+            "data": [
+                {
+                    "hash": "ALT_128", "quality": "128", "level": 2, "album_audio_id": 9,
+                    "relate_goods": [
+                        {"hash": "WRONG_FLAC", "quality": "flac", "level": 5, "album_audio_id": 9}
+                    ]
+                },
+                {
+                    "hash": "MAIN_128", "quality": "128", "level": 2, "album_audio_id": 7,
+                    "relate_goods": [
+                        {"hash": "RIGHT_FLAC", "quality": "flac", "level": 5, "album_audio_id": 7}
+                    ]
+                }
+            ]
+        });
+        let candidates = parse_quality_candidates(&response, "flac", "MAIN_128");
+        assert_eq!(
+            candidates,
+            vec![
+                QualityCandidate {
+                    hash: "RIGHT_FLAC".to_string(),
+                    quality: "flac".to_string(),
+                    album_audio_id: "7".to_string(),
+                },
+                // 降级链接着往下是 320、128；这一版只有 128
+                QualityCandidate {
+                    hash: "MAIN_128".to_string(),
+                    quality: "128".to_string(),
+                    album_audio_id: "7".to_string(),
+                },
+            ],
+            "必须按 hash 认出主 item；整个候选列表都得来自同一个版本"
+        );
+    }
+
+    /// 主 hash 那一版**一个可用档位都没有**（下架）时，仍要放开到别的 item 兜底。
+    ///
+    /// 这是「搜索给的 hash 已下架、歌在 `audio_info` 的另一个 hash 下」那条修复路径，
+    /// 分组不能把它堵死。
+    #[test]
+    fn candidates_fall_back_to_other_hashes_when_the_primary_has_nothing() {
+        let response = json!({
+            "data": [
+                // 主 hash：服务端认得，但每一档都没权限（下架 / 无版权）
+                {
+                    "hash": "MAIN_128", "quality": "128", "level": 0, "album_audio_id": 7,
+                    "relate_goods": [
+                        {"hash": "MAIN_FLAC", "quality": "flac", "level": 0, "album_audio_id": 7}
+                    ]
+                },
+                // audio_info 里的另一个 hash：还能听
+                {
+                    "hash": "ALT_128", "quality": "128", "level": 2, "album_audio_id": 9,
+                    "relate_goods": []
+                }
+            ]
+        });
+        let candidates = parse_quality_candidates(&response, "128", "MAIN_128");
+        assert_eq!(
+            candidates,
+            vec![QualityCandidate {
+                hash: "ALT_128".to_string(),
+                quality: "128".to_string(),
+                album_audio_id: "9".to_string(),
+            }],
+            "主 hash 全无权限时必须放开到别的 item，否则下架歌曲又听不了了"
+        );
+    }
+
+    /// 认不出主 item（服务端没给 hash / 我们手上没有）时退回第一个条目，
+    /// 也就是老行为——不能因此变成空列表。
+    #[test]
+    fn candidates_fall_back_to_the_first_item_when_the_primary_is_unknown() {
+        let response = json!({
+            "data": [
+                {
+                    "quality": "128", "level": 2, "album_audio_id": 7,
+                    "relate_goods": [
+                        {"hash": "FLAC_A", "quality": "flac", "level": 5, "album_audio_id": 7}
+                    ]
+                }
+            ]
+        });
+        let candidates = parse_quality_candidates(&response, "flac", "没人知道的 hash");
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].hash, "FLAC_A");
     }
 
     /// 下架歌曲的修复点：/privilege/lite 查不到时，不能只抱着失效的主 hash，
@@ -1352,7 +1654,7 @@ mod tests {
                 "relate_goods": [],
             }]
         });
-        let candidates = parse_quality_candidates(&response, "128");
+        let candidates = parse_quality_candidates(&response, "128", "h_128");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].album_audio_id, "330978610");
 
@@ -1472,5 +1774,185 @@ mod tests {
         });
         let names: Vec<String> = collect_artists(&root).into_iter().map(|a| a.name).collect();
         assert_eq!(names, vec!["周杰伦", "薛之谦"]);
+    }
+
+    // ------------------------------------------------------------------
+    // 静默降级
+    // ------------------------------------------------------------------
+
+    /// 真实响应：请求 flac，服务端给 128 kbps mp3 且 `status=1`。
+    ///
+    /// 这条是 2026-09-29 在概念版服务上实测到的原样数据（《东京不太热》原版，
+    /// `hash=EC8FF9465087CFCFE71AB1F26347E9E6`，该曲没有无损档）。
+    #[test]
+    fn flac_request_answered_with_mp3_is_reported_as_a_downgrade() {
+        let root = json!({
+            "status": 1,
+            "extName": "mp3",
+            "bitRate": 128000,
+            "fileSize": 3749296,
+            "url": ["http://example.invalid/a.mp3"]
+        });
+        let (ext, rate) = actual_audio_format(&root);
+        assert_eq!(ext.as_deref(), Some("mp3"));
+        assert_eq!(rate, Some(128000));
+
+        let note = downgrade_note("flac", ext.as_deref(), rate).expect("应当报出降级");
+        assert!(note.contains("flac"), "要说清请求的是哪档：{note}");
+        assert!(note.contains("128 kbps"), "要说清实际给了什么：{note}");
+        assert!(note.contains("mp3"), "要说清实际容器：{note}");
+    }
+
+    /// 320 请求回了 128 kbps mp3 —— 同样是降级。
+    #[test]
+    fn a_lower_mp3_bitrate_counts_as_a_downgrade() {
+        let note = downgrade_note("320", Some("mp3"), Some(128_000)).expect("应当报出降级");
+        assert!(note.contains("128 kbps"), "{note}");
+    }
+
+    /// 正常返回不能误报。这是这条判据最容易出错的方向：报错了用户会以为播放器坏了。
+    #[test]
+    fn matching_quality_is_not_reported() {
+        // 请求什么拿到什么
+        assert_eq!(downgrade_note("128", Some("mp3"), Some(128_000)), None);
+        assert_eq!(downgrade_note("320", Some("mp3"), Some(320_000)), None);
+        assert_eq!(downgrade_note("flac", Some("flac"), Some(1_389_000)), None);
+        assert_eq!(downgrade_note("high", Some("flac"), Some(1_442_000)), None);
+        // 比要的更高不算降级
+        assert_eq!(downgrade_note("128", Some("flac"), Some(1_389_000)), None);
+        assert_eq!(downgrade_note("320", Some("flac"), Some(1_389_000)), None);
+    }
+
+    /// 判据不参与比较的档位要一律返回 `None`，不能猜。
+    ///
+    /// `super` / 蝰蛇系列在接口层没有可对照的容器与码率；mp3 不报码率时分不清
+    /// 128 与 320；没见过的容器（这里用 wav 举例）也不下结论。
+    /// 这几种情况都必须**什么都不说**。
+    #[test]
+    fn unknown_tiers_are_never_guessed() {
+        assert_eq!(downgrade_note("super", Some("mp3"), Some(128_000)), None);
+        assert_eq!(
+            downgrade_note("viper_clear", Some("mp3"), Some(128_000)),
+            None
+        );
+        assert_eq!(
+            downgrade_note("320", Some("mp3"), None),
+            None,
+            "没报码率就别下结论"
+        );
+        assert_eq!(
+            downgrade_note("flac", None, Some(128_000)),
+            None,
+            "没有容器就别下结论"
+        );
+        assert_eq!(downgrade_note("flac", Some("wav"), Some(1_400_000)), None);
+    }
+
+    /// 无损请求回了 mp4（AAC）——要报出来。
+    ///
+    /// 参照实现 moekoemusic 专门挡这一种（命中就换下一档），说明服务端确实会这么回。
+    /// 我们不放弃它（rodio 放得了 AAC），但用户设的是无损，不能一声不响地降成有损。
+    #[test]
+    fn lossless_request_answered_with_mp4_is_reported() {
+        let note = downgrade_note("flac", Some("mp4"), Some(256_000)).expect("应当报出降级");
+        assert!(note.contains("mp4"), "{note}");
+        // 请求有损档时拿到 AAC 不算降级
+        assert_eq!(downgrade_note("320", Some("mp4"), Some(256_000)), None);
+        assert_eq!(downgrade_note("128", Some("m4a"), Some(128_000)), None);
+    }
+
+    /// 格式字段塞在 `data` 里的布局也要认。
+    #[test]
+    fn actual_audio_format_reads_the_nested_layout_too() {
+        let root = json!({ "status": 1, "data": { "extName": "flac", "bitRate": 1389000 } });
+        let (ext, rate) = actual_audio_format(&root);
+        assert_eq!(ext.as_deref(), Some("flac"));
+        assert_eq!(rate, Some(1389000));
+    }
+
+    /// 起一个「privilege/lite 说有 flac 档，song/url 却回 128 kbps mp3」的服务端。
+    ///
+    /// 手写 TcpListener，和上面翻页那条、以及 `audio::download` 那组同一个路子，不引新依赖。
+    fn spawn_downgrading_server() -> String {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+        let addr = listener.local_addr().expect("取本地地址");
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().expect("克隆流"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if header.trim().is_empty() => break,
+                        Ok(_) => {}
+                    }
+                }
+
+                let body = if request_line.contains("/privilege/lite") {
+                    // 账号有 flac 档，hash 是 BBBB
+                    json!({
+                        "status": 1,
+                        "data": [{
+                            "hash": "AAAA", "quality": "128", "level": 2, "album_audio_id": 7,
+                            "relate_goods": [
+                                {"hash": "BBBB", "quality": "flac", "level": 5, "album_audio_id": 7}
+                            ]
+                        }]
+                    })
+                } else {
+                    // 真拿到 flac 的话 extName 应当是 flac；这里回 mp3 + 128 kbps 就是降级
+                    json!({
+                        "status": 1,
+                        "extName": "mp3",
+                        "bitRate": 128000,
+                        "fileSize": 3749296,
+                        "url": ["http://example.invalid/downgraded.mp3"]
+                    })
+                };
+                let payload = body.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// **端到端**：服务端静默降级时，`song_stream_url` 必须把这件事带出来。
+    ///
+    /// 上面几条测的是判据本身；这条测的是**判据真的接在取链路径上**——去掉
+    /// `song_stream_url` 里那次 `downgrade_note` 调用，这条会失败。
+    #[tokio::test]
+    async fn song_stream_url_reports_a_silent_downgrade() {
+        let base = spawn_downgrading_server();
+        let client = ApiClient::new(&base, None, None).expect("构造客户端");
+        let song = Song {
+            hash: "AAAA".to_string(),
+            name: "测试曲".to_string(),
+            ..Default::default()
+        };
+
+        let stream = client
+            .song_stream_url(&song, "flac")
+            .await
+            .expect("应当拿到直链");
+        assert!(!stream.is_trial, "这是完整版，不是试听片段");
+        let reason = stream.reason.expect("降级必须带出原因，不能静默");
+        assert!(reason.contains("flac"), "要说清请求的是哪档：{reason}");
+        assert!(reason.contains("128 kbps"), "要说清实际给了什么：{reason}");
     }
 }

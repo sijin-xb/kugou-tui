@@ -519,6 +519,22 @@ let position_ms = self.last_position_ms;   // 上一帧还在播时的值
     另外，身份字段要**在 `spawn` 之前**写进状态（`open_playlist` / `open_artist` /
     `open_board` 都是这么做的）——写在结果里就晚了，那条结果永远对不上。
 
+改 `audio/downmix.rs`（多声道下混）之前，这条也要守住：
+
+12. **多声道文件必须先下混，再交给 rodio。** rodio 的 `ChannelCountConverter`
+    在降声道时是「保留每帧前 N 个样本、其余直接丢弃」（`conversions/channels.rs`，
+    单测 `remove_channels` 里 4→1 得到 `[1.0, 5.0]`）。而酷狗**存在多声道无损文件**，
+    且可能是「前两个声道不是这首歌」的那种：实测《东京不太热 (DJ Z新豪版)》的 `flac`
+    档是 4.0，歌在后两个声道里（前两个电平低 6–10 dB、与正确混音相关性仅 +0.35）。
+    少了这一层，用户听到的不是这首歌，表现成「音频版本和其他客户端不一致」。
+    判据与实测数据在 `downmix` 模块顶部；`build_decoder` 的两个出口都必须过
+    `downmix::to_stereo`。两条守护测试会在拆掉这层时失败：
+    `decoded_multichannel_files_are_downmixed_to_stereo`（自造 4 声道 WAV 走
+    `build_decoder`，断言 `channels() <= 2`）与
+    `the_mixer_hears_the_song_only_because_we_downmixed_first`（用
+    `rodio::mixer::mixer` 搭不依赖声卡的 mixer，对照证明「直接进 mixer 只剩前两个声道、
+    先下混再进才对」——钉的正是 bug 发生的那一层）。
+
 ---
 
 ## 5. 常见陷阱清单
@@ -534,6 +550,15 @@ let position_ms = self.last_position_ms;   // 上一帧还在播时的值
   而播放本身完全正常（极难察觉）。
 - 队列里只有一首 + 单曲循环/列表循环时，"播完"和"从头再播"看起来一样；
   调试时容易把 bug 当成特性。
+- **多声道文件在 rodio 里会被「丢声道」。** 降声道只保留每帧前 N 个样本、其余丢弃
+  （`conversions/channels.rs`）。酷狗有多声道无损文件，而且可能是「歌在后两个声道」的
+  那种（见 §4 第 12 条）。`build_decoder` 现在统一过 `downmix::to_stereo`，
+  别把那层去掉。诊断手法：`ffprobe` 看 `channels`，再逐声道算与正确混音的相关性。
+- **`/song/url` 会静默降级，且 `status` 仍是 1。** 实测请求 `quality=flac` 对没有无损档的
+  歌会回 `extName=mp3` + `bitRate=128000`。只判 `status` 的话界面会一直标着 flac、
+  实际放 128 kbps。判据在 `catalog::downgrade_note`（按容器 + 码率粗排，`super` 与
+  蝰蛇系列不参与比较），原因经 `StreamUrl::reason` 透到界面——注意
+  `handle_loaded` 里 `reason` 的**两个分支都要看**，只处理试听那支会把降级提示吞掉。
 
 **下载/缓存**
 

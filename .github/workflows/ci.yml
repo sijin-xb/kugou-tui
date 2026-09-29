@@ -82,6 +82,34 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      # 发行包也在**这里**打一遍，不等到打 tag。
+      #
+      # # 为什么必须提前
+      #
+      # 发行包此前只在 `release.yml` 里产出，而那是 tag 推上去之后——tag 不可撤销，
+      # 打包脚本要是漏了文件，只能发一个坏包或者认了。**这个项目真踩过**：
+      # 0.3.7 那版漏了三个脚本，非 Arch 用户解压后配不起接口服务。
+      # 那种错误在推 tag 之前发现，代价是零。
+      #
+      # # 为什么 macOS 那边也要跑
+      #
+      # `make-release-tarball` 是 bash 脚本，macOS 上用的是 BSD 的 `readlink` 与
+      # `shasum`（GNU 的 `readlink -f`、`sha256sum` 那边都不存在）。只在 Linux 上跑
+      # 等于只验证了一半——正是这个仓库花力气抹平的那类平台差异。
+      #
+      # Windows 那一栏本来就跑 `build-windows.ps1`（打包它自己那份 zip），
+      # 这里补上的是 Linux / macOS 的对称物。
+      - name: 打发行包（提前验证打包脚本）
+        run: ./scripts/make-release-tarball
+
+      - name: 上传发行包
+        uses: actions/upload-artifact@v4
+        with:
+          name: kugou-tui-linux-tarball
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
   windows:
     name: Windows
     runs-on: windows-latest
@@ -144,5 +172,20 @@ jobs:
         with:
           name: kugou-tui-macos-arm64
           path: target/release/kugou-tui
+          if-no-files-found: error
+          retention-days: 14
+
+      # 发行包提前打一遍，理由见 Linux 那一栏的注释：`release.yml` 里那份是 tag
+      # 推出去之后才跑的，而打包脚本漏文件是这个项目真实踩过的坑。
+      # 这一栏尤其不能省——`make-release-tarball` 里为 BSD 工具（`readlink`、
+      # `shasum`）写的那几段分支，只有在 macOS 上才会被执行到。
+      - name: 打发行包（提前验证打包脚本）
+        run: ./scripts/make-release-tarball
+
+      - name: 上传发行包
+        uses: actions/upload-artifact@v4
+        with:
+          name: kugou-tui-macos-tarball
+          path: dist/*.tar.gz
           if-no-files-found: error
           retention-days: 14

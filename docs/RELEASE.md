@@ -77,6 +77,18 @@ macOS 的二进制要 Apple SDK。
 > 机器上跑不了。要补的话得在同一个 runner 上 `--target x86_64-apple-darwin` 交叉编一份
 > ——那是另一个包名（`x86_64-apple-darwin`），加一个 job 即可，目前没做。
 
+### 打包脚本在普通 CI 里也跑一遍
+
+`release.yml` 是 tag 推出去之后才跑的，而 **tag 不可撤销**——打包脚本要是漏了文件，
+那时只能发一个坏包或者认了。这个项目真踩过：0.3.7 那版发行包里漏了三个脚本，
+非 Arch 用户解压后配不起接口服务。
+
+所以 `ci.yml` 里 Linux 与 macOS 两栏**也各跑一次 `make-release-tarball`** 并把
+`dist/*.tar.gz` 传成 artifact：任何一次 push 都能提前发现打包脚本的问题，
+顺带让「任意一次 push 都有可下载的发行版」。macOS 那一栏尤其不能省——
+脚本里为 BSD 工具（`readlink`、`shasum`）写的分支只有在那边才会被执行到。
+Windows 那一栏本来就在跑 `build-windows.ps1`，三平台因此对称。
+
 时序上有个坑：本地 `scripts/release` 的顺序是「推 tag → 建 Release」，而 tag 一推 CI 就
 起来了——**上传前必须等 Release 出现**。这件事连同幂等（`--clobber`）都收在
 `scripts/upload-release-asset` 里，三个平台共用同一个脚本（Windows runner 上的

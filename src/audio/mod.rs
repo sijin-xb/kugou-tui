@@ -1,12 +1,13 @@
 //! 音频子系统。
 //!
-//! 三个模块各管一件事：
+//! 几个模块各管一件事：
 //!
 //! * [`cache`] —— 磁盘缓存与容量回收，决定「文件放在哪、满了删谁」；
 //! * [`download`] —— 把直链下载成缓存文件，决定「怎么拿数据」；
+//! * [`downmix`] —— 多声道 → 立体声下混，决定「多声道文件怎么出声」；
 //! * [`engine`] —— 独占音频线程的播放引擎，决定「怎么出声」。
 //!
-//! 三者之间没有直接依赖：主线程负责编排
+//! 它们之间没有直接依赖：主线程负责编排
 //!
 //! ```text
 //! song_stream_url()  ──▶  cache.find(key)  命中 ──▶ engine.load(path)
@@ -24,6 +25,7 @@
 
 pub mod cache;
 pub mod download;
+pub mod downmix;
 pub mod engine;
 pub mod levels;
 pub mod spectrum;

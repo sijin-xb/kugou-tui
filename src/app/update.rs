@@ -1906,6 +1906,13 @@ impl App {
                         .unwrap_or_else(|| "（完整版需要对应会员）".to_string());
                     self.state
                         .warn(format!("《{}》只有试听片段{why}", song.name));
+                } else if let Some(why) = reason {
+                    // 完整版拿到了，但**档位可能不是用户设的那一档**：`/song/url`
+                    // 会静默降级（请求 flac 回 128 kbps mp3，`status` 仍是 1），
+                    // 蝰蛇音质没权限时也会降到标准档。以前这条 `reason` 只在试听
+                    // 分支被读，于是两种降级都无声无息地过去了——界面标着 flac，
+                    // 耳朵听的是 128，而且永远查不出来。
+                    self.state.info(format!("《{}》{why}", song.name));
                 }
                 // 片段落到独立的缓存键，避免把完整版的位置占住
                 self.start_download(*song, url, start_at_ms, is_trial);

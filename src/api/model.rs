@@ -442,9 +442,14 @@ pub fn song_from_json(value: &Value) -> Option<Song> {
 
     // `album_audio_id`：沿用原来「MixSongID 系」的候选键。
     //
-    // 注意候选键里**刻意不放** `audio_id` ——它在歌单接口里才是正确值，
-    // 而搜索接口里 `MixSongID` 才是。混在同一个字段里必然有一半接口取错，
-    // 所以拆成两个字段分别存，取链接时挨个试。
+    // 候选键里**刻意不放** `audio_id`——它在歌单接口里才是正确值，而搜索接口里
+    // `MixSongID` 才是；混进同一个字段必然有一半接口取错。
+    //
+    // 那要不要像歌单接口那样把 `audio_id` 也单独存一份、取链接时挨个试？
+    // **不用**，因为 `/song/url` 现在刻意一个 album 系 id 都不发
+    // （理由写在 `ApiClient::request_song_url_with_hash` 的文档里：实测四种参数
+    // 组合都能拿到直链，而带错 id 会让服务端回 `status=3`）。
+    // 字段存下来却没人读，就是一份会过期、还会误导人的注释——所以只留这一个。
     let album_audio_id = pick_i64(
         value,
         &[
@@ -456,9 +461,6 @@ pub fn song_from_json(value: &Value) -> Option<Song> {
         ],
     )
     .unwrap_or_default();
-
-    // `audio_id`：歌单接口（`/playlist/track/all/new`）给的另一个标识。
-    // 实测对下架歌曲它是唯一能拿到直链的那个。
 
     // 封面可能在顶层、在 `trans_param` 里，也可能在 `album_info` / `albuminfo` 里
     let cover = pick_string(value, &["Image", "img", "cover", "album_image"])

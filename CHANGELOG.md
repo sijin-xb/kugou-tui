@@ -4,6 +4,84 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 修复
+
+- **多声道无损文件只播了前两个声道，听到的不是这首歌**（新增 `audio/downmix.rs`，
+  接线在 `audio/engine.rs::build_decoder`）。触发场景：播《东京不太热 (DJ Z新豪版)》
+  （`hash=1953202D07B954E785CA5249E1A64B3C`）时，`flac` 档给的是一个 **4.0 声道**的
+  FLAC，而那个文件里**歌在后两个声道**：
+
+  | 声道 | dBFS | 与同曲 128 kbps mp3 的相关性 |
+  |---|---|---|
+  | ch0 FL | −21.0 | +0.35 |
+  | ch1 FR | −20.6 | +0.39 |
+  | ch2 BL | −11.7 | **+0.90** |
+  | ch3 BR | −12.8 | **+0.89** |
+
+  四路全混与 mp3 的相关性是 +0.999——也就是说前两个声道根本不是这首歌。而 rodio 0.22
+  的 `ChannelCountConverter` 降声道时是「保留每帧前 N 个样本、其余直接丢弃」
+  （`conversions/channels.rs`），于是我们实际只播了 FL/FR，用户听到的是另一段音频，
+  表现成「音频版本和其他客户端（moekoemusic）不一致」。
+
+  现在 `build_decoder` 的两个出口统一过 `downmix::to_stereo`：偶数索引声道 → L、
+  奇数索引声道 → R 取平均，`channels()` 恒为 2（这样 rodio 侧那次转换就成了空操作）。
+  单声道/立体声是恒等变换，不影响绝大多数歌。**实测**（走 `build_decoder` 的真实解码
+  路径、素材是酷狗给的原始文件）：下混结果与正确立体声混音的相关系数从 +0.35 升到
+  **+0.998 / +0.997**。两条守护测试：`decoded_multichannel_files_are_downmixed_to_stereo`
+  用自造的 4 声道 WAV 走一遍 `build_decoder` 并断言 `channels() <= 2`；
+  `the_mixer_hears_the_song_only_because_we_downmixed_first` 用 `rodio::mixer::mixer`
+  搭一个不依赖声卡的 mixer，**对照**证明「源直接进 mixer 会只剩前两个声道」、
+  「先下混再进则听到的是正确混音」——它钉的正是 bug 发生的那一层。两条都是
+  把那层拆掉就立刻失败。
+
+  **取平均而不是求和**：求和更贴近这个文件的立体声母版（mp3 的 L ≈ `FL+BL`），
+  但只要两个声道相关就会削顶；平均天然安全（`|out| <= max|in|`）。代价是这一对
+  声道互不相关（+0.03）而母版是它们的和，所以下混后整体比参照低约 **6 dB**。
+  音量用户可调，削顶是实打实的失真——取轻的那一头。详见 `downmix` 模块顶部。
+
+  顺带修掉同根因的另一处：`LevelMeter` 只采第 0 声道做电平/频谱，4 声道输入时
+  **频谱可视化画的也是错的音频**；下混层放在它前面之后自动跟着对。
+
+- **`/song/url` 的静默降级没人管**（`api/catalog.rs::downgrade_note`）。实测请求
+  `quality=flac` 对没有无损档的歌会回 `status=1` + `extName=mp3` + `bitRate=128000`
+  （3,749,296 B），而 `extract_stream_url` 只检查 `status`——界面会一直标着 flac、
+  实际放 128 kbps，且永远查不出来。现在按「容器 + 码率」粗排一次档位，实际比要的低时
+  给出人话（`音质已降级：请求 flac，服务端实际给了 128 kbps mp3`），经
+  `StreamUrl::reason` 透到界面。`super` 与蝰蛇系列不参与比较（接口层没有可对照的
+  容器/码率），mp3 不报码率时也不下结论——宁可不说，也不能误报；`mp4` / `m4a`（AAC）
+  按「有损」参与比较，所以「设了无损却拿到 AAC」也会报出来（这一条的依据是参照实现
+  moekoemusic 专门挡 `extName == 'mp4'`，不是我们自己实测到的）。
+  回归测试 `song_stream_url_reports_a_silent_downgrade` 用手写服务端端到端跑一遍。
+
+- **降级提示此前会被整个吞掉**（`app/update.rs`）。`StreamUrl::reason` 只在 `is_trial`
+  分支被读，于是「蝰蛇音质没权限、已降到标准档」这条提示从来没显示过。现在非试听分支
+  也会把它作为普通提示报出来。
+
+- **候选音质可能跨版本串味**（`api/catalog.rs::parse_quality_candidates`）。取链时会把手上的
+  多个 hash 逗号拼接一起发给 `/privilege/lite`，响应因此是**多个 item**；老写法把全部 item
+  的 variant 混进一张表、谁先出现谁赢，而服务端并不保证 item 顺序——某个 hash 一旦指向同曲的
+  **另一个版本**（不同版 / 翻唱 / 铃声），就可能挑到别的版本的文件。现在分两遍：先只认与主 item
+  （按 `hash` 认出）同一个 `album_audio_id` 的条目，拿不到才放开到全部——第二遍必须留着，
+  那是「搜索给的 hash 已下架、歌在 `audio_info` 的另一个 hash 下」那条修复路径。
+  回归测试三条：`candidates_never_borrow_a_quality_from_another_version`、
+  `candidates_identify_the_primary_item_by_hash_not_by_position`、
+  `candidates_fall_back_to_other_hashes_when_the_primary_has_nothing`。
+
+### 变更
+
+- **打包脚本在普通 CI 里也跑一遍**（`ci.yml` 的 Linux 与 macOS 两栏）。发行包此前只在
+  `release.yml` 里产出，而那是 tag 推出去之后——**tag 不可撤销**，打包脚本要是漏了文件，
+  只能发一个坏包或者认了。这个项目真踩过：0.3.7 那版漏了三个脚本，非 Arch 用户解压后
+  配不起接口服务。现在任意一次 push 都会打一次发行包并传成 artifact，问题在推 tag 之前
+  就暴露；macOS 那一栏顺带覆盖 `make-release-tarball` 里为 BSD 工具（`readlink`、
+  `shasum`）写的分支——那几段只有在那边才会被执行到。
+
+- `api/model.rs` 里「`audio_id` 拆成两个字段分别存，取链接时挨个试」那段注释与实现不符
+  （只有一个字段，且 `/song/url` 刻意不发送任何 album 系 id）。改成如实描述，
+  免得下一个人照着注释去找一段不存在的重试逻辑。
+
 ## [0.4.4] - 2026-09-28
 
 ### 变更
