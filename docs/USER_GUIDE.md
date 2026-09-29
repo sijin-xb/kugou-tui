@@ -295,8 +295,14 @@ playerctl -p kugou-tui position 90   # 拖进度条（走 SetPosition）
 除了 MPRIS，启动时会再注册一个 `org.kde.StatusNotifierItem` 托盘项。状态栏
 （Quickshell / waybar / KDE 等）会显示一个音符图标：
 
-- **右键** → 弹出菜单：播放 / 暂停、上一首、下一首、最小化 / 显示窗口（仅 niri）
+- **左键** → 无动作（刻意保留）
+- **滚轮** → 垂直调音量、水平快进 / 快退
+- **右键** → 弹出菜单：播放 / 暂停（措辞跟着状态切，播放中显示「暂停」）、
+  上一首、下一首、静音 / 取消静音、最小化 / 显示窗口（仅 niri）、退出
+- **中键**（KDE）或部分宿主的右键 → 播放 / 暂停
 - **鼠标悬停** → 显示当前曲目
+- **图标** → 播放 / 加载时是亮色音符，暂停 / 停止时同一张图整体变暗——
+  「还在不在放」不用点开就知道
 - 播放中状态为 `Active`、暂停时为 `Passive`，部分宿主的显示会跟着变
 
 菜单走 `com.canonical.dbusmenu`（`Menu` 属性指向 `/StatusNotifierItem/menu`）。
@@ -317,12 +323,12 @@ playerctl -p kugou-tui position 90   # 拖进度条（走 SetPosition）
 - 如果你用别的方式改掉了终端标题（比如某些 shell 的标题模板），这项会失效
   ——日志里会记一句「窗口列表里没有标题含 kugou-tui 的窗口」
 
-图标内嵌在程序里（源 `assets/tray.svg`），不依赖系统图标主题。下面三种情况
-会自动跳过，各只记一行日志、播放不受影响：没有图形会话（纯 tty、SSH 未转发）、
-没有 session bus、状态栏没有提供 `org.kde.StatusNotifierWatcher`。
+图标内嵌在程序里（源 `assets/tray.svg`），不依赖系统图标主题。没有图形会话
+（纯 tty、SSH 未转发）或没有 session bus 时自动跳过，各只记一行日志、播放不受
+影响。**状态栏比播放器后启动也不要紧**：托盘线程每 5 秒对一次 watcher 的注册
+列表，发现面板起来了会自动补注册——图标会在这时出现，不用重启 kugou-tui。
 
-不想要托盘就加 `--no-tray`，或在配置文件里设 `tray = false`——**重启生效**，
-KDE 风格的 watcher 只在进程启动 / 退出时同步托盘项。
+不想要托盘就加 `--no-tray`，或在配置文件里设 `tray = false`——**重启生效**。
 
 没有 D-Bus 的环境（纯 tty、容器）会自动跳过注册，播放功能不受影响。
 

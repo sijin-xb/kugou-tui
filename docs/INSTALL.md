@@ -18,7 +18,7 @@
 | 构建依赖（Windows） | 只需 **MSVC 工具链**（VS 生成工具 / Build Tools 里的「使用 C++ 的桌面开发」）。**不需要 CMake、NASM 或 OpenSSL** —— 见下文 |
 | 构建依赖（macOS） | 只需 Xcode 命令行工具（`xcode-select --install`） |
 | D-Bus（可选） | 有 session bus 时自动启用 MPRIS 与系统托盘；没有（纯 tty / macOS）则跳过，**不影响播放**。**Windows 上没有这套东西，相关代码不参与编译** |
-| 系统托盘（可选） | 需要状态栏提供 `org.kde.StatusNotifierWatcher`（Quickshell / waybar / KDE 都有）。没有就静默跳过；不需要时可用 `--no-tray` 关闭 |
+| 系统托盘（可选） | 需要状态栏提供 `org.kde.StatusNotifierWatcher`（Quickshell / waybar / KDE 都有）。面板后启动也不要紧——托盘线程每 5 秒重试注册，面板一起来图标就出现；不需要时可用 `--no-tray` 关闭 |
 
 ---
 
@@ -78,8 +78,8 @@ paru -S kugou-tui          # 或 yay -S kugou-tui
 **Linux（x86_64）**：
 
 ```bash
-tar xzf kugou-tui-0.4.5-x86_64-unknown-linux-gnu.tar.gz
-cd kugou-tui-0.4.5-x86_64-unknown-linux-gnu
+tar xzf kugou-tui-0.4.6-x86_64-unknown-linux-gnu.tar.gz
+cd kugou-tui-0.4.6-x86_64-unknown-linux-gnu
 
 # 二进制与三个脚本都链进 PATH。
 # `scripts/kugou-tui` 与二进制同名，所以链过去要改名（同 AUR 包的做法）。
@@ -96,8 +96,8 @@ kugou-tui                     # 开播（也可用 kugou-tui-launch，它会按�
 **Windows（x86_64）**：
 
 ```powershell
-Expand-Archive kugou-tui-0.4.5-x86_64-pc-windows-msvc.zip -DestinationPath .
-cd kugou-tui-0.4.5-x86_64-pc-windows-msvc
+Expand-Archive kugou-tui-0.4.6-x86_64-pc-windows-msvc.zip -DestinationPath .
+cd kugou-tui-0.4.6-x86_64-pc-windows-msvc
 
 .\scripts\kugou-api-install.ps1   # 一次性
 .\scripts\kugou-tui.ps1           # 开播
@@ -106,8 +106,8 @@ cd kugou-tui-0.4.5-x86_64-pc-windows-msvc
 **macOS（arm64）** —— 脚本是 bash，用法与 Linux 相同：
 
 ```bash
-tar xzf kugou-tui-0.4.5-aarch64-apple-darwin.tar.gz
-cd kugou-tui-0.4.5-aarch64-apple-darwin
+tar xzf kugou-tui-0.4.6-aarch64-apple-darwin.tar.gz
+cd kugou-tui-0.4.6-aarch64-apple-darwin
 ./scripts/kugou-api-install kugou
 ./scripts/kugou-tui
 ```

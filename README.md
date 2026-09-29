@@ -109,7 +109,7 @@ cd kugou-tui && cargo build --release
 | 播放队列 | 追加（`a`）、插播下一首（`i`）、整列表加入（`A`）、移除（`x`）、清空（`X`） |
 | 云端歌单 | 收藏单曲（`s`）、整个队列同步（`S`）、增删歌单（`N` / `D`） |
 | 登录 | 应用内扫码（`L`），二维码直接画在终端里 |
-| 桌面集成 | MPRIS（`playerctl` 可控）+ 系统托盘（右键菜单，Quickshell / waybar / KDE）；**仅 Linux 桌面**——Windows 上不参与编译，macOS 上无 session bus 时自动跳过 |
+| 桌面集成 | MPRIS（`playerctl` 可控）+ 系统托盘（右键菜单 / 滚轮音量 / 图标随播放状态变暗，Quickshell / waybar / KDE）；**仅 Linux 桌面**——Windows 上不参与编译，macOS 上无 session bus 时自动跳过 |
 | 输入与外观 | 键盘 + 鼠标；6 套主题（真彩 / 16 色各一版）；音频落盘缓存 + LRU 回收 |
 
 完整能力（含网络重试策略、概念版 VIP 自动领取等）见
