@@ -141,6 +141,10 @@ ok "CHANGELOG 有 $version 一节"
 
 if [ "$skip_aur" -eq 0 ]; then
   [ -f "$aur_dir/PKGBUILD" ] || die "找不到 $aur_dir/PKGBUILD（用 --no-aur 跳过 AUR）"
+  # 没有 `.git` 说明这个目录只是本地草稿，还没建过仓库、更没往 AUR 推过。
+  # 那时后面的 `git add` / `git push` 一定会失败，与其走到一半再炸，不如现在说清楚。
+  [ -d "$aur_dir/.git" ] ||
+    die "$aur_dir 不是 git 仓库（AUR 上还没建过这个包）。用 --no-aur 跳过 AUR。"
   ok "AUR 包目录 $aur_dir"
 fi
 
