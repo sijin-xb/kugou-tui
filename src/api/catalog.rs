@@ -469,6 +469,16 @@ impl ApiClient {
                     continue;
                 }
             };
+            // mp4 容器的候选要跳过（与 MoeKoeMusic 同款条件）：同一首歌的
+            // mp4 版是另一条转码链路出的文件，母版与 flac/mp3 不同——播它
+            // 就是「听着和别的客户端不一样」。跳过它试下一档。
+            if actual_audio_format(&response).0.as_deref() == Some("mp4") {
+                tlog!(
+                    crate::logger::LEVEL_DEBUG,
+                    "/song/url 候选是 mp4 容器，跳过试下一档（hash={hash} quality={q}）"
+                );
+                continue;
+            }
             if let Some(url) = extract_stream_url(&response) {
                 // 拿到直链不等于拿到了**用户要的那一档**：服务端会静默降级
                 // （请求 flac 回 mp3/128 kbps，`status` 仍是 1）。这里顺手核一次，
@@ -1176,6 +1186,136 @@ mod tests {
     use serde_json::json;
 
     // ------------------------------------------------------------------
+    // 取流诊断：真实 API 探针
+    //
+    // 排查「这首歌听着和其它客户端不一样」这类取流分歧时用。需要本地
+    // KuGouMusicApi 与真实登录态，所以挂 #[ignore]，用环境变量显式点名：
+    //
+    //   KUGOU_TUI_PROBE_HASH=<hash> \
+    //   cargo test probe_real_song_stream -- --ignored --nocapture
+    //
+    // 打印 privilege 候选表与降级链上每一档 /song/url 的真实返回
+    // （status / extName / bitRate / 文件头），各客户端选文件的分歧一眼可见。
+    // ------------------------------------------------------------------
+
+    /// 本地 API 地址。概念版默认端口，与配置文件一致。
+    #[tokio::test]
+    #[ignore = "诊断工具：需要本地 API 与真实登录态（KUGOU_TUI_PROBE_HASH=<hash>）"]
+    async fn probe_real_song_stream() {
+        let Ok(hash) = std::env::var("KUGOU_TUI_PROBE_HASH") else {
+            eprintln!("设 KUGOU_TUI_PROBE_HASH=<hash> 后再跑");
+            return;
+        };
+
+        // 真实配置才有登录态。cargo test 的环境里 XDG_CONFIG_HOME 未被改写，
+        // Config::load 读的就是用户自己的配置。
+        let config = crate::config::Config::load();
+        let api_base = config.api_base.clone();
+        let cookie = config.cookie.clone();
+        let quality = std::env::var("KUGOU_TUI_PROBE_QUALITY").unwrap_or(config.quality);
+        println!("API={api_base}  hash={hash}  请求档位={quality}");
+
+        let client =
+            ApiClient::new(&api_base, cookie, config.proxy.as_deref()).expect("构造客户端");
+        let song = Song {
+            hash: hash.clone(),
+            name: "probe".to_string(),
+            ..Default::default()
+        };
+
+        // ---- privilege 候选表：每个客户端「选哪个文件」的依据 ----
+        match client.request_privilege_lite(&song).await {
+            Ok(response) => {
+                for (index, item) in collect_privilege_items(&response).iter().enumerate() {
+                    println!(
+                        "item[{index}] hash={}… album_audio_id={}",
+                        &item.hash[..item.hash.len().min(10)],
+                        item.album_audio_id
+                    );
+                    for (quality, variant_hash) in &item.variants {
+                        println!(
+                            "    {quality:>12}  {}…",
+                            &variant_hash[..variant_hash.len().min(16)]
+                        );
+                    }
+                }
+                let candidates = parse_quality_candidates(&response, &quality, &song.hash);
+                println!("---- 候选链（{} 条）----", candidates.len());
+                for candidate in &candidates {
+                    println!(
+                        "    {} {}",
+                        candidate.quality,
+                        &candidate.hash[..candidate.hash.len().min(16)]
+                    );
+                }
+            }
+            Err(error) => println!("privilege 失败：{}", error.user_hint()),
+        }
+
+        // ---- 降级链逐档 /song/url：看每一档实际给的是什么文件 ----
+        for tier in fallback_chain(&quality) {
+            let response = match client
+                .request_song_url_with_hash(&song, &hash, tier, false)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    println!("{tier:>6}: 请求失败 {}", error.user_hint());
+                    continue;
+                }
+            };
+            let status = response.get("status").and_then(Value::as_i64).unwrap_or(0);
+            let (ext, bit_rate) = actual_audio_format(&response);
+            let url = extract_stream_url(&response);
+            let head = match &url {
+                Some(url) => {
+                    // 只下文件头（4 个 FLAC 块足够 ffprobe 认声道）
+                    let bytes = match reqwest::Client::new()
+                        .get(url)
+                        .header("Range", "bytes=0-131071")
+                        .send()
+                        .await
+                    {
+                        Ok(response) => match response.error_for_status() {
+                            Ok(response) => response.bytes().await.ok(),
+                            Err(_) => None,
+                        },
+                        Err(_) => None,
+                    };
+                    match bytes {
+                        Some(bytes) => {
+                            let path = std::env::temp_dir().join(format!("kugou-probe-{tier}.bin"));
+                            let _ = std::fs::write(&path, &bytes);
+                            format!("头 128KiB → {}", path.display())
+                        }
+                        None => "下载文件头失败".to_string(),
+                    }
+                }
+                None => "无 url".to_string(),
+            };
+            println!(
+                "{tier:>6}: status={status} ext={:?} kbps={:?} {}",
+                ext,
+                bit_rate.map(|rate| rate / 1000),
+                head
+            );
+        }
+
+        // ---- 走一遍应用的真实路径：它会选哪个候选 ----
+        match client.song_stream_url(&song, &quality).await {
+            Ok(stream) => {
+                println!(
+                    "应用最终选择：trial={} reason={:?} url={}…",
+                    stream.is_trial,
+                    stream.reason,
+                    &stream.url[..stream.url.len().min(60)]
+                );
+            }
+            Err(error) => println!("应用取流失败：{}", error.user_hint()),
+        }
+    }
+
+    // ------------------------------------------------------------------
     // 并发翻页的顺序
     //
     // `collect_all_pages` 是异步的，一批页同时发出去。测它需要一个真的服务端，
@@ -1873,6 +2013,70 @@ mod tests {
     /// 起一个「privilege/lite 说有 flac 档，song/url 却回 128 kbps mp3」的服务端。
     ///
     /// 手写 TcpListener，和上面翻页那条、以及 `audio::download` 那组同一个路子，不引新依赖。
+    /// 起一个「flac 档回 mp4 容器、320 档回正常 mp3」的服务端，
+    /// 验证 mp4 候选被跳过（MoeKoeMusic 同款条件）。
+    fn spawn_mp4_server() -> String {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+        let addr = listener.local_addr().expect("取本地地址");
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().expect("克隆流"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if header.trim().is_empty() => break,
+                        Ok(_) => {}
+                    }
+                }
+
+                let body = if request_line.contains("/privilege/lite") {
+                    json!({
+                        "status": 1,
+                        "data": [{
+                            "hash": "AAAA", "quality": "320", "level": 3, "album_audio_id": 9,
+                            "relate_goods": [
+                                {"hash": "CCCC", "quality": "flac", "level": 5, "album_audio_id": 9}
+                            ]
+                        }]
+                    })
+                } else if request_line.contains("quality=flac") {
+                    json!({
+                        "status": 1,
+                        "extName": "mp4",
+                        "url": ["http://example.invalid/wrapped.mp4"]
+                    })
+                } else {
+                    json!({
+                        "status": 1,
+                        "extName": "mp3",
+                        "bitRate": 320000,
+                        "url": ["http://example.invalid/normal.mp3"]
+                    })
+                };
+                let payload = body.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
     fn spawn_downgrading_server() -> String {
         use std::io::{BufRead, BufReader, Write};
         use std::net::TcpListener;
@@ -1936,6 +2140,32 @@ mod tests {
     ///
     /// 上面几条测的是判据本身；这条测的是**判据真的接在取链路径上**——去掉
     /// `song_stream_url` 里那次 `downgrade_note` 调用，这条会失败。
+    /// flac 档给的是 mp4 容器时必须跳过、落到下一档。
+    ///
+    /// MoeKoeMusic 对 mp4 候选的处理就是「尝试获取下一档音质」——mp4 是另一条
+    /// 转码链路的产物，母版和 flac/mp3 不同。播它就是「听着和别的客户端不一样」。
+    #[tokio::test]
+    async fn song_stream_url_skips_mp4_candidates() {
+        let base = spawn_mp4_server();
+        let client = ApiClient::new(&base, None, None).expect("构造客户端");
+        let song = Song {
+            hash: "AAAA".to_string(),
+            name: "测试曲".to_string(),
+            ..Default::default()
+        };
+
+        let stream = client
+            .song_stream_url(&song, "flac")
+            .await
+            .expect("应有可用候选");
+        assert!(
+            stream.url.contains("normal.mp3"),
+            "应跳过 mp4 候选落到 320 档：{}",
+            stream.url
+        );
+        assert!(!stream.is_trial, "320 档是完整版，不该标成试听");
+    }
+
     #[tokio::test]
     async fn song_stream_url_reports_a_silent_downgrade() {
         let base = spawn_downgrading_server();

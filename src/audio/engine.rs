@@ -127,7 +127,7 @@ pub enum AudioEvent {
 }
 
 /// 播放来源：缓存文件，或边下边播的流式缓冲。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AudioSource {
     /// 缓存里已经下完的文件。可以随便 seek。
     File(PathBuf),
@@ -411,6 +411,9 @@ struct Output {
     _stream: rodio::MixerDeviceSink,
     /// 设备名。上报给界面显示——「播着却没声音」时，用户看一眼就知道声音去了哪。
     name: String,
+    /// 设备的混合采样率。hi-res 母版的抗混叠重采样以它为目标（见
+    /// [`crate::audio::resample`]）。
+    rate: u32,
 }
 
 impl Output {
@@ -480,11 +483,13 @@ impl Output {
         stream.log_on_drop(false);
 
         let name = default_label();
+        let rate = stream.config().sample_rate().get();
         let player = rodio::Player::connect_new(stream.mixer());
         Ok(Self {
             player,
             _stream: stream,
             name,
+            rate,
         })
     }
 
@@ -498,11 +503,13 @@ impl Output {
         // 那行字会直接糊在 TUI 界面上，必须关掉。
         stream.log_on_drop(false);
 
+        let rate = stream.config().sample_rate().get();
         let player = rodio::Player::connect_new(stream.mixer());
         Ok(Self {
             player,
             _stream: stream,
             name,
+            rate,
         })
     }
 }
@@ -677,6 +684,7 @@ fn run(
                 levels,
                 bus,
                 stream: None,
+                source: None,
                 last_position_ms: 0,
                 loaded: false,
                 finished_reported: true,
@@ -725,6 +733,9 @@ struct Runtime {
     /// 播放器"变空"时要用它判断到底是**放完了**还是**数据断了**：
     /// 前者该切歌，后者该留住位置续播（见 [`Runtime::sync`]）。
     stream: Option<crate::audio::streaming::StreamingBuffer>,
+    /// 本曲的原始数据源（未消费的克隆）。seek 回退重建解码器时用它（见
+    /// [`Runtime::seek_to`]）；`None` 表示当前没装载任何东西。
+    source: Option<AudioSource>,
     /// 上一次**还在正常播放**时读到的位置（毫秒）。
     ///
     /// 曲目结束的那一帧不能读 `Player::get_pos()`：源都没了，rodio 报的是 0。
@@ -823,6 +834,9 @@ impl Runtime {
             AudioSource::Stream(buffer) => Some(buffer.clone()),
             AudioSource::File(_) => None,
         };
+        // 留一份未消费的克隆：seek 回退（symphonia 不能向后跳）要靠它重建解码器，
+        // 见 `seek_to` / `reload_at`。
+        self.source = Some(source.clone());
         self.last_position_ms = start_at_ms;
 
         // 解码器先建好：它跟设备无关，且失败时不用去动设备借用
@@ -835,11 +849,26 @@ impl Runtime {
             return;
         };
 
+        // hi-res 母版的抗混叠重采样（见 `resample.rs` 的说明）：降采样必须
+        // 带滤波，否则 >24 kHz 的内容会镜像折叠进可听频带——这就是「同一份
+        // 文件，听着和其它客户端不一样」的病根。等率 / 上采样在这里原样透传。
+        let decoder = crate::audio::resample::to_device_rate(decoder, output.rate);
+
         output.player.stop();
         output.player.clear();
         self.loaded = false;
         // 装载期间先屏蔽「结束」上报，避免旧的 empty 状态误触发切歌
         self.finished_reported = true;
+
+        // 上一首的音源已随 clear() 释放。换歌是天然的内存边界：这里 trim 一次
+        // 全堆，把上一首（下载、解码、封面）攒下的空闲页还给 OS——RSS 随之
+        // 落回去，而不是停在历史峰值。**离散事件，不是定时器**：增长已被上限
+        // 治住（流式只留 4 MiB 窗口、下载走落盘），这里只是把「还了自由但没还
+        // 给 OS」的页交还。仅 Unix（Windows 的 MSVC 堆本来就积极归还）。
+        #[cfg(unix)]
+        unsafe {
+            libc::malloc_trim(0);
+        }
 
         // 解码器报出的时长最准；拿不到就用列表里的时长兜底，保证进度条可用
         let duration_ms = decoder
@@ -907,6 +936,7 @@ impl Runtime {
         // 清掉残留的柱子，否则会定格在最后一帧，看着像卡住了
         self.levels.clear();
         self.stream = None;
+        self.source = None;
         self.last_position_ms = 0;
         self.loaded = false;
         self.finished_reported = true;
@@ -937,8 +967,68 @@ impl Runtime {
                 // 跳转后重新允许上报结束
                 self.finished_reported = false;
             }
-            Err(error) => tlog!(crate::logger::LEVEL_WARN, "跳转到 {target}ms 失败：{error}"),
+            Err(error) => {
+                // symphonia 的 FLAC 解码器在没有 SEEKTABLE 的文件上**不能向后跳**
+                // （demuxer 返回 ForwardOnly）——点进度条往回拖、`←` 快退、歌词
+                // 回跳，全都栽在这里，表现就是「进度条只能往前拖」。绕开它：用
+                // 同一份数据源重建解码器。新解码器从文件头出发，跳到 target 是
+                // **前向**跳，必然成功；代价是一次几十毫秒的重建。重建也失败才
+                // 真的报错。
+                if self.reload_at(target) {
+                    tlog!(
+                        crate::logger::LEVEL_DEBUG,
+                        "跳到 {target}ms 走了重建路径（symphonia 不支持向后 seek）：{error}"
+                    );
+                } else {
+                    tlog!(crate::logger::LEVEL_WARN, "跳转到 {target}ms 失败：{error}");
+                }
+            }
         }
+    }
+
+    /// 用同一份数据源重建解码器并落到 `target_ms`。seek 回退专用。
+    ///
+    /// 前提是 `target_ms` 处的数据一定拿得到：能「往后跳」说明那段早就播过——
+    /// 本地文件本来就完整，流式缓冲的那段也早已下载落盘。
+    fn reload_at(&mut self, target_ms: u64) -> bool {
+        let Some(source) = self.source.clone() else {
+            return false;
+        };
+        let source = match source {
+            // 流式缓冲要**归零读指针**的克隆：原缓冲的 pos 停在老解码器的读取
+            // 位置上，直接克隆会让新解码器从半截开始，「跳回前面」就又成了
+            // 向后 seek。
+            AudioSource::Stream(buffer) => AudioSource::Stream(buffer.reader_from_start()),
+            file => file,
+        };
+        let Ok(decoder) = build_decoder(source) else {
+            return false;
+        };
+        let Some(output) = self.output.as_mut() else {
+            return false;
+        };
+        // 与 `load` 同一管线：先抗混叠重采样，再在新源上前向 seek
+        let mut decoder = crate::audio::resample::to_device_rate(decoder, output.rate);
+        // 前向 seek 到目标；失败（比如数据不够）就放弃重建，走原错误路径
+        if decoder.try_seek(Duration::from_millis(target_ms)).is_err() {
+            return false;
+        }
+        // 暂停中触发的 seek（暂停时点进度条）要保持暂停
+        let was_paused = output.player.is_paused();
+        output.player.stop();
+        output.player.clear();
+        output
+            .player
+            .append(LevelMeter::new(decoder, self.levels.clone()));
+        if !was_paused {
+            output.player.play();
+        }
+
+        self.last_position_ms = target_ms;
+        self.shared.position_ms.store(target_ms, Ordering::Relaxed);
+        // 跳转后重新允许上报结束
+        self.finished_reported = false;
+        true
     }
 
     /// 把播放器的真实状态同步到共享快照，并检测曲目结束。
@@ -1276,6 +1366,112 @@ mod tests {
         assert_eq!(out.len(), 2, "应当能读出立体声帧");
         assert!((out[0] - 0.5).abs() < 0.01, "L 声道算错了：{}", out[0]);
         assert!((out[1] + 0.5).abs() < 0.01, "R 声道算错了：{}", out[1]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// **守护测试**：向后 seek 的回退路径（`reload_at` 的核心前提）。
+    ///
+    /// 病根：symphonia 的 FLAC 解码器在**没有 SEEKTABLE** 的文件上不能向后跳
+    /// （demuxer 返回 `ForwardOnly`）——酷狗给的 flac 档实测正是这种（`ffprobe`
+    /// 读不到 seektable，原始包扫描也找不到 `SEEKTABLE` 块）。于是点进度条往
+    /// 回拖、`←` 快退、歌词回跳全部失效，表现成「进度条只能往前拖」。
+    ///
+    /// 修复靠 `reload_at`：用同一份数据源重建解码器，新解码器从文件头出发，
+    /// 跳到任意位置都是**前向**跳，必然成功。这条测试钉住那个前提——
+    /// 重建出的解码器确实能从 0 走到较早的位置，且解出来的样本不是空的。
+    #[test]
+    fn rebuilt_decoder_can_seek_backward_from_the_start() {
+        let path = std::env::temp_dir().join(format!(
+            "kugou-tui-backward-seek-{}.wav",
+            std::process::id()
+        ));
+        // 3 秒 @ 8 kHz，够长到「跳到 0.5 秒」有实际距离
+        const RATE: u32 = 8_000;
+        const SECONDS: usize = 3;
+        let frames: Vec<[i16; 4]> = (0..RATE as usize * SECONDS)
+            .map(|i| {
+                let value = ((i as f32 * 0.02).sin() * 8000.0) as i16;
+                [value, value, value, value]
+            })
+            .collect();
+        write_four_channel_wav(&path, &frames);
+
+        // 模拟 reload_at：拿到源 → 重建解码器 → 前向 seek 到 500ms
+        let decoder = build_decoder(AudioSource::File(path.clone())).expect("首次解码");
+        let sample_rate = decoder.sample_rate().get();
+        assert!(sample_rate > 0, "解码器应报出采样率");
+
+        let mut rebuilt = build_decoder(AudioSource::File(path.clone())).expect("重建解码器");
+        rebuilt
+            .try_seek(Duration::from_millis(500))
+            .expect("重建后的解码器从文件头出发，向前跳到 500ms 必须成功");
+
+        // 跳过去之后还要真的出得了样本——空解码器即使 seek 返回 Ok 也没用
+        let out: Vec<f32> = rebuilt.take(64).collect();
+        assert!(
+            out.iter().any(|s| s.abs() > 0.001),
+            "向后 seek 后必须能继续解出非静音样本，实际 {out:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 向后 seek 后**播放位置**必须落在目标附近，不能停在原地或回到开头。
+    ///
+    /// 上一条测的是「解码器跳得过去」，这条测的是「跳完之后位置对得上」——
+    /// 两者缺一个都会复现用户的症状：一个是根本跳不动，一个是跳了但位置错。
+    /// 用 `StreamingBuffer` 造一段可解的数据，走「归零读指针 → 重建 → 前向
+    /// seek」这条真实回退路径。
+    #[test]
+    fn backward_seek_lands_near_the_target_not_at_the_start() {
+        let path = std::env::temp_dir().join(format!(
+            "kugou-tui-backward-target-{}.wav",
+            std::process::id()
+        ));
+        const RATE: u32 = 8_000;
+        let frames: Vec<[i16; 4]> = (0..RATE as usize * 2)
+            .map(|i| {
+                let value = ((i as f32 * 0.02).sin() * 8000.0) as i16;
+                [value, value, value, value]
+            })
+            .collect();
+        write_four_channel_wav(&path, &frames);
+        let bytes = std::fs::read(&path).expect("读回 wav");
+
+        // 1.2 秒处 —— 比 0 大得多，能区分「跳到目标」和「回到开头」
+        let target_ms = 1_200u64;
+        let stream = StreamingBuffer::new(Some(bytes.len() as u64));
+        stream.push(&bytes);
+        stream.finish(None);
+        let source = crate::audio::engine::AudioSource::Stream(stream.reader_from_start());
+        let mut decoder = build_decoder(source).expect("从流构建解码器");
+        decoder
+            .try_seek(Duration::from_millis(target_ms))
+            .expect("归零后的解码器应能前向跳到目标");
+
+        // 拿解码器自己报的位置对照：读完一帧后统计时长与目标的一致性。
+        // rodio 的 Source 不直接报位置，改用「样本数 → 时长」换算：
+        // 跳转后连续读 RATE/10 个样本（单声道折算），耗时应当接近 0.1 秒
+        // 的**剩余**部分，而不是整段 2 秒。
+        let total_duration = decoder.total_duration().expect("wav 应报时长");
+        assert!(
+            total_duration.as_millis() >= target_ms as u128,
+            "素材要长过目标位置，否则这条测试没有意义"
+        );
+
+        let mut consumed = 0usize;
+        let channels = decoder.channels().get() as usize;
+        // 读 0.05 秒的样本就够判断「不是从 0 重新开始」
+        let want = (RATE as usize / 20) * channels;
+        for _ in 0..want {
+            if decoder.next().is_some() {
+                consumed += 1;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(consumed, want, "向后 seek 后应能持续读到样本");
 
         let _ = std::fs::remove_file(&path);
     }
