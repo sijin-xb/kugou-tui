@@ -119,6 +119,9 @@ pub struct App {
     /// 的定期保存兜底——只在退出时存的话，非正常退出就丢进度了。
     last_session_save: Instant,
 
+    /// 上一次内存采样。只在 `KUGOU_TUI_MEM_TRACE=1` 时有意义（见 `App::tick`）。
+    last_mem_trace: Instant,
+
     /// 切换输出设备后要续播的曲目与位置。
     ///
     /// 换设备是在音频线程里重建设备，正在播的那首会停。这里记下「刚才在放什么、
@@ -245,6 +248,7 @@ impl App {
             runtime,
             last_frame_at: Instant::now(),
             last_session_save: Instant::now(),
+            last_mem_trace: Instant::now(),
             pending_device_resume: None,
             active_stream: None,
             stream_retried: None,

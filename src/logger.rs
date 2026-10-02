@@ -46,6 +46,45 @@ pub fn init(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 进程当前的驻留集（KiB）。取不到时返回 0。
+///
+/// 只在内存追踪打开时被调用（见 [`mem_trace_enabled`] 与 `App::tick`），用途是把
+/// 「听歌听久了内存涨」落到日志时间线上：日志里能直接看到「第几首歌之后涨了多少」，
+/// 而不是盯着 htop 手工对齐时间。
+///
+/// 页大小按 4 KiB 算：Linux 上 x86_64 与 arm64 都是这个值（16K/64K 页的架构下会
+/// 有偏差，但这个数字是给趋势看的，不是给计量用的）。
+pub fn rss_kib() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(text) = std::fs::read_to_string("/proc/self/statm") else {
+            return 0;
+        };
+        text.split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(|pages| pages * 4)
+            .unwrap_or(0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        0
+    }
+}
+
+/// 是否打开内存追踪：`KUGOU_TUI_MEM_TRACE=1`。
+///
+/// 与 `KUGOU_TUI_DEBUG` 分开：那个会连按键日志一起打开（每帧一条，日志瞬间变大），
+/// 而定位内存问题只需要每几秒一行的 RSS，不该被按键日志淹掉。
+pub fn mem_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("KUGOU_TUI_MEM_TRACE")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// 写入一行日志。
 pub fn write(level: &str, message: &str) {
     if level == LEVEL_DEBUG && !debug_enabled() {

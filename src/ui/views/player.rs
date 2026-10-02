@@ -2060,4 +2060,60 @@ mod tests {
             "`render_lyric` 自己画边框：内容区上沿 = area.y + 1，命中区必须与之一致"
         );
     }
+
+    /// 诊断用探针：模拟「连续换歌 → 换封面」，逐轮打印 RSS。
+    ///
+    /// 不做断言——RSS 受分配器行为影响，跨平台不可靠，写死一个阈值只会变成
+    /// 定时炸弹。它的用途是**拿数据**，区分三种情况：
+    ///
+    /// * RSS 稳定在峰值 → 没有泄漏，只是分配器不还页；
+    /// * RSS 逐轮单调上升且不回落 → 有东西被长期持有（真泄漏）；
+    /// * 上升一段后停住 → 碎片封顶。
+    ///
+    /// ```bash
+    /// cargo test --release cover_swap_rss_probe -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "诊断用，靠 --ignored 手动跑"]
+    fn cover_swap_rss_probe() {
+        /// 读 `/proc/self/statm` 的第二个字段（驻留页数），换算成 KiB。
+        fn rss_kib() -> u64 {
+            let text = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+            let pages: u64 = text
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            pages * 4
+        }
+
+        use ratatui::buffer::Buffer;
+        use ratatui::widgets::StatefulWidget;
+
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let mut state = AppState::new(crate::config::Config::default());
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buffer = Buffer::empty(area);
+
+        println!("轮次  RSS(KiB)");
+        for round in 0..40u8 {
+            // 480×480 的 RGB 位图 = 691 KB，与酷狗封面同一量级
+            let pixels = image::RgbImage::from_fn(480, 480, |x, y| {
+                image::Rgb([(x % 256) as u8, (y % 256) as u8, round])
+            });
+            state.cover.set_image(
+                format!("hash-{round}"),
+                image::DynamicImage::ImageRgb8(pixels),
+                1.0,
+            );
+            if let Some((protocol, render)) = state.cover.fit_to(CoverFill::Crop, area, &picker) {
+                StatefulImage::default().resize(Resize::Scale(None)).render(
+                    render,
+                    &mut buffer,
+                    protocol,
+                );
+            }
+            println!("{round:>4} {}", rss_kib());
+        }
+    }
 }

@@ -126,6 +126,30 @@ pub enum AudioEvent {
     Failed(String),
 }
 
+/// 把「已经 free、但还没还给 OS」的空闲页交还给内核（glibc）。
+///
+/// # 为什么需要
+///
+/// glibc 的堆在 free 之后默认把页留着复用（换速度），RSS 于是停在历史峰值——
+/// 长听下来就是「听歌听久了内存只涨不落」。`malloc_trim` 会把堆顶连续的整页还给
+/// 内核，代价是遍历一次堆，所以只在**离散的边界**调用（换歌、一首歌播完），
+/// 不挂定时器。
+///
+/// # 它治不了什么
+///
+/// 只能归还**堆顶连续**的空闲页。碎片化的空洞交不回去，RSS 也就不一定落回起点；
+/// 真的持有对象时更是一页都不会还。判断「泄漏还是碎片」要看活跃分配，不能只看
+/// RSS——见 `logger::rss_kib` 那个追踪开关。
+///
+/// 门控精确到 glibc：`malloc_trim` 是 glibc 专有符号，Darwin 的 libc 里没有，
+/// 用 `cfg(unix)` 会让 macOS 构建直接失败。Windows 的 MSVC 堆本来就积极归还。
+pub fn trim_heap() {
+    #[cfg(target_env = "gnu")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
 /// 播放来源：缓存文件，或边下边播的流式缓冲。
 #[derive(Debug, Clone)]
 pub enum AudioSource {
@@ -860,18 +884,8 @@ impl Runtime {
         // 装载期间先屏蔽「结束」上报，避免旧的 empty 状态误触发切歌
         self.finished_reported = true;
 
-        // 上一首的音源已随 clear() 释放。换歌是天然的内存边界：这里 trim 一次
-        // 全堆，把上一首（下载、解码、封面）攒下的空闲页还给 OS——RSS 随之
-        // 落回去，而不是停在历史峰值。**离散事件，不是定时器**：增长已被上限
-        // 治住（流式只留 4 MiB 窗口、下载走落盘），这里只是把「还了自由但没还
-        // 给 OS」的页交还。
-        //
-        // 门控精确到 glibc：`malloc_trim` 是 glibc 专有，Darwin 的 libc 里没有，
-        // 用 `cfg(unix)` 会让 macOS 构建直接失败。Windows 的 MSVC 堆本来就积极归还。
-        #[cfg(target_env = "gnu")]
-        unsafe {
-            libc::malloc_trim(0);
-        }
+        // 上一首的音源已随 clear() 释放。换歌是天然的内存边界，这里 trim 一次全堆。
+        trim_heap();
 
         // 解码器报出的时长最准；拿不到就用列表里的时长兜底，保证进度条可用
         let duration_ms = decoder
@@ -1475,6 +1489,76 @@ mod tests {
             }
         }
         assert_eq!(consumed, want, "向后 seek 后应能持续读到样本");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 诊断用探针：反复「装载一首本地文件 → 停」，逐轮打印 RSS。
+    ///
+    /// 与 `player::tests::cover_swap_rss_probe` 配对：那条排除了封面，这条看音频
+    /// 路径（解码器、sink、输出流、换歌时的 `malloc_trim`）。
+    ///
+    /// ```bash
+    /// cargo test --release file_swap_rss_probe -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "诊断用，靠 --ignored 手动跑"]
+    fn file_swap_rss_probe() {
+        fn rss_kib() -> u64 {
+            let text = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+            let pages: u64 = text
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            pages * 4
+        }
+
+        /// 写一个 3 秒 44.1kHz 立体声 16bit 的 WAV（全零采样）。
+        fn write_wav(path: &std::path::Path, seconds: u32) {
+            const RATE: u32 = 44_100;
+            const CHANNELS: u16 = 2;
+            let frames = RATE * seconds;
+            let data_len = frames * u32::from(CHANNELS) * 2;
+            let mut bytes = Vec::with_capacity(44 + data_len as usize);
+            bytes.extend_from_slice(b"RIFF");
+            bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+            bytes.extend_from_slice(b"WAVEfmt ");
+            bytes.extend_from_slice(&16u32.to_le_bytes());
+            bytes.extend_from_slice(&1u16.to_le_bytes());
+            bytes.extend_from_slice(&CHANNELS.to_le_bytes());
+            bytes.extend_from_slice(&RATE.to_le_bytes());
+            bytes.extend_from_slice(&(RATE * u32::from(CHANNELS) * 2).to_le_bytes());
+            bytes.extend_from_slice(&(CHANNELS * 2).to_le_bytes());
+            bytes.extend_from_slice(&16u16.to_le_bytes());
+            bytes.extend_from_slice(b"data");
+            bytes.extend_from_slice(&data_len.to_le_bytes());
+            bytes.resize(44 + data_len as usize, 0);
+            std::fs::write(path, bytes).expect("写 WAV");
+        }
+
+        let (bus, receiver) = crate::event::EventBus::new();
+        let handle = AudioHandle::spawn(bus, 0.5, None);
+        if handle.spawn_failed() {
+            println!("音频线程没起来（无可用输出设备？），本探针跳过");
+            return;
+        }
+
+        let dir = std::env::temp_dir().join("kugou-rss-probe");
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let path = dir.join("probe.wav");
+        write_wav(&path, 3);
+
+        println!("轮次  RSS(KiB)");
+        for round in 0..30u32 {
+            handle.load(AudioSource::File(path.clone()), 0, 3_000);
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            handle.stop();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // 顺手把事件收掉，别让通道里的积压混进这次测量
+            while receiver.try_recv().is_ok() {}
+            println!("{round:>4} {}", rss_kib());
+        }
 
         let _ = std::fs::remove_file(&path);
     }

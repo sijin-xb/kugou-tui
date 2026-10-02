@@ -2561,7 +2561,17 @@ impl App {
             }
             AudioEvent::TrackFinished => {
                 self.state.position_ms = 0;
-                self.active_stream = None;
+                // **先 cancel 再丢**。直接置 `None` 只放下了我们手里的那一份 Arc：
+                // 后台下载任务自己还持有一份，会继续把整首往内存窗口和 `.part`
+                // 文件里灌，谁也回收不了。切歌与主动停止两条路都调了 `cancel()`
+                // （`playback.rs`），唯独「自然播完」漏了——它恰恰是最常见的一条。
+                if let Some(stream) = self.active_stream.take() {
+                    stream.cancel();
+                }
+                // 一首歌结束是天然的释放边界：这里把「已 free 但没还给 OS」的页
+                // 交还，而不是等到下一首 `load` 时才做——那时新的分配已经发生，
+                // 刚还回去的页又被占回来了。
+                crate::audio::engine::trim_heap();
 
                 // 试听片段播完 ≠ 整首播完。这里不能走自动切歌：用户会以为是
                 // 「会员没生效、听了几十秒就跳歌」，而实际是没拿到完整版。
@@ -2658,6 +2668,29 @@ impl App {
         if self.last_session_save.elapsed() >= std::time::Duration::from_secs(30) {
             self.persist_session();
             self.last_session_save = std::time::Instant::now();
+        }
+
+        // 内存追踪（`KUGOU_TUI_MEM_TRACE=1`）：每 5 秒把 RSS 与当前曲目记进日志。
+        //
+        // 为什么挂在 tick 上而不是另起一个线程：日志的时间戳要与播放事件对齐，
+        // 同一个写入者才能保证顺序——排查「每首歌涨多少」全靠这个顺序。开销是
+        // 5 秒一次读 `/proc` 加一行 format，关掉时连读都不做。
+        if crate::logger::mem_trace_enabled()
+            && self.last_mem_trace.elapsed() >= std::time::Duration::from_secs(5)
+        {
+            self.last_mem_trace = std::time::Instant::now();
+            let current = self
+                .state
+                .current
+                .as_ref()
+                .map(describe_song)
+                .unwrap_or_else(|| "（无）".to_string());
+            tlog!(
+                crate::logger::LEVEL_INFO,
+                "[mem] RSS {} KiB，当前曲目 {}",
+                crate::logger::rss_kib(),
+                current
+            );
         }
         // 只在音频引擎真的持有曲目时才用它上报的位置。
         //

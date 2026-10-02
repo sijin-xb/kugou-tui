@@ -51,6 +51,23 @@
   额度；提示改为「按 Space 从断点重试」——`Enter` 的语义是「进入下一层 / 播放选中项」，
   保持可预测，不再写进提示。换歌与主动停止都会作废这个断点。
 
+- **流式播放「自然播完」时没有取消下载任务**（`app/update.rs` 的 `TrackFinished`）。
+  那里只写了 `active_stream = None`——放下的只是我们手里那一份 `Arc`，后台下载任务
+  自己还持有一份，会继续把整首往内存窗口和 `.part` 文件里灌。切歌与主动停止两条路
+  都调了 `cancel()`，唯独最常见的一条漏了。同时把「归还空闲页」的 `malloc_trim`
+  挪到这里：它原先只在下一首 `load` 时执行，那时新的分配已经发生，刚还回去的页又
+  被占回来了。
+
+### 诊断
+
+- `KUGOU_TUI_MEM_TRACE=1` 每 5 秒把 RSS 与当前曲目写进日志（`logger::rss_kib` +
+  `App::tick`），用来把「听久了内存涨」落到时间线上——不然只能盯着 htop 手工对齐。
+  与 `KUGOU_TUI_DEBUG` 分开：后者会连按键日志一起打开，反而把趋势淹掉。
+- 两个 `#[ignore]` 探针：`ui::views::player::tests::cover_swap_rss_probe`（反复换封面）
+  与 `audio::engine::tests::file_swap_rss_probe`（反复装载本地文件），各自打印每轮 RSS，
+  用来区分「换歌路径泄漏」与「分配器只是不还页」。
+  跑法：`cargo test --release <名字> -- --ignored --nocapture`。
+
 ## [0.4.6] - 2026-09-29
 
 ### 新增
