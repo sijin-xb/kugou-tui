@@ -43,6 +43,9 @@ impl App {
                 // 在这里展开 {size}：MprisSnapshot 只存最终可用的地址，
                 // 展开规则收敛到 Song::cover_url，避免各调用点各写一份
                 art_url: song.cover_url(MPRIS_COVER_SIZE),
+                // 曲目标识必须随歌走：客户端靠 `mpris:trackid` 判断「换歌了没有」，
+                // 给固定值会让标题与封面停在上一首（见 `mpris::TrackInfo::track_id`）。
+                track_id: song.hash.clone(),
                 position_us: (self.state.position_ms as i64) * 1_000,
                 duration_us: (self.state.duration_ms as i64) * 1_000,
                 status: self.state.playback,

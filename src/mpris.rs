@@ -43,6 +43,15 @@ pub struct TrackInfo {
     pub album: String,
     /// 封面 URL。酷狗的 `sizable_cover` 含 `{size}` 占位符，需要替换成具体像素值。
     pub art_url: Option<String>,
+    /// 当前曲目的唯一标识（酷狗的 hash，网易云是数字 id）。
+    ///
+    /// **必须随曲目变化**，这是 MPRIS 的硬要求：`mpris:trackid` 被定义为「曲目的
+    /// 唯一身份」，客户端（DMS / Quickshell / 各种状态栏）靠它判断「换歌了没有」。
+    /// 之前这里给的是一个固定路径 `/org/kugou_tui/Track/1`，于是换歌时元数据变了、
+    /// trackid 没变——按规范实现的客户端会认为还是同一首，标题和封面就停在上一首
+    /// 不动。这正是「MPRIS 推送偶尔丢」最像的一类表现：不是信号没到，是到了以后
+    /// 客户端按自己的规矩把它忽略了。
+    pub track_id: String,
     /// 当前位置（微秒，MPRIS 的单位）。
     pub position_us: i64,
     /// 总时长（微秒）。
@@ -238,14 +247,36 @@ where
         .unwrap_or_else(|| OwnedValue::from(zbus::zvariant::Str::from("")))
 }
 
+/// 曲目标识 → D-Bus 对象路径。
+///
+/// 对象路径只允许 `[A-Za-z0-9_]` 分段，所以先过滤一遍：酷狗 hash 是十六进制、
+/// 网易云是纯数字，本来就合法，但脏数据不该让整个 Metadata 构造失败（那会连带
+/// 标题、封面一起丢掉）。空 id（还没起播）给一个固定的占位路径。
+fn track_path(track_id: &str) -> String {
+    let safe: String = track_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .take(64)
+        .collect();
+    if safe.is_empty() {
+        "/org/kugou_tui/Track/none".to_string()
+    } else {
+        format!("/org/kugou_tui/Track/{safe}")
+    }
+}
+
 fn build_metadata(info: &TrackInfo) -> HashMap<String, OwnedValue> {
     let mut map: HashMap<String, OwnedValue> = HashMap::new();
 
     map.insert(
         "mpris:trackid".to_string(),
-        OwnedValue::from(zbus::zvariant::ObjectPath::from_static_str_unchecked(
-            "/org/kugou_tui/Track/1",
-        )),
+        zbus::zvariant::ObjectPath::try_from(track_path(&info.track_id))
+            .map(OwnedValue::from)
+            .unwrap_or_else(|_| {
+                OwnedValue::from(zbus::zvariant::ObjectPath::from_static_str_unchecked(
+                    "/org/kugou_tui/Track/none",
+                ))
+            }),
     );
     map.insert("mpris:length".to_string(), owned(info.duration_us));
     map.insert(
@@ -317,11 +348,9 @@ impl MediaPlayer2 {
 pub fn spawn(bus: EventBus) -> Option<MprisHandle> {
     let info = Arc::new(Mutex::new(TrackInfo::default()));
     let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let connected_thread = Arc::clone(&connected);
 
     let info_clone = Arc::clone(&info);
-    // 信号循环需要独立的一份引用：info_clone 会被 move 进 Player
-    let info_signal = Arc::clone(&info);
+    let connected_thread = Arc::clone(&connected);
     // 用独立线程跑 tokio 运行时：zbus 的连接是异步的，而我们的网络运行时
     // 只有 2 个 worker 且可能被下载占满，不适合再塞一个长驻连接。
     std::thread::spawn(move || {
@@ -334,84 +363,134 @@ pub fn spawn(bus: EventBus) -> Option<MprisHandle> {
         };
 
         runtime.block_on(async move {
-            let player = Player {
-                info: info_clone,
-                bus,
-            };
-
-            let result: Result<(), zbus::Error> = async {
-                let connection = ConnectionBuilder::session()?
-                    .name(BUS_NAME)?
-                    .serve_at(OBJECT_PATH, player)?
-                    .serve_at(OBJECT_PATH, MediaPlayer2)?
-                    .build()
-                    .await?;
-
-                // 到这一步才说明桌面组件真的能看到我们了
-                connected_thread.store(true, std::sync::atomic::Ordering::Relaxed);
-
-                // 属性变化信号。
-                //
-                // `#[zbus(property)]` 只提供读取，不会在值变化时自动发
-                // `PropertiesChanged`。纯轮询的客户端（playerctl）无所谓，
-                // 但依赖信号更新的桌面组件会反应滞后甚至不更新。
-                // 所以这里定时比对快照，变了就发信号。
-                //
-                // 0.5 秒足够：媒体控件不需要更实时，而这个循环只是读一次锁。
-                let iface = connection
-                    .object_server()
-                    .interface::<_, Player>(OBJECT_PATH)
-                    .await?;
-                let mut last: Option<TrackInfo> = None;
-
-                loop {
-                    // lock() 返回 Result；锁中毒时取 inner，宁可显示旧值也别卡住循环
-                    let current = match info_signal.lock() {
-                        Ok(guard) => Some(guard.clone()),
-                        Err(poisoned) => Some(poisoned.into_inner().clone()),
-                    };
-
-                    let changed = match (&last, &current) {
-                        (Some(prev), Some(cur)) => {
-                            prev.title != cur.title
-                                || prev.artists != cur.artists
-                                || prev.album != cur.album
-                                || prev.art_url != cur.art_url
-                                || prev.status_str() != cur.status_str()
-                                // 位置一直在走，只有跳变超过 1 秒才发信号，
-                                // 否则每半秒一次太吵
-                                || (prev.position_us - cur.position_us).abs() > 1_000_000
-                        }
-                        _ => true,
-                    };
-
-                    if changed {
-                        last = current;
-                        let ctxt = iface.signal_emitter();
-                        // 生成的 *_changed 是实例方法，需要通过接口引用调用
-                        let player_ref = iface.get().await;
-                        let _ = player_ref.playback_status_changed(ctxt).await;
-                        let _ = player_ref.metadata_changed(ctxt).await;
-                        let _ = player_ref.position_changed(ctxt).await;
+            // 断了就重连。
+            //
+            // 为什么需要：session bus 重启（`systemctl --user restart dbus`、注销再登录）
+            // 或总线名被别的实例抢走之后，旧连接上的信号发送会一直失败——而 `connected`
+            // 仍是 true，主线程照旧往里写快照，桌面组件那边却永远停在最后一帧。表现就是
+            // 「状态栏偶尔不再更新」，而且日志里一句都看不到（早先这些发送错误被 `let _`
+            // 吞掉了）。托盘侧早有「每 5 秒对账自愈」，MPRIS 侧一直没有，这里补上。
+            loop {
+                match serve(
+                    bus.clone(),
+                    Arc::clone(&info_clone),
+                    Arc::clone(&connected_thread),
+                )
+                .await
+                {
+                    // 正常路径是「连接一直活着」，只有出错才会返回
+                    Ok(()) => break,
+                    Err(error) => {
+                        connected_thread.store(false, std::sync::atomic::Ordering::Relaxed);
+                        crate::logger::tlog!(
+                            crate::logger::LEVEL_WARN,
+                            "MPRIS 连接中断（不影响播放），5 秒后重连：{error}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     }
-
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 }
-
-                // loop 永不退出，这里只是为了满足类型推断（! 可 coerce 成 ()）
-                #[allow(unreachable_code)]
-                Ok(())
-            }
-            .await;
-
-            if let Err(error) = result {
-                crate::logger::tlog!(
-                    crate::logger::LEVEL_WARN,
-                    "MPRIS 注册失败（不影响播放）：{error}"
-                );
             }
         });
     });
 
     Some(MprisHandle { info, connected })
+}
+
+/// 建立连接、注册接口，然后一直守着快照发信号。
+///
+/// 返回 `Err` 表示这条连接已经不可用（信号发不出去），调用方据此重连。
+async fn serve(
+    bus: EventBus,
+    info: Arc<Mutex<TrackInfo>>,
+    connected: Arc<std::sync::atomic::AtomicBool>,
+) -> zbus::Result<()> {
+    let player = Player {
+        info: Arc::clone(&info),
+        bus,
+    };
+
+    let connection = ConnectionBuilder::session()?
+        .name(BUS_NAME)?
+        .serve_at(OBJECT_PATH, player)?
+        .serve_at(OBJECT_PATH, MediaPlayer2)?
+        .build()
+        .await?;
+
+    // 到这一步才说明桌面组件真的能看到我们了
+    connected.store(true, std::sync::atomic::Ordering::Relaxed);
+    crate::logger::tlog!(crate::logger::LEVEL_INFO, "MPRIS 已注册：{BUS_NAME}");
+
+    // 属性变化信号。
+    //
+    // `#[zbus(property)]` 只提供读取，不会在值变化时自动发 `PropertiesChanged`。
+    // 纯轮询的客户端（playerctl）无所谓，但依赖信号更新的桌面组件会反应滞后甚至
+    // 不更新。所以这里定时比对快照，变了就发信号。
+    //
+    // 0.5 秒足够：媒体控件不需要更实时，而这个循环只是读一次锁。
+    let iface = connection
+        .object_server()
+        .interface::<_, Player>(OBJECT_PATH)
+        .await?;
+    let mut last: Option<TrackInfo> = None;
+    // 连续发送失败计数。单次失败可能只是对端一时忙，连着几次还发不出去就不是偶然了。
+    let mut failures = 0u32;
+
+    loop {
+        // lock() 返回 Result；锁中毒时取 inner，宁可显示旧值也别卡住循环
+        let current = match info.lock() {
+            Ok(guard) => Some(guard.clone()),
+            Err(poisoned) => Some(poisoned.into_inner().clone()),
+        };
+
+        let changed = match (&last, &current) {
+            (Some(prev), Some(cur)) => {
+                prev.track_id != cur.track_id
+                    || prev.title != cur.title
+                    || prev.artists != cur.artists
+                    || prev.album != cur.album
+                    || prev.art_url != cur.art_url
+                    || prev.status_str() != cur.status_str()
+            }
+            _ => true,
+        };
+
+        // 位置**不走** `PropertiesChanged`。
+        //
+        // MPRIS 规范里 `Position` 是不通过 PropertiesChanged 通知的属性：它一直在动，
+        // 客户端按自己的时钟推算，只有在发生跳变（seek）时才需要被告知——那走的是
+        // `Seeked` 信号。早先这里发的是 `position_changed`，属于非标准用法；严格些的
+        // 客户端收到不该出现的属性变化反而会重置自己的推算，进度条就跳。
+        let jumped = match (&last, &current) {
+            (Some(prev), Some(cur)) => (prev.position_us - cur.position_us).abs() > 1_000_000,
+            _ => false,
+        };
+
+        if changed || jumped {
+            let position_us = current.as_ref().map(|cur| cur.position_us).unwrap_or(0);
+            last = current;
+
+            let ctxt = iface.signal_emitter();
+            // 生成的 *_changed 是实例方法，需要通过接口引用调用
+            let player_ref = iface.get().await;
+            let mut failed = false;
+            if changed {
+                failed |= player_ref.playback_status_changed(ctxt).await.is_err();
+                failed |= player_ref.metadata_changed(ctxt).await.is_err();
+            }
+            if jumped {
+                failed |= Player::seeked(ctxt, position_us).await.is_err();
+            }
+
+            if failed {
+                failures += 1;
+                if failures >= 3 {
+                    return Err(zbus::Error::Failure("属性信号连续发送失败".to_string()));
+                }
+            } else {
+                failures = 0;
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
