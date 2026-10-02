@@ -76,9 +76,23 @@ fn main() -> anyhow::Result<()> {
     //
     // glibc 默认用**动态** mmap 阈值：一次大分配（封面解码、下载缓冲）会把阈值抬到
     // 它的大小，之后同样大的块改从 arena 里切——free 只是把页还进 arena，RSS 从此
-    // 抬到历史峰值不回落，「听歌听多了破一百 MB」的病根之一。把阈值钉死在 1 MiB，
-    // 大块一律 mmap：munmap 即还 OS，不经过 arena。配套的换歌边界 trim 见
-    // `engine.rs::load`。
+    // 抬到历史峰值不回落，「听歌听多了破一百 MB」的病根之一。把阈值钉死，大块一律
+    // mmap：munmap 即还 OS，不经过 arena，也就**不依赖 trim 的时机**。
+    //
+    // # 为什么是 256 KiB 而不是 1 MiB
+    //
+    // 原先钉的是 1 MiB，实测偏大：酷狗封面解码出来是 300–900 KB 的位图，**正好落在
+    // 它下面**，仍然走 arena。`audio::engine::tests::mmap_threshold_effect_probe`
+    // 拿「尺寸随轮次变化」的分配模式量过（固定尺寸测不出来——那总能复用同一批
+    // chunk）：
+    //
+    // | 阈值 | 20 轮、不 trim 的 RSS |
+    // |---|---|
+    // | 1 MiB | +192 → +332 KiB，前 11 轮单调上升后停住 |
+    // | 256 KiB | 恒定 +0 |
+    //
+    // 代价是 ≥256 KiB 的分配多几次 mmap/munmap 系统调用（每首歌个位数，微秒级），
+    // 换来的是「free 即归还」，不受堆布局与 trim 时机影响。低于阈值的分配行为不变。
     //
     // 门控必须精确到 glibc：`mallopt` / `M_MMAP_THRESHOLD` 是 glibc 专有符号，
     // Darwin（macOS）同属 Unix 但 libc 里没有这两样，用 `cfg(unix)` 会直接编译失败。
@@ -86,7 +100,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_env = "gnu")]
     unsafe {
         // M_MMAP_THRESHOLD 的惯例写法是传 -3（glibc 的内部编号）
-        libc::mallopt(libc::M_MMAP_THRESHOLD, 1024 * 1024);
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 256 * 1024);
     }
 
     let cli = Cli::parse();

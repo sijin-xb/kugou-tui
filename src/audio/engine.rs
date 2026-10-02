@@ -1493,6 +1493,135 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// 诊断用探针：模拟「一首歌」那种**尺寸混杂**的分配模式，看 RSS 会不会涨、
+    /// `trim_heap()` 能不能收回来。
+    ///
+    /// 与上面两个探针的区别很关键：那两个每轮分配的都是**同尺寸**的块，会走
+    /// tcache/fastbin 完美复用，所以必然稳定——它们只能证明「没有对象被长期持有」，
+    /// 证明不了「堆不会碎」。真实播放一轮里混着封面位图（~700 KB）、裁剪副本
+    /// （~460 KB）、歌词行（几十字节到几百字节不等的 String）、URL 与 JSON 缓冲，
+    /// 尺寸参差正是碎片的成因。
+    ///
+    /// 判读：
+    ///
+    /// * RSS 逐轮上升、且每轮都 trim 也收不回 → **碎片**（非泄漏），修复方向是
+    ///   分配策略（降 mmap 阈值 / 换分配器），不是去代码里找「谁没释放」；
+    /// * RSS 稳定 → 碎片假说也不成立，问题在别处。
+    ///
+    /// ```bash
+    /// cargo test --release mixed_alloc_rss_probe -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "诊断用，靠 --ignored 手动跑"]
+    fn mixed_alloc_rss_probe() {
+        use std::hint::black_box;
+
+        fn rss_kib() -> u64 {
+            let text = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+            let pages: u64 = text
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            pages * 4
+        }
+
+        println!("轮次  RSS(KiB)");
+        for round in 0..40u32 {
+            // 封面原图（480×480 RGB ≈ 691 KB，正好落在 1 MiB 的 mmap 阈值之下）
+            let mut cover = vec![round as u8; 691 * 1024];
+            // 裁剪/缩放后的副本
+            let mut cropped = vec![round as u8; 460 * 1024];
+            // 歌词：长度参差的 String，模拟真实文本
+            let mut lyrics: Vec<String> = (0..300)
+                .map(|index| "词".repeat(8 + (index % 40) as usize))
+                .collect();
+            // 解析出来的 JSON 文本块
+            let mut json = vec![round as u8; 128 * 1024];
+
+            black_box(&mut cover);
+            black_box(&mut cropped);
+            black_box(&mut lyrics);
+            black_box(&mut json);
+            drop((cover, cropped, lyrics, json));
+
+            // 换歌时本来就会 trim 一次
+            trim_heap();
+            println!("{round:>4} {}", rss_kib());
+        }
+    }
+
+    /// 诊断用探针：**同一段分配模式**，分别在 `M_MMAP_THRESHOLD` = 1 MiB 与 256 KiB
+    /// 下跑，**两段都不 trim**，看 RSS 自己落不落。
+    ///
+    /// 回答的是「RSS 只涨不落是泄漏还是页没还」：
+    ///
+    /// * 两段都不回落 → 纯分配器行为，`trim_heap` 是唯一的归还通道，那就得提高
+    ///   它的调用频率；
+    /// * 降到 256 KiB 后 RSS 自己就稳了 → 大块走 mmap（free 即 `munmap` 还给内核），
+    ///   不依赖 trim，改阈值即可治本。
+    ///
+    /// ```bash
+    /// cargo test --release mmap_threshold_effect_probe -- --ignored --nocapture
+    /// ```
+    #[cfg(target_env = "gnu")]
+    #[test]
+    #[ignore = "诊断用，靠 --ignored 手动跑"]
+    fn mmap_threshold_effect_probe() {
+        use std::hint::black_box;
+
+        fn rss_kib() -> u64 {
+            let text = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+            let pages: u64 = text
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            pages * 4
+        }
+
+        /// 一首歌那种尺寸混杂的一轮分配，**全部在作用域结束时释放**。
+        ///
+        /// 尺寸**随轮次变化**是这里的关键：真实的封面图大小各不相同（300×300 到
+        /// 800×800 都有），歌词长度也参差。如果每轮都分配同一个尺寸，glibc 必然
+        /// 复用刚释放的那批 chunk，探针就永远测不出碎片——上一版探针正是这样，
+        /// 所以两段都是平的，什么也没证明。
+        fn alloc_round(round: u32) {
+            let step = round as usize % 16;
+            let mut cover = vec![round as u8; 300 * 1024 + step * 40 * 1024];
+            let mut cropped = vec![round as u8; 200 * 1024 + step * 24 * 1024];
+            let mut lyrics: Vec<String> = (0..300)
+                .map(|index| "词".repeat(8 + (index * (1 + step)) % 60))
+                .collect();
+            let mut json = vec![round as u8; 64 * 1024 + step * 8 * 1024];
+            black_box(&mut cover);
+            black_box(&mut cropped);
+            black_box(&mut lyrics);
+            black_box(&mut json);
+        }
+
+        for (label, threshold) in [("1 MiB（当前设置）", 1024 * 1024), ("256 KiB", 256 * 1024)]
+        {
+            unsafe {
+                libc::mallopt(libc::M_MMAP_THRESHOLD, threshold);
+            }
+            // 两轮热身：把切换阈值瞬间的残留排除在统计之外
+            for round in 0..2u32 {
+                alloc_round(round);
+            }
+            let base = rss_kib();
+            println!("--- M_MMAP_THRESHOLD = {label}，不 trim ---");
+            for round in 0..20u32 {
+                alloc_round(round);
+                let now = rss_kib();
+                println!(
+                    "{round:>4} {now}（较本段起点 {:+}）",
+                    now as i64 - base as i64
+                );
+            }
+        }
+    }
+
     /// 诊断用探针：反复「装载一首本地文件 → 停」，逐轮打印 RSS。
     ///
     /// 与 `player::tests::cover_swap_rss_probe` 配对：那条排除了封面，这条看音频

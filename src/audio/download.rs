@@ -160,6 +160,18 @@ pub struct Downloader {
 }
 
 impl Downloader {
+    /// 当前登记在案的流式下载数（诊断用）。
+    ///
+    /// 正常应当恒为 0 或 1——登记在起任务之前、摘除在回调之前，一首歌只该有一条。
+    /// 长时间听歌之后如果它跟着 RSS 一起涨，就说明有任务没走到摘除那一步，
+    /// 「内存只涨不落」的答案就在这条路上；反之可以把这条路径整个排除。
+    pub fn active_streams(&self) -> usize {
+        self.streams
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len()
+    }
+
     pub fn new(proxy: Option<&str>) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
             // 整首歌可能几十 MB，超时给足

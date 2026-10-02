@@ -58,15 +58,31 @@
   挪到这里：它原先只在下一首 `load` 时执行，那时新的分配已经发生，刚还回去的页又
   被占回来了。
 
+- **「听久了内存只涨不落」的根因：mmap 阈值定得太高**（`src/main.rs`）。原先钉在
+  1 MiB，而酷狗封面解码出来是 300–900 KB 的位图，**正好落在它下面**，于是走 brk
+  arena——free 只把页还给 arena，RSS 停在峰值，要等下一次 `malloc_trim` 才可能收回，
+  这就是「没有泄漏但收不回」的来源。改成 256 KiB 后这些块直接走 mmap，`free` 即
+  `munmap`，无条件还内核，不再依赖 trim 的时机。低于阈值的分配行为不变。
+
+  依据是 `audio::engine::tests::mmap_threshold_effect_probe` 的对照数据（分配尺寸
+  随轮次变化，两段都不 trim）：1 MiB 下 20 轮 +192 → +332 KiB 单调上升后停住，
+  256 KiB 下恒定 +0。**固定尺寸测不出这个**——那总能复用同一批 chunk。
+
 ### 诊断
 
-- `KUGOU_TUI_MEM_TRACE=1` 每 5 秒把 RSS 与当前曲目写进日志（`logger::rss_kib` +
-  `App::tick`），用来把「听久了内存涨」落到时间线上——不然只能盯着 htop 手工对齐。
+- `KUGOU_TUI_MEM_TRACE=1` 每 5 秒把 RSS 连同「可能累积的东西」的计数写进日志
+  （`logger::rss_kib` + `App::tick`）：流式下载登记表、播放队列长度、命中区容量、
+  当前曲目。光有 RSS 只能看出涨了，这些计数才能把范围收到某一条路径上。
   与 `KUGOU_TUI_DEBUG` 分开：后者会连按键日志一起打开，反而把趋势淹掉。
-- 两个 `#[ignore]` 探针：`ui::views::player::tests::cover_swap_rss_probe`（反复换封面）
-  与 `audio::engine::tests::file_swap_rss_probe`（反复装载本地文件），各自打印每轮 RSS，
-  用来区分「换歌路径泄漏」与「分配器只是不还页」。
+- 三个 `#[ignore]` 探针，各自打印每轮 RSS：
+  `ui::views::player::tests::cover_swap_rss_probe`（反复换封面）、
+  `audio::engine::tests::file_swap_rss_probe`（反复装载本地文件）、
+  `audio::engine::tests::mixed_alloc_rss_probe` 与
+  `mmap_threshold_effect_probe`（尺寸混杂的分配 vs. 阈值对照）。
   跑法：`cargo test --release <名字> -- --ignored --nocapture`。
+
+  实测：换封面 40 轮、装载 30 轮、混合分配 40 轮，RSS 都在头两轮内落定后**恒定**
+  ——换歌路径没有对象泄漏，剩下的就是「页还没还」。
 
 ## [0.4.6] - 2026-09-29
 

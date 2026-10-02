@@ -2685,10 +2685,20 @@ impl App {
                 .as_ref()
                 .map(describe_song)
                 .unwrap_or_else(|| "（无）".to_string());
+            // 除了 RSS，把「可能累积的东西」的计数一起打出来。
+            //
+            // 光有 RSS 只能看出「涨了」，看不出「谁在涨」——这几个计数才是把范围
+            // 收窄到某一条路径的东西：
+            //   streams    流式下载登记表（正常 0 或 1，涨了就是任务没摘除）
+            //   queue      播放队列（跨音源播放时可能被追加）
+            //   hit_zones  每帧回填的命中区（容量应当很快稳定）
             tlog!(
                 crate::logger::LEVEL_INFO,
-                "[mem] RSS {} KiB，当前曲目 {}",
+                "[mem] RSS {} KiB，流式任务 {}，队列 {}，命中区 {}，曲目 {}",
                 crate::logger::rss_kib(),
+                self.downloader.active_streams(),
+                self.state.queue.len(),
+                self.state.hit_zones.capacity(),
                 current
             );
         }
