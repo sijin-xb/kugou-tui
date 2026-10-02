@@ -17,6 +17,9 @@
 | `--proxy <URL>` | `KUGOU_PROXY` | 访问 API 服务时用的 HTTP 代理 |
 | `--basic-color` | — | 使用 16 色固定色板，适配老终端 |
 | `--no-tray` | — | 不注册系统托盘图标（也可用配置文件里的 `tray = false` 长期关闭） |
+| `--no-api-start` | `KUGOU_API_AUTO_START=0` | 不自动拉起本机接口服务（服务由你自己管理，端口上没服务时直接报错） |
+| `--api-start` | — | 只准备并启动本机接口服务就退出，不进界面；这里拉起的**留在后台**，用 `--api-stop` 停 |
+| `--api-stop` | — | 停止本程序拉起过的本机接口服务 |
 | `--print-config` | — | 打印最终生效的配置、缓存与日志路径后退出 |
 
 ```bash
@@ -35,6 +38,8 @@ kugou-tui -s "海阔天空"          # 启动即搜索（需要登录）
 | `KUGOU_TUI_CONFIG_DIR` | **整体覆盖配置根目录**。设成某个路径后，配置读写成 `<该路径>/config.toml`，不再用 `~/.config/kugou-tui`。便携安装（程序与配置一起放 U 盘）时有用；测试也靠它把落盘隔离到临时目录。缓存目录不受影响，仍可用 `--cache-dir` 单独指定 |
 | `KUGOU_TUI_NERD_FONT` | `1` 强制按「装了 Nerd Font」渲染图标，`0` 强制按「没装」渲染 ASCII。留空表示自动探测（Linux 下查 `fc-list`；**Windows 没有 fontconfig，自动探测一律当作没装**，装了 Nerd Font 就得靠这个变量打开） |
 | `KUGOU_TUI_DEBUG` | `1` 打开 DEBUG 级日志（按键、位置同步这类每帧日志默认关着，否则会把日志淹掉） |
+| `KUGOU_API_DIR` | 本机 KuGouMusicApi 的目录。设了之后**不再自动查找与下载**，指错位置直接报错 |
+| `KUGOU_API_AUTO_START` | `0` / `false` / `no` / `off` 关闭自动拉起接口服务，反过来（`1` / `true` …）打开 |
 
 ```powershell
 # Windows：便携目录 + 打开 Nerd Font 图标
@@ -75,7 +80,27 @@ qr_aspect = 2.0                     # 终端字符「高:宽」比，见下方�
 lite_mode = false                   # 简易模式，见下方说明
 cover_fill = "crop"                 # 首页大封面怎么铺满，见下方说明
 tray = true                         # 系统托盘，见下方说明
+api_auto_start = true               # 服务没起时自动拉起，见下方说明
+api_dir = ""                        # 本机 KuGouMusicApi 目录，留空 = 自动查找
 ```
+
+### 接口服务的自动拉起
+
+接口服务（KuGouMusicApi）是 Node.js 写的，`cargo install` 带不了它，所以由程序自己
+在**运行时**补齐：启动时探一次端口，有服务就复用（退出时不碰它），没有才动手。
+查找顺序是「配置的 `api_dir` → `/usr/share/kugou-tui/api/kugou`（发行包）→
+`~/.local/share/kugou-tui/api/kugou` → `~/KuGouMusicApi`」，都没有就下载钉住的提交并
+`npm install --omit=dev`。
+
+| 场景 | 怎么做 |
+|---|---|
+| 服务常驻在别的机器上 / 交给 systemd | `api_auto_start = false`（或 `--no-api-start`） |
+| 想提前装好、以后秒开 | `kugou-tui --api-start`（拉起的服务留后台，`--api-stop` 停） |
+| 服务目录在别处 | `api_dir = "/opt/KuGouMusicApi"` 或 `KUGOU_API_DIR=...` |
+
+**前提**：机器上要有 Node.js（>= 12）与 npm。没有 node 时程序会直接说清楚并退出——
+Rust 这一侧变不出 Node 运行时。默认行为是「自己拉起的服务随退出停止」，不留常驻进程。
+
 
 `cover_fill` 决定**首页那块大封面**怎么填满它的区域。封面区是「多少列 × 多少行」，
 换算成像素后几乎永远不是正方形，而专辑封面大多是正方形——**框和图的形状不一致时，

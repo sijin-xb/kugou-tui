@@ -2602,10 +2602,17 @@ impl App {
                     return;
                 };
 
-                // 每首歌只自动兜一次：网络真断了的话，反复重试只会刷屏
+                // 每首歌只自动兜一次：网络真断了的话，反复重试只会刷屏。
+                //
+                // 但自动兜底退出之后**必须把断点交给手动路径**，而且只认 Space：
+                // 之前这里只打一句「按 Space 或 Enter 重试」就返回，而 Enter 在浏览态
+                // 走 `activate()`（按 Tab/Focus 分派成「播放选中歌曲」「打开歌单」……），
+                // 与重试毫无关系；Space 走 `toggle_playback()`，位置取自 `state.resume`
+                // （会话恢复用的，此时为 None），结果是**从头播**。提示说重试、实际是重来。
                 if self.stream_retried.as_deref() == Some(song.hash.as_str()) {
+                    self.pending_stream_retry = Some((song.clone(), position_ms));
                     self.state.warn(format!(
-                        "《{}》缓冲中断在 {}，按 Space 或 Enter 重试",
+                        "《{}》缓冲中断在 {}，按 Space 从断点重试",
                         song.name,
                         format_duration_ms(position_ms)
                     ));

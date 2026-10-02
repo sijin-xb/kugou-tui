@@ -59,8 +59,8 @@ paru -S kugou-tui          # 或 yay -S kugou-tui
 > 网易云那份服务不在包里（它只在用网易云音源时才需要），仍然走
 > `kugou-tui-install-api netease` 拉取。
 
-> `cargo install kugou-tui` 这条路**暂时不走**——crate 尚未发布到 crates.io。
-> 而且它只能装上主程序，没有那套脚本与服务；想省掉编译的话请用下面的「路径三」。
+> `cargo install kugou-tui` 现在可以走了，见下面的「路径四」。它同样只装主程序、
+> 也没有那套脚本，但**接口服务会由程序自己在首次运行时补齐**，不用手工部署。
 
 ### 路径三：预编译二进制（GitHub Release）
 
@@ -119,6 +119,27 @@ cd kugou-tui-0.4.6-aarch64-apple-darwin
 >
 > Windows 的 zip 里同时带着 bash 版脚本，方便在 Git Bash / WSL 下用；反过来
 > Linux / macOS 的 tarball 里没有 PowerShell 脚本——那三个只在 Windows 上有意义。
+
+### 路径四：`cargo install`（crates.io，当前可用）
+
+```bash
+cargo install kugou-tui
+kugou-tui
+```
+
+只装主程序，但**不需要再手工部署接口服务**：首次启动会自己把它准备好并拉起
+（下载钉住的上游提交 → `npm install --omit=dev` → 起服务，实测约 25 秒），之后每次
+启动探到端口就直接复用。默认**自己拉起的服务随退出停止**，不留常驻 node。
+
+| 项 | 说明 |
+|---|---|
+| Node.js | **必须**（>= 12，含 npm）。没有 node 时程序会直接说清楚并退出——crates.io 只分发 Rust 代码，带不了 Node 服务 |
+| 首次启动 | 需要网络。想提前做完：`kugou-tui --api-start`（它拉起的服务留在后台，用 `--api-stop` 停） |
+| 服务装在哪 | 优先 `/usr/share/kugou-tui/api/kugou`（发行包）与已存在的 `~/KuGouMusicApi`，都没有才装到 `~/.local/share/kugou-tui/api/kugou` |
+| 想自己管服务 | 配置 `api_auto_start = false`，或 `--no-api-start` |
+
+> 这条路拿不到仓库里的 `scripts/*`（它们不是 crate 的一部分）。要那套一键脚本就用
+> 预编译包或 AUR。
 
 ---
 
@@ -335,9 +356,9 @@ ALSA 那套依赖，也不需要额外装 CMake（构建脚本在没有 cmake �
 
 ## 部署第三方 API 服务
 
-**装过 AUR 包的话这一整节都不用做**：包已经把酷狗那份服务连同生产依赖放在
-`/usr/share/kugou-tui/api/kugou/`，启动器会优先用它。下面这套流程是给
-「从源码跑」和「要装网易云那份服务」的人准备的。
+**装过 AUR 包、或是 `cargo install` 装的，这一整节都不用做**：前者已经把酷狗那份
+服务连同生产依赖放在 `/usr/share/kugou-tui/api/kugou/`；后者由程序自己在首次运行时
+下载安装并拉起。下面这套流程是给「从源码跑」和「要装网易云那份服务」的人准备的。
 
 **本项目不含任何接口实现**，数据全部来自第三方的
 [KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi)——它是**独立仓库**，

@@ -1,6 +1,6 @@
 [package]
 name = "kugou-tui"
-version = "0.4.6"
+version = "0.4.7"
 edition = "2024"
 # MSRV 由**依赖**决定，不是本项目代码决定的。当前最高的是 `quantette`（要 1.90，
 # 经 ratatui-image → icy_sixel 引进来），其余：ratatui 0.30 要 1.88、rodio 0.22 要
@@ -14,7 +14,7 @@ edition = "2024"
 # 也别为了压低它去退依赖：ratatui-image 8.x 只认 ratatui 0.29，会和这里的 0.30
 # 编出两份 ratatui（不兼容，渲染不进同一个 Frame）。
 rust-version = "1.90"
-description = "轻量级酷狗音乐命令行 TUI 播放器，基于 KuGouMusicApi"
+description = "轻量级酷狗音乐命令行 TUI 播放器（首次运行自动准备接口服务，需 Node.js）"
 license = "MIT"
 repository = "https://github.com/sijin-xb/kugou-tui"
 keywords = ["tui", "music", "kugou", "player", "cli"]
@@ -82,6 +82,14 @@ time = { version = "0.3", default-features = false, features = ["std", "local-of
 # --- 错误处理 ---
 thiserror = "2"
 anyhow = "1"
+
+# --- 接口服务的自动引导（下载归档 + 解包）---
+#
+# 只在「本机还没有 KuGouMusicApi」时才会走到这条路（见 `bootstrap.rs`）。
+# 两个都是纯 Rust：flate2 用 rust_backend（miniz_oxide），不碰系统 zlib；
+# tar 也不引任何 C 依赖。刻意不开 flate2 的默认特性组合以免拖进 zlib。
+tar = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # --- 基础设施 ---
 # `dirs` 在两个平台上给的都是各自的「正统」位置：Unix 是 XDG 目录，

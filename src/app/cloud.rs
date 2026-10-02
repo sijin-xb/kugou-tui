@@ -488,6 +488,19 @@ impl App {
                 .warn(format!("音源已切换，但保存配置失败：{error}"));
         }
 
+        // 目标音源的服务可能还没起（默认只为当前音源拉起一个）。
+        //
+        // 这里只 spawn、不下载安装：界面已经画在屏幕上了，一次 `npm install` 要几十
+        // 秒，冻住界面不可接受。而依赖目录是各平台共用的，装过一次就够，正常情况只是
+        // 起一个进程、一到两秒。真没装过时下面会给一句「先跑 --api-start」的提示。
+        if let Err(error) = crate::bootstrap::ensure_running(
+            kind,
+            &self.state.config.api_base,
+            self.state.config.api_dir.as_deref(),
+        ) {
+            self.state.warn(format!("{error}"));
+        }
+
         match crate::api::ApiClient::new(
             &self.state.config.api_base,
             self.state.config.cookie_header(),

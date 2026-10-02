@@ -179,11 +179,32 @@ pub struct Config {
     #[serde(default = "default_tray")]
     pub tray: bool,
 
+    /// 启动时若本机接口服务没在跑，是否自动拉起一个。
+    ///
+    /// 默认开启，这是「装完就能用」的关键：`cargo install` 只放一个二进制，接口服务
+    /// 得由程序自己在第一次运行时准备好（见 `bootstrap.rs`）。想完全自己管服务
+    /// （比如跑在别的机器上、或用 systemd 托管）就把它关掉，命令行也有
+    /// `--no-api-start` 临时关闭。
+    #[serde(default = "default_api_auto_start")]
+    pub api_auto_start: bool,
+
+    /// 本机 KuGouMusicApi 的目录。不设置时按 `bootstrap.rs` 里的候选顺序自动查找，
+    /// 找不到就下载安装到用户数据目录。
+    ///
+    /// 显式设置后**不再自动查找与下载**——指错位置会直接报错，而不是悄悄换一个。
+    /// 环境变量 `KUGOU_API_DIR` 可覆盖它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_dir: Option<PathBuf>,
+
     /// 各音源的连接与身份配置，以及当前选中的音源。
     ///
     /// 切换音源时，`api_base` / `cookie` / `dfid` 会从选中的音源同步过来。
     /// 这三个字段仍是运行时实际读取的值，这样改动面最小，也不会漏掉某处引用。
     pub sources: SourceSet,
+}
+
+fn default_api_auto_start() -> bool {
+    true
 }
 
 fn default_qr_aspect() -> f32 {
@@ -278,6 +299,8 @@ impl Default for Config {
             lite_mode: false,
             cover_fill: CoverFill::default(),
             tray: default_tray(),
+            api_auto_start: default_api_auto_start(),
+            api_dir: None,
             sources: SourceSet::default(),
         }
     }
@@ -329,32 +352,48 @@ impl Config {
     /// 读取配置。任何异常都退化为默认配置，保证程序总能启动。
     pub fn load() -> Self {
         let path = Self::path();
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Self::default();
-            }
+        let config = match std::fs::read_to_string(&path) {
+            Ok(text) => match toml::from_str::<Self>(&text) {
+                Ok(config) => config.normalized(),
+                Err(error) => {
+                    tlog!(
+                        crate::logger::LEVEL_WARN,
+                        "解析配置文件 {} 失败：{error}，改用默认配置",
+                        path.display()
+                    );
+                    Self::default()
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(error) => {
                 tlog!(
                     crate::logger::LEVEL_WARN,
                     "读取配置文件 {} 失败：{error}，改用默认配置",
                     path.display()
                 );
-                return Self::default();
-            }
-        };
-
-        match toml::from_str::<Self>(&text) {
-            Ok(config) => config.normalized(),
-            Err(error) => {
-                tlog!(
-                    crate::logger::LEVEL_WARN,
-                    "解析配置文件 {} 失败：{error}，改用默认配置",
-                    path.display()
-                );
                 Self::default()
             }
+        };
+        config.with_env()
+    }
+
+    /// 环境变量覆盖。
+    ///
+    /// 与 `cli.rs` 里那些 `env = "..."` 的参数不冲突：那些是「命令行 > 环境变量 >
+    /// 配置文件」的常规优先级，而这里的两项没有对应的命令行参数（`api_dir` 指向的
+    /// 是本机服务目录，做成命令行参数只会让人一次性的值写进配置里）。
+    fn with_env(mut self) -> Self {
+        if let Some(dir) = std::env::var_os("KUGOU_API_DIR").filter(|value| !value.is_empty()) {
+            self.api_dir = Some(PathBuf::from(dir));
         }
+        if let Ok(value) = std::env::var("KUGOU_API_AUTO_START") {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "0" | "false" | "no" | "off" => self.api_auto_start = false,
+                "1" | "true" | "yes" | "on" => self.api_auto_start = true,
+                _ => {}
+            }
+        }
+        self
     }
 
     /// 写回配置文件，使用 pretty 格式方便用户手工编辑。
@@ -427,6 +466,9 @@ impl Config {
         }
         if cli.no_tray {
             self.tray = false;
+        }
+        if cli.no_api_start {
+            self.api_auto_start = false;
         }
         self.normalize();
     }

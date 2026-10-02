@@ -5,6 +5,7 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Rust](https://img.shields.io/badge/rust-1.90%2B-orange.svg)
 ![Platform](https://img.shields.io/badge/platform-linux%20%7C%20windows-lightgrey.svg)
+![crates.io](https://img.shields.io/crates/v/kugou-tui.svg)
 
 ### 为什么做这个
 
@@ -54,6 +55,17 @@ cd kugou-tui-<版本>-x86_64-pc-windows-msvc
 .\scripts\kugou-tui.ps1
 ```
 
+**或者用 cargo 装**（已发布到 crates.io，只装主程序）：
+
+```bash
+cargo install kugou-tui
+kugou-tui                    # 首次运行会自己准备并拉起接口服务
+```
+
+> 走这条路**仍然需要 Node.js（>= 12）**：接口服务是 Node 写的，crates.io 只分发
+> Rust 代码，带不了它。首次启动会自己下载并安装（约半分钟，看网络），之后每次
+> 启动直接复用；想提前把这一分钟花掉，先跑一次 `kugou-tui --api-start`。
+
 **或者从源码构建**：
 
 | 平台 | 前置 | 命令 |
@@ -72,6 +84,9 @@ cd kugou-tui && cargo build --release
 > `kugou-api-install` 就是把「clone → 装依赖 → 配端口」做完，之后启动器会在每次开播前
 > 按需把服务拉起来。想手动来一遍、要装启动器到 `~/.local/bin`、或要部署网易云音源，
 > 见 **[docs/INSTALL.md](docs/INSTALL.md)**。
+>
+> `cargo install` 装的程序不带那些脚本，但同样不用手工部署：它在首次运行时自己
+> 把服务装好并拉起（前提是有 Node.js）。
 
 #### 平台差异
 

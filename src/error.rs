@@ -59,6 +59,14 @@ pub enum AppError {
     #[error("音频引擎错误：{0}")]
     Audio(String),
 
+    /// 本地接口服务（KuGouMusicApi）的准备或启动失败。
+    ///
+    /// 与 `Http` 分开：`Http` 的处置动作是「换个时刻重试」，而这类错误重试一百次也
+    /// 不会变好——该做的是检查本机环境（有没有 node、依赖装没装、日志里报了什么）。
+    /// UI 层的提示也据此不同，见 `bootstrap.rs`。
+    #[error("{0}")]
+    Service(String),
+
     #[error("未找到资源：{0}")]
     NotFound(String),
     #[error("{0}")]

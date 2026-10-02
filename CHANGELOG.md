@@ -4,6 +4,53 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.7] - 2026-10-02
+
+### 新增
+
+- **接口服务的自动引导**（新增 `src/bootstrap.rs`）。第一次启动会自己把 KuGouMusicApi
+  准备好并拉起，用户全程只敲 `kugou-tui`——这也是本版本发布到 crates.io 的前提。
+
+  为什么需要它：`cargo install` 只放一个二进制到 `~/.cargo/bin`，既不带那个 Node.js
+  服务，也没有 post-install 钩子可用。此前「装完了却不能用」：用户还得自己 clone
+  仓库、装依赖、按平台起两个实例。
+
+  - **探活优先**：端口上已经有服务就**直接复用，退出时不碰它**——它可能是用户自己
+    起的，也可能是另一个 kugou-tui 实例起的；
+  - 缺服务时才动手，按「配置的 `api_dir` → `/usr/share/kugou-tui/api/kugou`（发行包）
+    → `~/.local/share/kugou-tui/api/kugou` → `~/KuGouMusicApi`」找，都没有才下载钉住
+    的提交（`a5a9801`）并 `npm install --omit=dev`；
+  - 只为**当前音源**拉起一个实例；切到另一个平台时补起（只 spawn，不再走安装——界面
+    已经画在屏幕上，被 npm 冻住几十秒不可接受）；
+  - **退出版图**：自己拉起的实例随退出停止，不留常驻 node。`--api-start` 是显式要求
+    常驻的例外，用 `--api-stop` 停；
+  - 安装带文件锁，两个实例同时首次启动不会往同一个 `node_modules` 里写。
+
+  **前提没变：机器上要有 Node.js（>= 12）**。没有 node 时程序会直接说清楚并退出——
+  Rust 这一侧变不出 Node 运行时。
+
+- 配置项 `api_auto_start`（默认 `true`）与 `api_dir`；命令行 `--no-api-start` /
+  `--api-start` / `--api-stop`；环境变量 `KUGOU_API_AUTO_START` / `KUGOU_API_DIR`。
+- crate 发布到 [crates.io](https://crates.io/crates/kugou-tui)，`cargo install kugou-tui`
+  可用。
+
+### 修复
+
+- **「按 Space 或 Enter 重试」此前是一句空头支票**（`app/update.rs` 的
+  `StreamInterrupted` 分支）。边下边播第二次断流后只打一句提示就返回，没有任何按键
+  接得住它：
+
+  - `Space` 走 `toggle_playback()` 的普通起播路径，位置取 `state.resume`（会话恢复用
+    的，此时为 `None`），于是**从头播**，不是从断点续；
+  - `Enter` 走 `activate()`，按 `(Tab, Focus)` 分派成「播放选中歌曲 / 打开歌单」，与
+    断掉的那首无关；
+  - 而且 `start_playback` 只在 hash **不同**时才清 `stream_retried`，手动重播同一首
+    之后额度不恢复，再断流连自动兜底都没有。
+
+  现在断流后把断点存进 `pending_stream_retry`，按 `Space` 从那里续播并归还自动兜底
+  额度；提示改为「按 Space 从断点重试」——`Enter` 的语义是「进入下一层 / 播放选中项」，
+  保持可预测，不再写进提示。换歌与主动停止都会作废这个断点。
+
 ## [0.4.6] - 2026-09-29
 
 ### 新增

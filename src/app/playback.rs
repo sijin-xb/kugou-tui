@@ -85,6 +85,22 @@ impl App {
             PlaybackState::Loading => {}
             PlaybackState::Playing | PlaybackState::Paused => self.audio.toggle(),
             PlaybackState::Stopped => {
+                // 断流等着重试：断点优先于队列与会话恢复的位置。
+                //
+                // 放在这里而不是塞进 `state.resume`，是因为 resume 的语义是「上次退出
+                // 时听到哪」，两者混用会让一次断流位置被当成会话进度写进配置。
+                if let Some((song, position_ms)) = self.pending_stream_retry.take() {
+                    // 手动重试时把自动兜底的额度还回去：这次是用户主动发起的，
+                    // 再断一次理应还能自动续一次（否则额度一旦用尽就永远不再兜）。
+                    self.stream_retried = None;
+                    self.state.info(format!(
+                        "从 {} 继续《{}》",
+                        crate::api::model::format_duration_ms(position_ms),
+                        song.name
+                    ));
+                    self.start_playback(song, position_ms);
+                    return;
+                }
                 if let Some(song) = self.state.queue.current().cloned() {
                     // 会话恢复的那首：从上次的位置续播，而不是从头。
                     // hash 对不上就说明用户换了歌，这个位置作废。
@@ -231,6 +247,9 @@ impl App {
             stream.cancel();
         }
         self.stream_retried = None;
+        // 用户主动停了，之前那个「等你按 Space」的断点也就作废了：再按 Space 应当
+        // 从曲目开头起播，而不是跳到一个几分钟前断掉的位置。
+        self.pending_stream_retry = None;
         self.audio.stop();
     }
 
@@ -245,6 +264,15 @@ impl App {
         // 「已自动兜过一次」的记号按曲目算：换了歌就清掉，同一次断流不重复兜。
         if self.stream_retried.as_deref() != Some(song.hash.as_str()) {
             self.stream_retried = None;
+        }
+        // 起播了别的歌，之前那个断点就不该再生效——否则换歌之后按 Space 会跳回
+        // 上一首断掉的位置。
+        if self
+            .pending_stream_retry
+            .as_ref()
+            .is_some_and(|(pending, _)| pending.hash != song.hash)
+        {
+            self.pending_stream_retry = None;
         }
 
         self.state.current = Some(song.clone());

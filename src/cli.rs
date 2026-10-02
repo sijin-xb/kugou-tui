@@ -9,7 +9,8 @@ use clap::Parser;
 
 /// 酷狗音乐命令行 TUI 播放器。
 ///
-/// 需要先在本机运行 KuGouMusicApi 服务（默认 http://127.0.0.1:3000）。
+/// 本机接口服务（KuGouMusicApi）会在首次运行时自动准备并拉起，无需手工安装；
+/// 前提是本機已装 Node.js。想自己管服务时用 `--no-api-start`。
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "kugou-tui",
@@ -64,6 +65,27 @@ pub struct Cli {
     /// 启动时不注册系统托盘图标。配置文件里的 `tray` 也可关。
     #[arg(long)]
     pub no_tray: bool,
+
+    /// 不自动拉起本机接口服务。
+    ///
+    /// 服务由你自己管理（跑在别的机器上、交给 systemd、或本来就常驻着）。端口上
+    /// 没有服务时程序会直接报错，而不是去启动一个。
+    #[arg(long, conflicts_with = "api_start")]
+    pub no_api_start: bool,
+
+    /// 只准备并启动本机接口服务，然后退出，不进入界面。
+    ///
+    /// 与默认行为不同：这里拉起的服务**留在后台**（默认行为是随本程序退出而停止），
+    /// 之后每次启动直接复用，冷启动更快。停掉它用 `--api-stop`。
+    ///
+    /// 首次运行时会顺带完成下载与依赖安装——想提前把这一分钟花掉、之后再秒开，
+    /// 就先跑一次这个。
+    #[arg(long)]
+    pub api_start: bool,
+
+    /// 停止本程序拉起过的本机接口服务（`--api-start` 留下的那些）。
+    #[arg(long)]
+    pub api_stop: bool,
 
     /// 打印最终生效的配置、缓存目录与日志路径后退出。
     #[arg(long)]
