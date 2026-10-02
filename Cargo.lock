@@ -1586,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "kugou-tui"
-version = "0.4.7"
+version = "0.4.8"
 dependencies = [
  "anyhow",
  "base64 0.23.1",

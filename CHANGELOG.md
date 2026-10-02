@@ -4,6 +4,30 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.8] - 2026-10-02
+
+### 文档
+
+本轮**只动文档**，代码与 0.4.7 完全一致。之所以要单独发一版，是因为 crates.io 页面渲染的是
+**包里那份 README**——文档改了不发版，页面就不会变。
+
+- **全部文档按「这份是给谁看的」重写了一遍**，合计 1844 → 1473 行：
+
+  - README 192 → 162：删掉塞进来的实现论证（Windows 为何不用 CMake / NASM、边下边播的
+    4 MiB 窗口、内存测量方法），安装一节改成 cargo 优先；
+  - INSTALL 590 → 425：删掉与程序内建功能重复的 fish workflow（探活 / 拉起 / 退出收摊现在
+    程序自己做，只差一个 `git pull`），压缩 Windows 与 macOS 段的解释性段落；
+  - CONFIGURATION 318 → 256：配置项里展开的「为什么」压成一句，论证留给 DESIGN.md；
+  - USER_GUIDE 335 → 230：合并界面布局、桌面集成两节的重复描述；
+  - FAQ：补上 0.4.7 引入的四个真实问题——找不到 node、首次启动为什么要等半分钟、服务起不来
+    / 端口被占、内存只涨不落怎么查；
+  - CONTRIBUTING：代码结构树补齐（`bootstrap.rs` / `mpris.rs` / `tray.rs` / `window.rs` /
+    `source/` 等），发版一节补上 crates.io 这一步（`scripts/release` 不含它）；
+  - `DESIGN.md` 与 `MAINTENANCE.md` **刻意不动**：它们是「为什么」的归档，详细本身就是价值。
+
+- 文档里的事实做了一轮机器核验：43 条内部链接与锚点、14 处 `kugou-tui --xxx` 用法（对齐
+  `cli.rs` 的 17 个长参数）、全部 `KUGOU_*` 环境变量与配置项名，均与代码一致。
+
 ## [0.4.7] - 2026-10-02
 
 ### 新增
