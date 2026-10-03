@@ -119,6 +119,24 @@ fn not_logged_in_hint(source: SourceKind) -> String {
     }
 }
 
+/// ↑↓ 在当前 (标签页, 焦点) 下是否表示「切歌」。
+///
+/// 首页与可视化页没有任何可导航的列表，↑↓ 退化成切歌——这是有意为之：
+/// 这两页正是「看着歌词 / 频谱听歌」的页面，切歌是最高频的操作。
+///
+/// 但**焦点在侧边栏或队列时不算**：那两个焦点各有自己的 ↑↓ 语义
+/// （侧边栏切栏目、队列移动队列项，见 `App::move_selection`）。
+///
+/// # 为什么要看焦点
+///
+/// 早先这里只判标签页。`Tab` 会把焦点轮流交给侧边栏 / 主区 / 队列，于是在
+/// 首页按 `Tab` 选中侧边栏之后，↑↓ 走的仍是「切歌」分支：歌换了、侧边栏高亮
+/// 纹丝不动。用户看来就是「在导航里按上下键没反应」（其实切歌了，还会突然
+/// 换歌，更莫名其妙）。
+fn up_down_switches_track(tab: Tab, focus: Focus) -> bool {
+    matches!(tab, Tab::Home | Tab::Visualizer) && matches!(focus, Focus::Primary | Focus::Secondary)
+}
+
 impl App {
     // ==================================================================
     // 事件分发
@@ -935,10 +953,10 @@ impl App {
             // 焦点在**侧边栏**或**队列**时不能抢：那两个焦点各有自己的 ↑↓ 语义
             // （见 `move_selection`）。少了这个条件，Tab 键把焦点交给侧边栏之后
             // ↑↓ 就会切歌，而高亮还停在侧边栏上——看起来像程序没反应。
-            Action::MoveDown if matches!(self.state.tab, Tab::Home | Tab::Visualizer) => {
+            Action::MoveDown if up_down_switches_track(self.state.tab, self.state.focus) => {
                 self.next_track(true);
             }
-            Action::MoveUp if matches!(self.state.tab, Tab::Home | Tab::Visualizer) => {
+            Action::MoveUp if up_down_switches_track(self.state.tab, self.state.focus) => {
                 self.previous_track();
             }
             Action::MoveDown => self.move_selection(1),
@@ -2990,6 +3008,51 @@ mod tests {
         assert_eq!(first_screen_page(true, 30, 30), 1);
         assert_eq!(first_screen_page(true, 4, 30), 1);
         assert_eq!(first_screen_page(true, 0, 30), 1);
+    }
+
+    /// ↑↓ 只在「无列表的展示页 + 焦点在主区/歌曲列表」时才表示切歌。
+    ///
+    /// 回归：`Tab` 把焦点交给侧边栏后，在导航里按 ↑↓ 曾经会**切歌**，
+    /// 而侧边栏高亮不动——因为判据只看了标签页、没看焦点。
+    #[test]
+    fn up_down_switches_track_only_where_there_is_no_list() {
+        // 首页 / 可视化页 + 主区焦点 → 切歌（这两页没有任何列表）
+        for tab in [Tab::Home, Tab::Visualizer] {
+            assert!(
+                up_down_switches_track(tab, Focus::Primary),
+                "{tab:?} 主区应切歌"
+            );
+            assert!(
+                up_down_switches_track(tab, Focus::Secondary),
+                "{tab:?} 歌曲列表应切歌"
+            );
+            // 侧边栏要切栏目、队列要移动队列项，都不能被切歌抢走
+            assert!(
+                !up_down_switches_track(tab, Focus::Sidebar),
+                "{tab:?} 侧边栏焦点下不能切歌"
+            );
+            assert!(
+                !up_down_switches_track(tab, Focus::Queue),
+                "{tab:?} 队列焦点下不能切歌"
+            );
+        }
+
+        // 有列表的页面一律走列表导航
+        for tab in [
+            Tab::Search,
+            Tab::Playlists,
+            Tab::Artists,
+            Tab::Ranks,
+            Tab::Cloud,
+            Tab::Queue,
+            Tab::Settings,
+            Tab::Sources,
+        ] {
+            assert!(
+                !up_down_switches_track(tab, Focus::Primary),
+                "{tab:?} 有列表，不能被切歌抢走"
+            );
+        }
     }
 
     /// 首屏取的是末页（不满页）时，**仍然**要把整表取回来。
