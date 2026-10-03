@@ -501,6 +501,16 @@ impl Config {
         if let Some(medusa) = non_empty(cli.sodam_x_medusa.as_deref()) {
             self.sources.sodam_app.x_medusa = medusa.to_string();
         }
+        // 签名服务地址/Token。这里**不能**套 `non_empty` 的「空即不覆盖」：
+        // `none` 是一个有意义的值（显式关掉签名），它必须能传进来。
+        if let Some(url) = cli.sodam_signer_url.as_deref().map(str::trim)
+            && !url.is_empty()
+        {
+            self.sources.sodam_app.signer_url = url.to_string();
+        }
+        if let Some(token) = non_empty(cli.sodam_signer_token.as_deref()) {
+            self.sources.sodam_app.signer_token = token.to_string();
+        }
 
         self.normalize();
     }
@@ -911,7 +921,10 @@ volume = 0.5
         assert_eq!(app.iid, "iid-7");
         assert_eq!(app.x_helios, "helios-1");
         assert_eq!(app.x_medusa, "medusa-1");
-        assert!(app.is_complete(), "三者齐备应判定为完整");
+        assert!(
+            !app.device_id.is_empty() && !app.x_helios.is_empty() && !app.x_medusa.is_empty(),
+            "三个静态签名头都要落到配置里"
+        );
     }
 
     /// 只传一部分参数时，其余的必须保留配置文件里的值。
@@ -1055,6 +1068,8 @@ volume = 0.5
             x_helios: "helios-1".to_string(),
             x_medusa: "medusa-1".to_string(),
             user_agent: String::new(),
+            signer_url: "http://127.0.0.1:8799".to_string(),
+            signer_token: String::new(),
         };
 
         let text = toml::to_string_pretty(&config).expect("汽水配置要能序列化");
@@ -1072,9 +1087,7 @@ volume = 0.5
         assert_eq!(parsed.sources.sodam_app.x_helios, "helios-1");
         assert_eq!(parsed.sources.sodam_app.x_medusa, "medusa-1");
         assert_eq!(parsed.sources.sodam_app.iid, "iid-1");
-        assert!(
-            parsed.sources.sodam_app.is_complete(),
-            "读回来后仍应判定为完整"
-        );
+        assert_eq!(parsed.sources.sodam_app.device_id, "dev-1");
+        assert_eq!(parsed.sources.sodam_app.x_helios, "helios-1");
     }
 }

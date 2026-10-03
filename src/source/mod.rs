@@ -152,21 +152,23 @@ impl SourceKind {
             // 汽水音乐：直连公网，不经本地接口服务。
             //
             // * `stream` / `lyric` / `cover`：搜索走免签名网关，这三项匿名可用。
-            // * `login`：支持——但**只支持手填 cookie**，不支持扫码。
-            //   汽水的扫码要驱动 Chromium 跑签名页（libresoda 的 cdp-signer），
-            //   为一个 TUI 拉一整套浏览器依赖不划算，所以这里只提供 cookie 登录。
-            //   `client_token` 为真：登录态由客户端持有并写进配置。
-            // * `catalog` / `cloud`：**都不支持**。汽水的歌单 / 榜单 / 歌手接口
-            //   要么不存在、要么同样要应用签名，且本项目用不上它们的写入能力。
-            //   声明为假，界面就不会展示那些入口，而不是让用户点了才报错。
-            // * `vip`：有 `/luna/pc/me`，但它同样要应用签名；没配签名时探测结果
-            //   不可信。与其给一个可能错的「是不是会员」，不如先不提供这个面板。
+            // * `login`：支持——扫码（需要签名页服务）与手填 cookie 两条路都行。
+            // * `client_token` 为**假**！汽水登录拿到的是服务端下发的**会话 cookie**
+            //   （`sessionid` / `sessionid_ss`），不是 token+userid。界面按这个标志
+            //   决定走哪条收尾路径：为真时会去找 token，于是登录成功也会被报成
+            //   「未拿到 token」——酷狗的形态，硬套到汽水上必然失败。
+            // * `catalog` / `cloud`：**暂为假**，但原因已经不是「没有接口」了。
+            //   汽水有 `/luna/pc/me/playlist`（我的歌单）、歌手、专辑、排行榜；
+            //   签名服务接上之后它们**技术上已经可用**（libresoda 有现成实现）。
+            //   差的只是把它们接进界面的那几个面板——那是独立的一块工作，
+            //   没接完之前声明为真会弹出点了就报错的入口。
+            // * `vip`：同上（`/luna/pc/me` 已可用，缺的是会员面板）。
             SourceKind::Sodam => Capability {
                 stream: true,
                 lyric: true,
                 cover: true,
                 login: true,
-                client_token: true,
+                client_token: false,
                 catalog: false,
                 cloud: false,
                 vip: false,
@@ -193,14 +195,14 @@ impl SourceKind {
 
     /// 该音源是否支持**扫码**登录。
     ///
-    /// 与 [`Capability::login`] 区分：后者只说「有没有登录态」，
-    /// 汽水有（手填 cookie 即可），但它的扫码要驱动 Chromium 跑签名页，
-    /// 本项目不引入那套依赖。因此它 `login = true` 而本方法为 `false`，
-    /// 登录选择器据此把它排除，改在配置里手填。
+    /// 与 [`Capability::login`] 区分：后者只说「有没有登录态」。
+    /// 汽水两者都为真。它的扫码走 libresoda 内置的 **CDP 签名页**（直控本机
+    /// Chromium，不需要 Node），所以前提是机器上有 Chrome/Chromium/Edge；
+    /// 没有的话那一步会给出明确报错，不影响搜索与播放。
     pub fn supports_qr_login(self) -> bool {
         match self {
             SourceKind::Kugou | SourceKind::KugouConcept | SourceKind::Netease => true,
-            SourceKind::Sodam => false,
+            SourceKind::Sodam => true,
         }
     }
 
@@ -510,10 +512,7 @@ impl SourceKind {
         let mut songs = match self {
             Self::Kugou | Self::KugouConcept => client.search_songs(keyword, page, page_size).await,
             Self::Netease => netease::search_songs(client, keyword, page, page_size).await,
-            Self::Sodam => {
-                let soda = sodam::client_of(client)?;
-                sodam::search_songs(&soda, keyword, page, page_size).await
-            }
+            Self::Sodam => sodam::search_songs(client, keyword, page, page_size).await,
         }?;
         stamp_songs(&mut songs, self);
         Ok(songs)
@@ -530,11 +529,10 @@ impl SourceKind {
             Self::Kugou | Self::KugouConcept => client.song_stream_url(song, quality).await,
             Self::Netease => netease::song_stream_url(client, song, quality).await,
             Self::Sodam => {
-                let soda = sodam::client_of(client)?;
-                // 解密后的中间文件放在音频缓存目录下的专用子目录里：它不是
-                // 「可直接播放的缓存」（命名也不同），但同属可重建的派生物。
+                // 解密产物落在音频缓存目录下的专用子目录：它不是「可直接播放的
+                // 缓存」（命名也不同），但同属可重建的派生物，放一起便于清理。
                 let scratch = scratch_dir();
-                sodam::song_stream_url(&soda, song, quality, &scratch).await
+                sodam::song_stream_url(client, song, quality, &scratch).await
             }
         }
     }
@@ -547,10 +545,7 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => Ok(song.cover.clone()),
             Self::Netease => netease::cover_url(client, song).await,
-            Self::Sodam => {
-                let soda = sodam::client_of(client)?;
-                sodam::cover_url(&soda, song).await
-            }
+            Self::Sodam => sodam::cover_url(client, song).await,
         }
     }
 
@@ -559,19 +554,19 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.fetch_lyric(song).await,
             Self::Netease => netease::fetch_lyric(client, song).await,
-            Self::Sodam => {
-                let soda = sodam::client_of(client)?;
-                sodam::fetch_lyric(&soda, song).await
-            }
+            Self::Sodam => sodam::fetch_lyric(client, song).await,
         }
     }
 
-    /// 扫码登录第一步：取 key。
+    /// 扫码登录第一步：创建二维码会话，返回会话键。
     pub async fn login_qr_key(self, client: &ApiClient) -> Result<String> {
         match self {
             Self::Kugou | Self::KugouConcept => client.login_qr_key().await,
             Self::Netease => netease::login_qr_key(client).await,
-            Self::Sodam => Err(sodam::unsupported("扫码登录（请在配置里手填 cookie）")),
+            // 汽水走 libresoda 内置的 CDP 签名页：直控本机 Chromium，
+            // **不需要 Node**。这也解释了为什么它必须借道浏览器——护照接口要
+            // `a_bogus`，而确认后的登录态只存在于那个浏览器会话的 cookie jar 里。
+            Self::Sodam => sodam::create_qr_session(client).await,
         }
     }
 
@@ -580,7 +575,8 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.login_qr_create(key).await,
             Self::Netease => netease::login_qr_create(client, key).await,
-            Self::Sodam => Err(sodam::unsupported("扫码登录（请在配置里手填 cookie）")),
+            // 汽水的扫码地址在第 1 步就随二维码一起拿到了，这里只是取回它。
+            Self::Sodam => sodam::scan_url_for(key),
         }
     }
 
@@ -593,7 +589,7 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.login_qr_check(key).await,
             Self::Netease => netease::login_qr_check(client, key).await,
-            Self::Sodam => Err(sodam::unsupported("扫码登录（请在配置里手填 cookie）")),
+            Self::Sodam => sodam::check_qr_session(client, key).await,
         }
     }
 
@@ -923,31 +919,63 @@ mod tests {
         assert!(set.enabled().contains(&SourceKind::Sodam));
     }
 
-    /// 登录选择器按 `supports_qr_login` 过滤：汽水有登录态但走不通扫码，
-    /// 混进去会让用户卡在「二维码出不来」。
+    /// 登录选择器按 `supports_qr_login` 过滤：**支持扫码的音源都要在列表里**。
+    ///
+    /// 回归：汽水早先被排除（当时判断它只能手填 cookie）。后来确认它的扫码
+    /// 可以借道签名页服务，于是重新放进来——用户按 L 却看不到汽水，就是这个
+    /// 过滤条件写死造成的。
     #[test]
-    fn qr_login_candidates_exclude_sodam() {
+    fn qr_login_candidates_include_every_source_that_supports_it() {
         let candidates: Vec<SourceKind> = SourceKind::ALL
             .iter()
             .copied()
             .filter(|kind| kind.capability().login && kind.supports_qr_login())
             .collect();
 
-        assert!(
-            !candidates.contains(&SourceKind::Sodam),
-            "汽水不该进扫码列表"
-        );
-        assert!(candidates.contains(&SourceKind::Kugou));
-        assert!(candidates.contains(&SourceKind::Netease));
+        for kind in [SourceKind::Kugou, SourceKind::Netease, SourceKind::Sodam] {
+            assert!(candidates.contains(&kind), "{kind:?} 应该在扫码列表里");
+        }
     }
 
-    /// 汽水的 `catalog` / `cloud` 声明为假，界面据此隐藏歌单广场与云端同步入口。
+    /// `supports_qr_login` 为真必须蕴含 `login` 为真——否则选择器会推出一个
+    /// 没有登录态的音源，扫码成功也无处安放。
     #[test]
-    fn sodam_declares_no_catalog_or_cloud() {
+    fn qr_login_implies_login_support() {
+        for kind in SourceKind::ALL {
+            if kind.supports_qr_login() {
+                assert!(kind.capability().login, "{kind:?} 支持扫码却不支持登录");
+            }
+        }
+    }
+
+    /// 汽水的登录态是**服务端下发的会话 cookie**，不是 token+userid。
+    ///
+    /// `client_token` 必须为假：界面据此决定收尾路径，为真时会去找 token，
+    /// 于是登录成功也被报成「未拿到 token」。
+    #[test]
+    fn sodam_login_uses_a_server_cookie_not_a_client_token() {
         let capability = SourceKind::Sodam.capability();
-        assert!(!capability.catalog, "不支持歌单/榜单/歌手");
-        assert!(!capability.cloud, "不支持云端歌单");
-        // 这三项是匿名可用的，必须为真，否则搜索进来也是白搭
+        assert!(capability.login, "汽水支持登录");
+        assert!(
+            !capability.client_token,
+            "汽水的凭据是 cookie，不能按「客户端持有 token」处理"
+        );
+    }
+
+    /// 汽水的 `catalog` / `cloud` 目前仍声明为假。
+    ///
+    /// **原因不是「汽水没有这些接口」**——它有（`/luna/pc/me/playlist` 就是
+    /// 「我的歌单」，还有歌手、专辑、排行榜），而且签名服务接上之后它们
+    /// 技术上已经可用。差的是把它们接进界面面板，那是独立的一块工作；
+    /// 没接完之前声明为真会弹出「点了就报错」的入口。
+    ///
+    /// 这条断言钉的是「声明与实现一致」：真接上了就要连它一起改。
+    #[test]
+    fn sodam_declares_no_catalog_or_cloud_until_the_panels_are_wired() {
+        let capability = SourceKind::Sodam.capability();
+        assert!(!capability.catalog, "目录浏览尚未接进界面");
+        assert!(!capability.cloud, "云端歌单尚未接进界面");
+        // 这三项匿名可用，必须为真，否则搜索进来也是白搭
         assert!(capability.stream);
         assert!(capability.lyric);
         assert!(capability.cover);

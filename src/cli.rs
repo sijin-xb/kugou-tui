@@ -87,6 +87,17 @@ pub struct Cli {
     /// 汽水音乐的 install id `iid`。
     #[arg(long, env = "SODAM_IID", value_name = "ID")]
     pub sodam_iid: Option<String>,
+
+    /// 汽水应用签名服务地址（libmssdk 的 `/sign`）。
+    ///
+    /// 留空则用上游内置的**公共签名服务**（VIP 整曲开箱即用）；
+    /// 填 `none` 显式关掉签名，只留试听与免费曲目。
+    #[arg(long, env = "QISHUI_SIGNER_URL", value_name = "URL")]
+    pub sodam_signer_url: Option<String>,
+
+    /// 签名服务的 Bearer Token。用公共地址时留空即可（用内置的默认 token）。
+    #[arg(long, env = "QISHUI_SIGNER_TOKEN", value_name = "TOKEN")]
+    pub sodam_signer_token: Option<String>,
     /// 启动时使用固定色板（16 色），适配老终端。
     #[arg(long)]
     pub basic_color: bool,

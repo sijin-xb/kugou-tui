@@ -74,9 +74,6 @@ pub struct ApiClient {
     http: reqwest::Client,
     base: Arc<str>,
     cookie: Option<Arc<str>>,
-    /// 构造时用的代理原样保存。`reqwest::Client` 建成后不再暴露它，
-    /// 但需要重建客户端的音源模块（汽水）要沿用同一套代理配置。
-    proxy: Option<Arc<str>>,
 }
 
 impl ApiClient {
@@ -94,11 +91,6 @@ impl ApiClient {
                 .map_err(|error| AppError::Config(format!("代理地址 {proxy_url} 无效：{error}")))?;
             builder = builder.proxy(parsed);
         }
-        let proxy = proxy
-            .map(str::trim)
-            .filter(|url| !url.is_empty())
-            .map(Arc::from);
-
         let http = builder
             .build()
             .map_err(|error| AppError::Config(format!("构造 HTTP 客户端失败：{error}")))?;
@@ -109,7 +101,6 @@ impl ApiClient {
             cookie: cookie
                 .filter(|value| !value.trim().is_empty())
                 .map(Arc::from),
-            proxy,
         })
     }
 
@@ -124,11 +115,6 @@ impl ApiClient {
     /// 但「有哪些身份凭据」这个信息是通用的，不该被这里藏起来。
     pub fn cookie(&self) -> Option<&str> {
         self.cookie.as_deref()
-    }
-
-    /// 构造时用的代理地址。
-    pub fn proxy(&self) -> Option<&str> {
-        self.proxy.as_deref()
     }
 
     /// 更新 cookie（例如自动探测到 dfid 之后）。

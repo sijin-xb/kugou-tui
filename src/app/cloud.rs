@@ -331,8 +331,31 @@ impl App {
     /// 与 [`Self::apply_login`] 的差别只是凭据从哪来：那边自己拼 `token=; userid=`，
     /// 这边直接用服务端给的一整串。
     pub(super) fn apply_server_cookie(&mut self, cookie: String) {
-        self.state.config.cookie = Some(cookie);
-        self.api.set_cookie(self.state.config.cookie_header());
+        // 汽水的凭据存在**自己档案**里，不走顶层 `cookie`：它直连公网，没有
+        // 「服务端替它管 cookie」这回事，而且顶层那个是酷狗的地盘——写错地方
+        // 会让酷狗带着汽水的 sessionid 发请求，而汽水永远读不到自己的登录态。
+        let kind = self.state.config.active_source_kind();
+        if kind == SourceKind::Sodam {
+            self.state
+                .config
+                .sources
+                .profile_mut(SourceKind::Sodam)
+                .cookie = Some(cookie);
+            // 客户端每次按音源重建（`client_of`），这里同步热更新当前那个，
+            // 让「登录成功后立刻查会员/资料」不必等下一次切音源。
+            if let Ok(mut api) = self.client_for(SourceKind::Sodam) {
+                api.set_cookie(
+                    self.state
+                        .config
+                        .sources
+                        .profile(SourceKind::Sodam)
+                        .cookie_header(SourceKind::Sodam),
+                );
+            }
+        } else {
+            self.state.config.cookie = Some(cookie);
+            self.api.set_cookie(self.state.config.cookie_header());
+        }
 
         let config_path = Config::path();
         match self.state.config.save() {
@@ -343,7 +366,7 @@ impl App {
                     true,
                     format!(
                         "「{}」登录成功，凭据已写入 {}",
-                        self.state.config.active_source_kind().label(),
+                        kind.label(),
                         config_path.display()
                     ),
                 );

@@ -1158,9 +1158,7 @@ impl App {
         // 这里顺带**无条件**同步（而不是只在 `kind == Sodam` 时）：切歌、
         // 跨音源播放都会经过这个函数，而凭证是「本机的汽水身份」，
         // 只有一个值。每次都写同一个值，开销可以忽略。
-        crate::source::sodam::client::set_active_credentials(
-            self.state.config.sources.sodam_app.clone(),
-        );
+        crate::source::sodam::set_active_credentials(self.state.config.sources.sodam_app.clone());
 
         if kind == self.state.config.active_source_kind() {
             // 当前音源已经有现成的客户端，直接复用（省一次连接池重建）

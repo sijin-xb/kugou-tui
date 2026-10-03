@@ -252,20 +252,25 @@ fn print_effective_config(config: &Config) {
         }
     );
 
-    // 汽水的签名凭证单独说清：它决定「VIP 整曲 / 无损能不能拿到」，
-    // 而现象是「只有 30 秒试听」——不说清的话用户很难联想到要配这个。
+    // 汽水的签名状态单独说清：它决定「VIP 整曲 / 无损能不能拿到」，
+    // 而出问题的现象是「只有 30 秒试听」——不说清的话很难联想到这一项。
     if kind == crate::source::SourceKind::Sodam {
         let app = &config.sources.sodam_app;
-        println!(
-            "签名凭证  : {}",
-            if app.is_complete() {
-                "完整（可取整曲）"
-            } else if app.has_device_fingerprint() {
-                "缺 x-helios / x-medusa（VIP 整曲与无音乐会退化成试听片段）"
-            } else {
-                "未配置（仅试听片段与免费音质）"
+        let status = match app.signer_base() {
+            Some(base) => {
+                let using_default = base == crate::source::sodam::client::DEFAULT_SIGNER_URL;
+                if using_default {
+                    "公共签名服务（开箱即用；长期使用建议换成自建的）".to_string()
+                } else {
+                    format!("已配置：{base}")
+                }
             }
-        );
+            None => "已关闭（只放试听与免费曲目）".to_string(),
+        };
+        println!("签名服务  : {status}");
+        if app.has_device_fingerprint() {
+            println!("设备指纹  : 已配置（手工抓包路径）");
+        }
     }
     println!(
         "设备指纹  : {}",
