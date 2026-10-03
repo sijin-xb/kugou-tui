@@ -152,26 +152,25 @@ impl SourceKind {
             // 汽水音乐：直连公网，不经本地接口服务。
             //
             // * `stream` / `lyric` / `cover`：搜索走免签名网关，这三项匿名可用。
-            // * `login`：支持——扫码（需要签名页服务）与手填 cookie 两条路都行。
+            // * `login`：支持——扫码（内置 CDP 签名页）与手填 cookie 两条路都行。
             // * `client_token` 为**假**！汽水登录拿到的是服务端下发的**会话 cookie**
             //   （`sessionid` / `sessionid_ss`），不是 token+userid。界面按这个标志
-            //   决定走哪条收尾路径：为真时会去找 token，于是登录成功也会被报成
+            //   决定收尾路径：为真时会去找 token，于是登录成功也会被报成
             //   「未拿到 token」——酷狗的形态，硬套到汽水上必然失败。
-            // * `catalog` / `cloud`：**暂为假**，但原因已经不是「没有接口」了。
-            //   汽水有 `/luna/pc/me/playlist`（我的歌单）、歌手、专辑、排行榜；
-            //   签名服务接上之后它们**技术上已经可用**（libresoda 有现成实现）。
-            //   差的只是把它们接进界面的那几个面板——那是独立的一块工作，
-            //   没接完之前声明为真会弹出点了就报错的入口。
-            // * `vip`：同上（`/luna/pc/me` 已可用，缺的是会员面板）。
+            // * `catalog`：歌单广场与歌单浏览已接（走 `/luna/pc/`，需要签名服务）。
+            //   **但「歌手」与「排行榜」没有对应接口**——libresoda 里只有按 id 查
+            //   歌手详情/曲目，没有「热门歌手列表」；榜单也没有等价的端点。
+            //   那两处保留明确报错（见 `singer`/`rank` 分支），不是漏接。
+            // * `cloud` / `vip`：都已接（我的歌单、用户资料、会员状态）。
             SourceKind::Sodam => Capability {
                 stream: true,
                 lyric: true,
                 cover: true,
                 login: true,
                 client_token: false,
-                catalog: false,
-                cloud: false,
-                vip: false,
+                catalog: true,
+                cloud: true,
+                vip: true,
             },
         }
     }
@@ -610,7 +609,9 @@ impl SourceKind {
                 client.plaza_playlists(category_id, page, page_size).await
             }
             Self::Netease => netease::plaza_playlists(client, category_id, page, page_size).await,
-            Self::Sodam => Err(sodam::unsupported("歌单广场")),
+            // 汽水没有分类广场（libresoda 的 `get_playlist_categories` 就是
+            // Unsupported），只有一份推荐歌单，所以忽略分类与分页参数。
+            Self::Sodam => sodam::plaza_playlists(client, category_id, page, page_size).await,
         }
     }
 
@@ -651,7 +652,13 @@ impl SourceKind {
             (Self::Netease, PlaylistRef::Public(global_id)) => {
                 netease::playlist_tracks_page(client, global_id, page, page_size).await
             }
-            (Self::Sodam, _) => Err(sodam::unsupported("歌单浏览")),
+            // 汽水的歌单 id 就是数字串，自有与公开走同一个端点
+            (Self::Sodam, PlaylistRef::Own(id)) => {
+                sodam::playlist_tracks_page(client, &id.to_string(), "", page_size).await
+            }
+            (Self::Sodam, PlaylistRef::Public(id)) => {
+                sodam::playlist_tracks_page(client, id, "", page_size).await
+            }
         }?;
         stamp_songs(&mut songs, self);
         Ok(songs)
@@ -666,7 +673,7 @@ impl SourceKind {
         let mut songs = match self {
             Self::Kugou | Self::KugouConcept => client.playlist_tracks_all(global_id, fresh).await,
             Self::Netease => netease::playlist_tracks_all(client, global_id).await,
-            Self::Sodam => Err(sodam::unsupported("歌单浏览")),
+            Self::Sodam => sodam::playlist_tracks(client, global_id).await,
         }?;
         stamp_songs(&mut songs, self);
         Ok(songs)
@@ -681,7 +688,9 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.artist_list(kind, hot_size).await,
             Self::Netease => netease::artist_list(client, kind, hot_size).await,
-            Self::Sodam => Err(sodam::unsupported("歌手浏览")),
+            Self::Sodam => Err(sodam::unsupported(
+                "歌手列表（汽水没有「热门歌手」接口，只能按 id 查）",
+            )),
         }
     }
 
@@ -694,7 +703,9 @@ impl SourceKind {
         let mut songs = match self {
             Self::Kugou | Self::KugouConcept => client.artist_tracks_all(artist_id, sort).await,
             Self::Netease => netease::artist_tracks_all(client, artist_id).await,
-            Self::Sodam => Err(sodam::unsupported("歌手浏览")),
+            Self::Sodam => Err(sodam::unsupported(
+                "歌手列表（汽水没有「热门歌手」接口，只能按 id 查）",
+            )),
         }?;
         stamp_songs(&mut songs, self);
         Ok(songs)
@@ -704,7 +715,7 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.rank_boards().await,
             Self::Netease => netease::rank_boards(client).await,
-            Self::Sodam => Err(sodam::unsupported("排行榜")),
+            Self::Sodam => Err(sodam::unsupported("排行榜（汽水没有等价的榜单端点）")),
         }
     }
 
@@ -712,7 +723,7 @@ impl SourceKind {
         let mut songs = match self {
             Self::Kugou | Self::KugouConcept => client.rank_tracks_all(rank_id).await,
             Self::Netease => netease::rank_tracks_all(client, rank_id).await,
-            Self::Sodam => Err(sodam::unsupported("排行榜")),
+            Self::Sodam => Err(sodam::unsupported("排行榜（汽水没有等价的榜单端点）")),
         }?;
         stamp_songs(&mut songs, self);
         Ok(songs)
@@ -722,7 +733,7 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.user_playlists().await,
             Self::Netease => netease::user_playlists(client).await,
-            Self::Sodam => Err(sodam::unsupported("云端歌单")),
+            Self::Sodam => sodam::user_playlists(client).await,
         }
     }
 
@@ -734,7 +745,7 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.user_detail().await,
             Self::Netease => netease::user_detail(client).await,
-            Self::Sodam => Err(sodam::unsupported("用户资料")),
+            Self::Sodam => sodam::user_detail(client).await,
         }
     }
 
@@ -750,7 +761,7 @@ impl SourceKind {
             }
             // 网易云没有「自己的歌单」专用端点，按 id 取即可
             Self::Netease => netease::playlist_tracks_all(client, &list_id.to_string()).await,
-            Self::Sodam => Err(sodam::unsupported("云端歌单")),
+            Self::Sodam => sodam::playlist_tracks(client, &list_id.to_string()).await,
         }?;
         stamp_songs(&mut songs, self);
         Ok(songs)
@@ -962,23 +973,26 @@ mod tests {
         );
     }
 
-    /// 汽水的 `catalog` / `cloud` 目前仍声明为假。
+    /// 汽水的目录/云端/会员能力现在都已接上。
     ///
-    /// **原因不是「汽水没有这些接口」**——它有（`/luna/pc/me/playlist` 就是
-    /// 「我的歌单」，还有歌手、专辑、排行榜），而且签名服务接上之后它们
-    /// 技术上已经可用。差的是把它们接进界面面板，那是独立的一块工作；
-    /// 没接完之前声明为真会弹出「点了就报错」的入口。
+    /// 只**剩「歌手列表」与「排行榜」确实没有对应接口**——libresoda 只提供按
+    /// id 查歌手详情与曲目，没有「热门歌手列表」；榜单也没有等价端点。那两处
+    /// 保留明确报错（见分派层），不是漏接。
     ///
-    /// 这条断言钉的是「声明与实现一致」：真接上了就要连它一起改。
+    /// 这条钉的是「声明与实现一致」：改动能力时要连它一起改。
     #[test]
-    fn sodam_declares_no_catalog_or_cloud_until_the_panels_are_wired() {
+    fn sodam_declares_the_capabilities_it_actually_has() {
         let capability = SourceKind::Sodam.capability();
-        assert!(!capability.catalog, "目录浏览尚未接进界面");
-        assert!(!capability.cloud, "云端歌单尚未接进界面");
-        // 这三项匿名可用，必须为真，否则搜索进来也是白搭
+        assert!(capability.catalog, "歌单广场与歌单浏览已接");
+        assert!(capability.cloud, "云端歌单（我的歌单）已接");
+        assert!(capability.vip, "会员状态已接");
+        // 这几项匿名可用，必须为真，否则搜索进来也是白搭
         assert!(capability.stream);
         assert!(capability.lyric);
         assert!(capability.cover);
+        assert!(capability.login);
+        // 汽水的登录态是服务端下发的 cookie，不是客户端持有的 token
+        assert!(!capability.client_token);
     }
 
     /// 老配置文件里没有汽水的段，反序列化后仍要拿到可用的默认值。

@@ -28,7 +28,7 @@
 
 use std::time::Instant;
 
-use crate::api::cloud::QrStatus;
+use crate::api::cloud::{QrStatus, VipInfo, VipKind};
 use crate::app::App;
 use crate::app::state::{ConfirmAction, LoginPicker, LoginState};
 use crate::app::update::describe_song;
@@ -642,6 +642,35 @@ impl App {
 
         let api = self.api.clone();
         let bus = self.bus.clone();
+        let kind = self.state.config.active_source_kind();
+
+        // 汽水的会员信息在 `/luna/pc/me`，与酷狗的 `/user/vip/detail` 不是一套
+        // 端点，走 libresoda 自己的实现。它直接给 `is_vip`，比「探测能不能拿整曲」
+        // 可靠——后者会被签名可用性干扰，把非会员误判成「拿不到整曲」。
+        if kind == SourceKind::Sodam {
+            self.runtime.spawn(async move {
+                match crate::source::sodam::is_vip_account(&api).await {
+                    Ok(is_vip) => bus.emit(Loaded::VipStatus(Box::new(VipInfo {
+                        kind: if is_vip {
+                            VipKind::Other("汽水".to_string())
+                        } else {
+                            VipKind::None
+                        },
+                        product: if is_vip {
+                            "汽水音乐会员".to_string()
+                        } else {
+                            String::new()
+                        },
+                        // 汽水这个端点不给到期时间（上游也没暴露），留空即可——
+                        // 界面在没有到期时间时会只显示产品名。
+                        end_time: String::new(),
+                    }))),
+                    // 取不到会员信息不影响听歌，静默降级即可
+                    Err(error) => tlog!(crate::logger::LEVEL_WARN, "获取汽水会员信息失败：{error}"),
+                }
+            });
+            return;
+        }
 
         self.runtime.spawn(async move {
             match api.user_vip_detail().await {

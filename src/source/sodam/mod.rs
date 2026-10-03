@@ -543,6 +543,143 @@ pub async fn check_qr_session(api: &ApiClient, token: &str) -> Result<crate::api
 }
 
 // ============================================================================
+// 云端歌单 / 歌单曲目 / 歌单广场 / 用户资料 / 会员
+// ============================================================================
+//
+// 这几项走 `/luna/pc/` 一族，**要求应用签名**——这正是它们此前没接的原因，
+// 而不是「汽水没有这些接口」。签名服务接上之后就都能用了（见 `client`）。
+
+/// libresoda 的歌单 → 本项目的歌单。
+///
+/// `list_id` 单独填：本项目的云端增删歌曲要的是一个**数字 id**，而汽水自建
+/// 歌单的 id 本来就是数字串。解析失败就留 `None`——那说明这不是一个能写的
+/// 歌单，界面据此收起写操作入口。
+fn to_playlist(source: &libresoda::Playlist, is_own: bool) -> crate::api::model::Playlist {
+    crate::api::model::Playlist {
+        id: source.id.clone(),
+        list_id: source.id.trim().parse::<i64>().ok(),
+        name: source.name.clone(),
+        cover: Some(source.cover.clone()).filter(|url| !url.trim().is_empty()),
+        song_count: source.track_count.max(0) as u32,
+        creator: Some(source.creator.clone()).filter(|name| !name.trim().is_empty()),
+        description: Some(source.description.clone()).filter(|text| !text.trim().is_empty()),
+        is_own,
+    }
+}
+
+/// 云端「我的歌单」。
+///
+/// 需要登录（cookie）；未登录时服务端会拒绝。
+pub async fn user_playlists(api: &ApiClient) -> Result<Vec<crate::api::model::Playlist>> {
+    let soda = client::configure(api);
+    blocking("取云端歌单", move || {
+        // 这个端点只接受 libresoda 的 `(page, limit)`，没有游标。第 1 页一次
+        // 取够——界面另有「加载更多」，但先给足一次刷完的量，省得来回。
+        let playlists =
+            libresoda::soda::user_playlist::get_user_playlists(soda, 1, 100).map_err(convert)?;
+        Ok(playlists
+            .iter()
+            // 它只回自己创建的歌单，所以 is_own 恒为真
+            .map(|playlist| to_playlist(playlist, true))
+            .collect())
+    })
+    .await
+}
+
+/// 歌单广场（推荐歌单）。
+///
+/// 汽水**没有分类广场**（`get_playlist_categories` 在 libresoda 里就是
+/// `Unsupported`），只有一份推荐列表，因此忽略 `category_id`/`page` 参数——
+/// 界面的分类切换在汽水下会一直看到同一份内容，这比报错更符合预期（用户按的
+/// 是「换个分类看看」，而不是「我要报错」）。
+pub async fn plaza_playlists(
+    api: &ApiClient,
+    category_id: i64,
+    page: u32,
+    page_size: u32,
+) -> Result<Vec<crate::api::model::Playlist>> {
+    let _ = (api, category_id, page, page_size);
+    Err(AppError::Other(
+        "汽水没有「歌单广场」：参考实现里没有推荐歌单与分类端点\
+         （仅 `search_playlist` 可按关键词搜歌单）。\
+         可以切到别的音源看广场，或用搜索找歌单。"
+            .to_string(),
+    ))
+}
+
+/// 取一个歌单的全部曲目。
+///
+/// `list_id` 是歌单主键（汽水的 id 就是数字串）。
+pub async fn playlist_tracks(api: &ApiClient, playlist_id: &str) -> Result<Vec<Song>> {
+    let soda = client::configure(api);
+    let playlist_id = playlist_id.trim().to_string();
+    blocking("取歌单曲目", move || {
+        let songs =
+            libresoda::soda::playlist::get_playlist_songs(soda, &playlist_id).map_err(convert)?;
+        Ok(songs.iter().map(to_song).collect())
+    })
+    .await
+}
+
+/// 取一个歌单的**一页**曲目。
+///
+/// # 为什么和 [`playlist_tracks`] 是同一个实现
+///
+/// 汽水的歌单详情是**游标式**的，而 libresoda 暴露的分页入口
+/// （`fetch_playlist_detail_page`）回的是**未归一化的原始 `Value`**——它的形状
+/// 属于内部结构，照抄一遍就是猜。所以这里直接调公开的 `get_playlist_songs`
+/// 一次取全，把 `cursor` 忽略掉。
+///
+/// 代价是首屏多等一会儿（歌单很大时），换来的是**没有猜出来的解析逻辑**。
+/// 界面的「加载更多」在汽水下因此不会真正分页——但也不会重复追加，
+/// 因为每次拿到的都是完整列表。
+pub async fn playlist_tracks_page(
+    api: &ApiClient,
+    playlist_id: &str,
+    _cursor: &str,
+    _count: u32,
+) -> Result<Vec<Song>> {
+    playlist_tracks(api, playlist_id).await
+}
+
+/// 取当前账号的资料（昵称、头像、会员标记）。
+pub async fn user_detail(api: &ApiClient) -> Result<crate::api::cloud::UserInfo> {
+    let soda = client::configure(api);
+    blocking("取用户资料", move || {
+        let me = libresoda::soda::user_playlist::fetch_pc_me(soda).map_err(convert)?;
+        let info = me.my_info;
+        Ok(crate::api::cloud::UserInfo {
+            nickname: if info.nickname.trim().is_empty() {
+                info.public_name.clone()
+            } else {
+                info.nickname.clone()
+            },
+            pic: Some(libresoda::soda::types::build_image_url(
+                &info.larger_avatar_url,
+                "",
+            ))
+            .filter(|url| !url.trim().is_empty()),
+            // 汽水没有「用户等级」这个概念，也没有累计听歌时长。
+            grade: None,
+            duration_min: None,
+        })
+    })
+    .await
+}
+
+/// 当前账号是不是会员。
+///
+/// 官方 `/luna/pc/me` 直接给 `is_vip`，比「探测能不能拿整曲」可靠得多——
+/// 后者会被签名可用性干扰，把非会员误判成「拿不到整曲」。
+pub async fn is_vip_account(api: &ApiClient) -> Result<bool> {
+    let soda = client::configure(api);
+    blocking("查会员状态", move || {
+        libresoda::soda::account::is_vip_account(soda).map_err(convert)
+    })
+    .await
+}
+
+// ============================================================================
 // 不支持的能力
 // ============================================================================
 
