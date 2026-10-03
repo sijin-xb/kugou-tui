@@ -12,26 +12,19 @@
 # 因此触发只有 `workflow_dispatch`（手动）。这也与项目既有约定一致——
 # `scripts/release` 里刻意**不含** crates.io 这一步。
 #
-# # ⚠️ 当前会失败的已知原因
+# # 依赖为什么长这样（path + version 双写）
 #
-# `Cargo.toml` 里的 `libresoda` 是**本地路径依赖**（源码已随包内置在
-# `crates/libresoda/`），而 **crates.io 要求每个依赖都必须有 `version`**——
-# 发布时会用 registry 上的版本替换掉路径。crates.io 上没有 libresoda，
-# 所以必然被拒，报
-# 「all dependencies must have a version specified when publishing」。
-# （此前用 git 依赖时是同一个错误，只是提示里说的是 `git`。）
-# 下面的「检查依赖可发布性」步骤会先把它拦下来，给出人话说明，
-# 免得跑到一半看到一句 cargo 的原始报错。
+# 汽水 SDK 没有发到 crates.io（上游的名字 `libresoda` 在那里是空的，但我们
+# 不能抢——否则他们以后想发就被我们堵死），所以源码随包内置在
+# `crates/libresoda/`，并以 `libresoda-fork` 之名发到了 crates.io。
 #
-# 要让这个工作流真正跑通，得先解决 libresoda 的分发方式，三条路：
+# 于是主包的依赖写成 **path + version 双写**：本地构建走 path（改它立即生效），
+# 发布时 crates.io 剥掉 path、用 registry 上的 version。这正是 crates.io 对
+# path 依赖的要求——之前只写 path（更早是 git），都会在打包阶段被拒。
 #
-#   1. **让上游发布**：请 sodahub-org 把 libresoda 发到 crates.io，
-#      然后这里改成 `libresoda = "0.1"`（version 依赖）。最干净。
-#   2. **随包内置**：把 libresoda 的源码并进本仓库当模块（不是依赖），
-#      发布包自包含。代价是与上游脱钩，得自己跟。
-#   3. **不在 crates.io 发**：只走 GitHub Release（现状）。
-#      `cargo install --git` 仍然可用。
-#
+# `cargo publish --dry-run` 已全绿：发布包从 registry 拉 libresoda-fork
+# 编译通过。
+
 # # 用法
 #
 #   gh workflow run crates.yml                      # 真发布
