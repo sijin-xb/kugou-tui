@@ -29,7 +29,8 @@ path = "src/main.rs"
 members = ["crates/libresoda"]
 
 [dependencies]
-libresoda = { path = "crates/libresoda" }
+# 包名 libresoda-fork，Rust 侧 lib 名仍是 libresoda（见该 crate 的 Cargo.toml）。
+libresoda-fork = { path = "crates/libresoda", version = "0.1.0" }
 # --- TUI ---
 # 只依赖 ratatui，crossterm 通过 ratatui::crossterm 复用，避免版本错配
 ratatui = { version = "0.30", default-features = false, features = [

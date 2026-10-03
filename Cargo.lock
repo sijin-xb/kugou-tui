@@ -1771,7 +1771,7 @@ dependencies = [
  "flate2",
  "image",
  "libc",
- "libresoda",
+ "libresoda-fork",
  "qrcode",
  "ratatui",
  "ratatui-image",
@@ -1823,7 +1823,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "libresoda"
+name = "libresoda-fork"
 version = "0.1.0"
 dependencies = [
  "aes",

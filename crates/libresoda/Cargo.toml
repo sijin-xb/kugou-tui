@@ -17,12 +17,15 @@
 # 自己的 `crate::error` 冲突。独立 crate 的 `crate::` 各自指向各自根，代码零改动。
 
 [package]
-name = "libresoda"
+# 包名带 -fork 后缀：crates.io 上把上游的名字（libresoda）留给它自己，
+# 免得哪天上游想发的时候被我们堵死。Rust 侧的 lib 名仍是 libresoda，
+# 所以主包的代码一行都不用改。
+name = "libresoda-fork"
 # 上游是 0.1.0（未发布）。保持一致便于对照；不要发到 crates.io。
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "Rust port of music-lib's soda (汽水音乐 / Soda Music) implementation: search, playlists, albums, lyrics, VIP-aware stream resolution and CENC/MP4 audio decryption."
+description = "Fork of sodahub-org/libresoda (f02497e, AGPL-3.0-or-later), vendored for kugou-tui. Rust port of music-lib's soda (汽水音乐 / Soda Music) implementation: search, playlists, albums, lyrics, VIP-aware stream resolution and CENC/MP4 audio decryption."
 license = "AGPL-3.0-or-later"
 keywords = ["soda-music", "qishui", "douyin", "music", "decrypt"]
 categories = ["multimedia::audio", "api-bindings"]
