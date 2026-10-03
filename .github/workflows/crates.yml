@@ -83,6 +83,13 @@ jobs:
             echo "当前带 git 依赖的条目："
             grep -nE '^\s*[A-Za-z0-9_-]+\s*=.*git\s*=' Cargo.toml | sed 's/^/  /'
             echo
+            echo "cargo 的原始报错（已实测确认，失败发生在打包阶段、编译之前）："
+            echo
+            echo "  error: failed to verify manifest at Cargo.toml"
+            echo "  Caused by:"
+            echo "    all dependencies must have a version requirement specified when publishing."
+            echo "    dependency libresoda does not specify a version"
+            echo
             echo "解决方向（详见本工作流文件顶部的注释）："
             echo "  1. 请上游把该库发布到 crates.io，然后改成 version 依赖（最干净）"
             echo "  2. 把该库源码并进本仓库当模块，使发布包自包含"

@@ -17,6 +17,22 @@
 # 音频后端是 CoreAudio 而不是 ALSA，字体探测拿不到 `fc-list`。这些差异只有在
 # 那边真的跑一遍测试才看得见。没有这一栏，README 上就只能写「理论可用」。
 #
+# # 这里**只做验证**，不产出任何发行资产
+#
+# 三栏跑的都是 clippy + test，**不跑 `cargo build --release`、不打发行包、
+# 不传 artifact**。原因：
+#
+#   * release 构建带 `lto = "fat"` 与 `codegen-units = 1`，每次推送为三个平台
+#     各跑一遍要好几倍的时间，而**产物没有任何人用**——要下载二进制的人应该去
+#     Releases 页，那里有正式资产；
+#   * 打发行包那份工作 `release.yml` 在打 tag 时已经完整做过一遍，这里再做
+#     属于重复；
+#   * 「推 tag 之前先验证打包脚本」这个顾虑，由 `scripts/release` 的**阶段一**
+#     兜住——它本来就会在本机跑完 `make-release-tarball` 并停下来等确认，
+#     所以推 tag 之前一样看得见打包结果。CI 那份是重复的第二次。
+#
+# 简言之：**发行资产只由 `release.yml` 在发版时产出**，CI 负责「能不能合入」。
+#
 # # 本地等价命令
 #
 # 见 `CONTRIBUTING.md`「提交前请跑这三条」与 `docs/MAINTENANCE.md` §1.6。
@@ -62,53 +78,6 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
-      - run: cargo build --release
-
-      # 把编好的二进制传成 artifact，这样**任何一次 push** 都能直接下载来用，
-      # 不必等发版、也不必在本机重编一遍（`lto = "fat"` + `codegen-units = 1`
-      # 的 release 构建要跑好几分钟）。
-      #
-      # 三栏都传。早先只传了 Linux 这一份，理由是「Windows / macOS 的包由
-      # release.yml 在打 tag 时产出」——但那意味着平时想拿一份别的平台的二进制
-      # 只能等发版。多传两份的代价只是几 MB 存储（14 天过期），比「拿不到」划算。
-      #
-      # `if-no-files-found: error`：路径写错时宁可让这一步红掉，
-      # 也不要「上传了 0 个文件然后成功退出」——那种绿是最难查的。
-      - name: 上传二进制
-        uses: actions/upload-artifact@v4
-        with:
-          name: kugou-tui-linux-x86_64
-          path: target/release/kugou-tui
-          if-no-files-found: error
-          retention-days: 14
-
-      # 发行包也在**这里**打一遍，不等到打 tag。
-      #
-      # # 为什么必须提前
-      #
-      # 发行包此前只在 `release.yml` 里产出，而那是 tag 推上去之后——tag 不可撤销，
-      # 打包脚本要是漏了文件，只能发一个坏包或者认了。**这个项目真踩过**：
-      # 0.3.7 那版漏了三个脚本，非 Arch 用户解压后配不起接口服务。
-      # 那种错误在推 tag 之前发现，代价是零。
-      #
-      # # 为什么 macOS 那边也要跑
-      #
-      # `make-release-tarball` 是 bash 脚本，macOS 上用的是 BSD 的 `readlink` 与
-      # `shasum`（GNU 的 `readlink -f`、`sha256sum` 那边都不存在）。只在 Linux 上跑
-      # 等于只验证了一半——正是这个仓库花力气抹平的那类平台差异。
-      #
-      # Windows 那一栏本来就跑 `build-windows.ps1`（打包它自己那份 zip），
-      # 这里补上的是 Linux / macOS 的对称物。
-      - name: 打发行包（提前验证打包脚本）
-        run: ./scripts/make-release-tarball
-
-      - name: 上传发行包
-        uses: actions/upload-artifact@v4
-        with:
-          name: kugou-tui-linux-tarball
-          path: dist/*.tar.gz
-          if-no-files-found: error
-          retention-days: 14
 
   windows:
     name: Windows
@@ -127,24 +96,6 @@ jobs:
 
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
-      - run: cargo build --release
-
-      # 与 Linux 那一栏同一个理由，见那边的注释。
-      # 路径带 `.exe`：MSVC 目标产出的就是这个名字；写错会被
-      # `if-no-files-found: error` 当场拦住，而不是悄悄上传一个空包。
-      - name: 上传二进制
-        uses: actions/upload-artifact@v4
-        with:
-          name: kugou-tui-windows-x86_64
-          path: target/release/kugou-tui.exe
-          if-no-files-found: error
-          retention-days: 14
-
-      # 顺带验证打包脚本本身：它只能在这边跑（依赖 MSVC 工具链的产物），
-      # 而「打包漏文件」是这个项目真实踩过的坑（0.3.7 那版漏了脚本）。
-      - name: 打包
-        shell: pwsh
-        run: ./scripts/build-windows.ps1 -SkipBuild
 
   macos:
     name: macOS
@@ -162,30 +113,3 @@ jobs:
 
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
-      - run: cargo build --release
-
-      # 与 Linux 那一栏同一个理由，见那边的注释。
-      # `macos-latest` 是 arm64 机器，所以这份是 aarch64 二进制，在 Intel Mac 上跑不了
-      # —— 与 Release 页的产物是同一个限制，见 docs/RELEASE.md。
-      - name: 上传二进制
-        uses: actions/upload-artifact@v4
-        with:
-          name: kugou-tui-macos-arm64
-          path: target/release/kugou-tui
-          if-no-files-found: error
-          retention-days: 14
-
-      # 发行包提前打一遍，理由见 Linux 那一栏的注释：`release.yml` 里那份是 tag
-      # 推出去之后才跑的，而打包脚本漏文件是这个项目真实踩过的坑。
-      # 这一栏尤其不能省——`make-release-tarball` 里为 BSD 工具（`readlink`、
-      # `shasum`）写的那几段分支，只有在 macOS 上才会被执行到。
-      - name: 打发行包（提前验证打包脚本）
-        run: ./scripts/make-release-tarball
-
-      - name: 上传发行包
-        uses: actions/upload-artifact@v4
-        with:
-          name: kugou-tui-macos-tarball
-          path: dist/*.tar.gz
-          if-no-files-found: error
-          retention-days: 14
