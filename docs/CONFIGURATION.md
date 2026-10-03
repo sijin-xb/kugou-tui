@@ -15,6 +15,11 @@
 | `--tick-ms <MS>` | — | 刷新间隔，50–5000，调大可进一步降低 CPU |
 | `--page-size <N>` | — | 搜索结果与歌单广场的每页条目数，5–200 |
 | `--proxy <URL>` | `KUGOU_PROXY` | 访问 API 服务时用的 HTTP 代理 |
+| `--sodam-cookie <COOKIE>` | `SODAM_COOKIE` | 汽水音乐的登录态，形如 `sessionid_ss=…; sessionid=…` |
+| `--sodam-device-id <ID>` | `SODAM_DEVICE_ID` | 汽水的设备指纹，必须与签名凭证里的设备一致 |
+| `--sodam-iid <ID>` | `SODAM_IID` | 汽水的 install id |
+| `--sodam-x-helios <VALUE>` | `SODAM_X_HELIOS` | 汽水应用签名头；**VIP 整曲与无损音质靠它**，缺了只剩试听 |
+| `--sodam-x-medusa <VALUE>` | `SODAM_X_MEDUSA` | 汽水应用签名头（与上面成对使用） |
 | `--basic-color` | — | 使用 16 色固定色板，适配老终端 |
 | `--no-tray` | — | 不注册系统托盘图标（也可用配置里的 `tray = false` 长期关闭） |
 | `--no-api-start` | `KUGOU_API_AUTO_START=0` | 不自动拉起本机接口服务（服务由你自己管理，端口上没服务时直接报错） |
@@ -83,6 +88,45 @@ cover_fill = "crop"                 # 首页大封面怎么铺满，见下方说
 tray = true                         # 系统托盘，见下方说明
 api_auto_start = true               # 服务没起时自动拉起，见下方说明
 api_dir = ""                        # 本机 KuGouMusicApi 目录，留空 = 自动查找
+
+# ---- 各音源的连接与身份，以及当前选中的那个 ----
+# 四个音源各自独立：登录态与设备标识**不能跨音源复用**。
+# 详见「使用指南」的音源章节。
+[sources]
+active = "kugou"                   # kugou | kugou_concept | netease | sodam
+
+[sources.kugou]
+enabled = true
+api_base = "http://127.0.0.1:3000"  # 本机 KuGouMusicApi（标准版）
+cookie = "token=…; userid=…"        # 该音源自己的登录态
+device_id = "…"                      # 该音源自己的 dfid
+priority = 0                         # 数字小的排前面
+
+[sources.kugou_concept]
+enabled = true
+api_base = "http://127.0.0.1:3001"  # 本机 KuGouMusicApi（platform=lite）
+priority = 10
+
+[sources.netease]
+enabled = true
+api_base = "http://127.0.0.1:3002"  # 本机 NeteaseCloudMusicApi
+priority = 20
+
+[sources.sodam]
+enabled = true
+api_base = "https://api.qishui.com" # 汽水**直连公网**，本机不需要服务
+cookie = "sessionid_ss=…; sessionid=…"
+device_id = "…"                      # 与下面 sodam_app 里的设备保持一致
+priority = 30
+
+# 汽水的应用级签名凭证：决定「VIP 整曲与无损能不能拿到」。
+# 三者齐了才有整曲；缺了会退化成 30/60 秒试听（现象很像「会员没生效」）。
+# 抓包方式见「使用指南」的汽水章节。
+[sources.sodam_app]
+device_id = "…"                      # 与 [sources.sodam].device_id 一致
+iid = "…"                            # install id
+x_helios = "…"                       # 请求头 x-helios（会过期）
+x_medusa = "…"                       # 请求头 x-medusa（会过期）
 ```
 
 ### 接口服务的自动拉起
