@@ -80,7 +80,10 @@ impl App {
         let candidates: Vec<SourceKind> = SourceKind::ALL
             .iter()
             .copied()
-            .filter(|kind| kind.capability().login)
+            // 汽水的 `login` 为真（它确实有登录态），但**只支持手填 cookie**，
+            // 走不通下面这套扫码流程。放进选择器的话，用户会选到它然后卡在
+            // 「二维码出不来」——所以这里额外排掉它，在配置里手填即可。
+            .filter(|kind| kind.capability().login && kind.supports_qr_login())
             .collect();
 
         match candidates.len() {

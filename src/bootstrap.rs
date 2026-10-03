@@ -177,7 +177,13 @@ pub fn detach() {
 pub fn prepare(config: &Config) -> Result<&'static str> {
     let kind = config.active_source_kind();
     let Some((name, platform)) = instance_of(kind) else {
-        return Ok("该音源不由本程序托管其接口服务");
+        // 两种「不托管」的原因不同，话也要分开说：汽水是**本来就没有**本机服务
+        // （它直连公网），说成「不托管」会让人以为要去别处准备一个。
+        return Ok(if kind.is_remote() {
+            "该音源直连公网，不需要本机接口服务"
+        } else {
+            "该音源不由本程序托管其接口服务"
+        });
     };
 
     let Some((host, port)) = parse_endpoint(&config.api_base) else {
@@ -292,6 +298,16 @@ pub fn stop_recorded() -> Result<usize> {
 // 实例与端点
 // ======================================================================
 
+/// 本机是否托管该音源的接口服务。
+///
+/// 面向「这个音源要不要准备服务？」这一问，`prepare` 与 `ensure_running`
+/// 都据此跳过。单独给一个具名函数，是为了让别处（`source` 的测试）
+/// 能直接断言这个约定，而不必把 `instance_of` 的返回结构也变成公开 API。
+#[cfg(test)]
+pub fn manages_service(kind: SourceKind) -> bool {
+    instance_of(kind).is_some()
+}
+
 /// 音源 → （实例名, 服务端的 `platform` 参数）。
 ///
 /// 酷狗的两个平台是两套独立的鉴权体系，平台由服务端启动参数决定，所以必须各跑一个
@@ -302,6 +318,10 @@ fn instance_of(kind: SourceKind) -> Option<(&'static str, Option<&'static str>)>
         SourceKind::KugouConcept => Some(("lite", Some("lite"))),
         // 网易云走的是 NeteaseCloudMusicApi，另一套服务、另一套安装方式
         SourceKind::Netease => None,
+        // 汽水直连公网（api.qishui.com），本机没有、也不该有它的服务进程。
+        // 返回 `None` 会让 `prepare` 直接说「该音源不由本程序托管其接口服务」，
+        // 也让 `ensure_running` 跳过——这正是我们要的：既不下载也不 spawn。
+        SourceKind::Sodam => None,
     }
 }
 

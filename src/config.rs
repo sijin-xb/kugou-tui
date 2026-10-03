@@ -203,6 +203,14 @@ pub struct Config {
     pub sources: SourceSet,
 }
 
+/// 把命令行传上来的可选字符串收拾成「有内容才 Some」。
+///
+/// 空串与纯空白都当**没传**：用户在 shell 里拼变量时很容易传出空值，
+/// 若照单全收就会把配置里已有的值抹掉——那比「参数没生效」更难排查。
+fn non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 fn default_api_auto_start() -> bool {
     true
 }
@@ -470,6 +478,30 @@ impl Config {
         if cli.no_api_start {
             self.api_auto_start = false;
         }
+
+        // 汽水的凭据与签名：只覆盖**显式传了**的项，其余保留配置文件里的值。
+        // 逐项覆盖而不是整块替换——用户可能只想补一个签名头，
+        // 不该因为没传 `--sodam-iid` 就把已配的 iid 清掉。
+        if let Some(cookie) = non_empty(cli.sodam_cookie.as_deref()) {
+            let profile = self.sources.profile_mut(SourceKind::Sodam);
+            profile.cookie = Some(cookie.to_string());
+        }
+        if let Some(device_id) = non_empty(cli.sodam_device_id.as_deref()) {
+            // 设备的指纹存在**档案**里（`device_id` 字段），签名凭证里另存一份
+            // `device_id` 是为了与 `x-helios` 成对持久化；两者同步写入。
+            self.sources.profile_mut(SourceKind::Sodam).device_id = Some(device_id.to_string());
+            self.sources.sodam_app.device_id = device_id.to_string();
+        }
+        if let Some(iid) = non_empty(cli.sodam_iid.as_deref()) {
+            self.sources.sodam_app.iid = iid.to_string();
+        }
+        if let Some(helios) = non_empty(cli.sodam_x_helios.as_deref()) {
+            self.sources.sodam_app.x_helios = helios.to_string();
+        }
+        if let Some(medusa) = non_empty(cli.sodam_x_medusa.as_deref()) {
+            self.sources.sodam_app.x_medusa = medusa.to_string();
+        }
+
         self.normalize();
     }
 
@@ -491,6 +523,52 @@ impl Config {
             if profile.api_base.trim().is_empty() {
                 profile.api_base = kind.default_api_base().to_string();
                 profile.enabled = true;
+            }
+        }
+
+        // 汽水的设备指纹在**两个地方**各存了一份：档案的 `device_id`（通用字段）
+        // 与签名凭证的 `device_id`（要跟 `x-helios` 成对）。这里补齐缺失的一侧，
+        // 让「只在一处配了」也能工作。
+        //
+        // 哪一侧优先：档案里的显式值。反过来（凭证侧有值就灌进档案）也说得通，
+        // 但档案是用户直接编辑的那份，语义上更「权威」。
+        if self.sources.sodam_app.device_id.trim().is_empty() {
+            if let Some(device_id) = self
+                .sources
+                .profile(SourceKind::Sodam)
+                .device_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                self.sources.sodam_app.device_id = device_id.to_string();
+            }
+        } else if self
+            .sources
+            .profile(SourceKind::Sodam)
+            .device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| value.is_empty())
+            .is_some()
+        {
+            self.sources.profile_mut(SourceKind::Sodam).device_id =
+                Some(self.sources.sodam_app.device_id.trim().to_string());
+        }
+
+        // 签名凭证的字符串统一去空白：抓包工具很容易在末尾带一个换行或空格，
+        // 而签名头是**精确比对**的，多一个字符就失效。
+        for field in [
+            &mut self.sources.sodam_app.device_id,
+            &mut self.sources.sodam_app.iid,
+            &mut self.sources.sodam_app.fp,
+            &mut self.sources.sodam_app.x_helios,
+            &mut self.sources.sodam_app.x_medusa,
+            &mut self.sources.sodam_app.user_agent,
+        ] {
+            let trimmed = field.trim();
+            if trimmed.len() != field.len() {
+                *field = trimmed.to_string();
             }
         }
 
@@ -553,6 +631,17 @@ impl Config {
 
     /// 是否已配置登录态。
     pub fn is_logged_in(&self) -> bool {
+        // 汽水的凭据存在**自己档案**里，不走顶层的 `self.cookie`：
+        // 它直连公网，没有「服务端替它管 cookie」这回事。
+        if self.active_source_kind() == SourceKind::Sodam {
+            return self
+                .sources
+                .profile(SourceKind::Sodam)
+                .cookie
+                .as_deref()
+                .is_some_and(|cookie| cookie.contains("sessionid"));
+        }
+
         self.cookie
             .as_deref()
             .map(|cookie| {
@@ -637,7 +726,10 @@ fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::Config;
+    use crate::Cli;
     use crate::source::SourceKind;
+    use crate::source::sodam;
+    use clap::Parser;
 
     #[test]
     fn normalizes_api_base_and_volume() {
@@ -778,6 +870,211 @@ volume = 0.5
         assert_eq!(
             config.cookie_header().as_deref(),
             Some("token=t; userid=1; dfid=keep")
+        );
+    }
+
+    // ==================================================================
+    // 汽水音乐
+    // ==================================================================
+
+    /// 命令行传汽水凭据时要写进**它自己的档案**，不能碰到当前音源（酷狗）。
+    ///
+    /// 写错地方的后果很隐蔽：cookie 进了 `[sources.kugou]`，于是下次启动
+    /// 切回酷狗时带着一串汽水的 cookie 发过去，而汽水的登录态永远读不到。
+    #[test]
+    fn cli_sodam_credentials_land_in_the_soda_profile() {
+        let cli = Cli::parse_from([
+            "kugou-tui",
+            "--sodam-cookie",
+            "sessionid_ss=abc",
+            "--sodam-device-id",
+            "2204957404565290",
+            "--sodam-iid",
+            "iid-7",
+            "--sodam-x-helios",
+            "helios-1",
+            "--sodam-x-medusa",
+            "medusa-1",
+        ]);
+
+        let mut config = Config::default();
+        config.merge_cli(&cli);
+
+        let soda = config.sources.profile(SourceKind::Sodam);
+        assert_eq!(soda.cookie.as_deref(), Some("sessionid_ss=abc"));
+        assert_eq!(soda.device_id.as_deref(), Some("2204957404565290"));
+        // 酷狗那边不能被污染
+        assert!(config.sources.profile(SourceKind::Kugou).cookie.is_none());
+
+        let app = &config.sources.sodam_app;
+        assert_eq!(app.device_id, "2204957404565290");
+        assert_eq!(app.iid, "iid-7");
+        assert_eq!(app.x_helios, "helios-1");
+        assert_eq!(app.x_medusa, "medusa-1");
+        assert!(app.is_complete(), "三者齐备应判定为完整");
+    }
+
+    /// 只传一部分参数时，其余的必须保留配置文件里的值。
+    ///
+    /// 整块替换会让「只想临时补一个签名头」变成「把已配的 iid 抹掉」——
+    /// 而 iid 抹掉后整曲取流直接失效，比参数没生效更难排查。
+    #[test]
+    fn cli_sodam_credentials_merge_rather_than_replace() {
+        let mut config = Config::default();
+        config.sources.sodam_app = sodam::client::AppCredentials {
+            device_id: "dev-1".to_string(),
+            iid: "iid-original".to_string(),
+            x_helios: "helios-original".to_string(),
+            x_medusa: "medusa-original".to_string(),
+            ..Default::default()
+        };
+
+        let cli = Cli::parse_from(["kugou-tui", "--sodam-x-helios", "helios-new"]);
+        config.merge_cli(&cli);
+
+        assert_eq!(
+            config.sources.sodam_app.x_helios, "helios-new",
+            "传了的要更新"
+        );
+        assert_eq!(
+            config.sources.sodam_app.iid, "iid-original",
+            "没传的必须保留"
+        );
+        assert_eq!(config.sources.sodam_app.x_medusa, "medusa-original");
+        assert_eq!(config.sources.sodam_app.device_id, "dev-1");
+    }
+
+    /// 空串与纯空白都当「没传」——shell 拼变量时很容易传出空值，
+    /// 照单全收会把已有配置抹掉。
+    #[test]
+    fn empty_cli_values_do_not_clobber_existing_config() {
+        let mut config = Config::default();
+        config.sources.sodam_app.x_helios = "helios-keep".to_string();
+
+        let cli = Cli::parse_from(["kugou-tui", "--sodam-x-helios", "   "]);
+        config.merge_cli(&cli);
+
+        assert_eq!(config.sources.sodam_app.x_helios, "helios-keep");
+    }
+
+    /// 签名头是**精确比对**的，抓包工具带来的尾随空白会让它直接失效。
+    #[test]
+    fn normalize_trims_signature_credentials() {
+        let mut config = Config::default();
+        config.sources.sodam_app.x_helios = "  helios \n".to_string();
+        config.sources.sodam_app.x_medusa = "medusa\t".to_string();
+        config.normalize();
+
+        assert_eq!(config.sources.sodam_app.x_helios, "helios");
+        assert_eq!(config.sources.sodam_app.x_medusa, "medusa");
+    }
+
+    /// 设备指纹在档案与签名凭证里各存一份，normalize 要把它们对齐，
+    /// 否则「只在一处配了」会静默失效。
+    #[test]
+    fn normalize_syncs_the_two_copies_of_sodam_device_id() {
+        // 只在档案里配了 → 补进签名凭证
+        let mut config = Config::default();
+        config.sources.profile_mut(SourceKind::Sodam).device_id = Some("dev-1".to_string());
+        config.normalize();
+        assert_eq!(config.sources.sodam_app.device_id, "dev-1");
+
+        // 只在签名凭证里配了 → 补进档案
+        let mut config = Config::default();
+        config.sources.profile_mut(SourceKind::Sodam).device_id = Some("  ".to_string());
+        config.sources.sodam_app.device_id = "dev-2".to_string();
+        config.normalize();
+        assert_eq!(
+            config
+                .sources
+                .profile(SourceKind::Sodam)
+                .device_id
+                .as_deref(),
+            Some("dev-2")
+        );
+    }
+
+    /// 汽水的登录态不走顶层 `cookie`，`is_logged_in` 必须按当前音源分别判断。
+    #[test]
+    fn is_logged_in_uses_the_per_source_credentials() {
+        let mut config = Config::default();
+        config.sources.active = SourceKind::Sodam;
+        assert!(!config.is_logged_in(), "没配 cookie 就是未登录");
+
+        config.sources.profile_mut(SourceKind::Sodam).cookie = Some("sessionid_ss=abc".to_string());
+        assert!(config.is_logged_in(), "配了 sessionid 就算已登录");
+
+        // 切回酷狗后，汽水的登录态不该让它显示成「已登录」
+        config.sources.active = SourceKind::Kugou;
+        assert!(!config.is_logged_in());
+    }
+
+    /// 老配置里没有汽水的段时，normalize 要补上公网地址并置为启用。
+    #[test]
+    fn normalize_backfills_sodam_for_existing_configs() {
+        let mut config = Config::default();
+        // 模拟老配置：汽水的段缺失，serde 给了默认（地址为空）
+        config.sources.sodam.api_base = String::new();
+        config.normalize();
+
+        assert_eq!(config.sources.sodam.api_base, "https://api.qishui.com");
+        assert!(
+            config.sources.sodam.enabled,
+            "新音源默认要能用，不能要用户手动开"
+        );
+    }
+
+    /// `device_id` 对汽水是**设备标识**而不是酷狗的 dfid，
+    /// 所以不能被拼进 cookie 头。
+    #[test]
+    fn sodam_cookie_header_does_not_append_device_id() {
+        let mut profile = crate::source::SourceProfile::new(SourceKind::Sodam);
+        profile.cookie = Some("sessionid_ss=abc".to_string());
+        profile.device_id = Some("2204957404565290".to_string());
+
+        assert_eq!(
+            profile.cookie_header(SourceKind::Sodam).as_deref(),
+            Some("sessionid_ss=abc"),
+            "汽水不认 dfid，拼上去反而可能被判异常"
+        );
+    }
+
+    /// 汽水的配置要能**写进 TOML 再读回来**——`config.toml` 是用户手动编辑的地方，
+    /// 序列化不过就等于没法手填。
+    #[test]
+    fn sodam_credentials_survive_a_toml_round_trip() {
+        let mut config = Config::default();
+        config.sources.active = SourceKind::Sodam;
+        config.sources.profile_mut(SourceKind::Sodam).cookie =
+            Some("sessionid_ss=abc; sessionid=def".to_string());
+        config.sources.profile_mut(SourceKind::Sodam).device_id = Some("dev-1".to_string());
+        config.sources.sodam_app = sodam::client::AppCredentials {
+            device_id: "dev-1".to_string(),
+            iid: "iid-1".to_string(),
+            fp: String::new(),
+            x_helios: "helios-1".to_string(),
+            x_medusa: "medusa-1".to_string(),
+            user_agent: String::new(),
+        };
+
+        let text = toml::to_string_pretty(&config).expect("汽水配置要能序列化");
+        // 落盘后是用户能看懂、能手改的东西
+        assert!(text.contains("[sources.sodam]"), "实际：\n{text}");
+        assert!(text.contains("[sources.sodam_app]"), "实际：\n{text}");
+        assert!(text.contains("sessionid_ss=abc"));
+
+        let parsed: Config = toml::from_str(&text).expect("汽水配置要能读回来");
+        assert_eq!(parsed.sources.active, SourceKind::Sodam);
+        assert_eq!(
+            parsed.sources.profile(SourceKind::Sodam).cookie.as_deref(),
+            Some("sessionid_ss=abc; sessionid=def")
+        );
+        assert_eq!(parsed.sources.sodam_app.x_helios, "helios-1");
+        assert_eq!(parsed.sources.sodam_app.x_medusa, "medusa-1");
+        assert_eq!(parsed.sources.sodam_app.iid, "iid-1");
+        assert!(
+            parsed.sources.sodam_app.is_complete(),
+            "读回来后仍应判定为完整"
         );
     }
 }

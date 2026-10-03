@@ -112,6 +112,10 @@ fn not_logged_in_hint(source: SourceKind) -> String {
         SourceKind::Kugou | SourceKind::KugouConcept => {
             "云端歌单需要登录，请配置 cookie（--cookie 或配置文件）".to_string()
         }
+        // 汽水没有云端歌单（`Capability::cloud` 为假），这个分支走不到；
+        // 仍给一条明确的话而不是 unreachable!()——万一将来接上了，
+        // 用户看到的是「怎么登录」而不是程序崩溃。
+        SourceKind::Sodam => "汽水音乐没有云端歌单功能".to_string(),
     }
 }
 
@@ -898,6 +902,7 @@ impl App {
         true
     }
 
+    /// 浏览态下的按键分发。
     fn handle_normal_action(&mut self, action: Action) {
         match action {
             Action::None => {}
@@ -926,6 +931,10 @@ impl App {
             // 控制：这两页正是「看着歌词 / 频谱听歌」的页面，切歌是最高频的操作。
             // 有列表的页面（搜索 / 歌单 / 歌手 / 榜单 / 云端 / 队列 / 设置）↑↓
             // 依旧是列表导航，抢走它等于抢走核心交互。
+            //
+            // 焦点在**侧边栏**或**队列**时不能抢：那两个焦点各有自己的 ↑↓ 语义
+            // （见 `move_selection`）。少了这个条件，Tab 键把焦点交给侧边栏之后
+            // ↑↓ 就会切歌，而高亮还停在侧边栏上——看起来像程序没反应。
             Action::MoveDown if matches!(self.state.tab, Tab::Home | Tab::Visualizer) => {
                 self.next_track(true);
             }
@@ -1124,6 +1133,17 @@ impl App {
         &self,
         kind: SourceKind,
     ) -> crate::error::Result<crate::api::ApiClient> {
+        // 汽水的应用签名凭证要在**造客户端时**同步到进程级槽位：它不是
+        // HTTP 层能表达的东西（不是 cookie、也不是 URL 参数），
+        // 而分派层的方法签名统一只收 `&ApiClient`。
+        //
+        // 这里顺带**无条件**同步（而不是只在 `kind == Sodam` 时）：切歌、
+        // 跨音源播放都会经过这个函数，而凭证是「本机的汽水身份」，
+        // 只有一个值。每次都写同一个值，开销可以忽略。
+        crate::source::sodam::client::set_active_credentials(
+            self.state.config.sources.sodam_app.clone(),
+        );
+
         if kind == self.state.config.active_source_kind() {
             // 当前音源已经有现成的客户端，直接复用（省一次连接池重建）
             return Ok(self.api.clone());
@@ -2281,7 +2301,10 @@ impl App {
             // 要跳到中间（续播上次的位置）时**不能**走流式：缓冲里只有开头那点
             // 数据，seek 到几百秒的位置会阻塞等下载、超时失败，结果从头播
             // ——用户实测「边听边下载会直接从最开始听」就是这个。
-            if start_at_ms > 0 {
+            //
+            // 汽水（`file://`）也走这条：它整首已经下完并解密了，流式缓冲
+            // 那套「边下边播」对它没有意义——文件就在本地，直接复制进缓存。
+            if start_at_ms > 0 || crate::audio::download::is_local_url(&url) {
                 match downloader.fetch_to(&url, &target, &progress).await {
                     Ok(_) => bus.emit(Loaded::StreamCached {
                         song: Box::new(song),

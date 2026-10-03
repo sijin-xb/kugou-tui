@@ -58,6 +58,35 @@ pub struct Cli {
     #[arg(long, env = "KUGOU_PROXY", value_name = "URL")]
     pub proxy: Option<String>,
 
+    /// 汽水音乐的登录 cookie，形如 `sessionid_ss=xxx; sessionid=yyy`。
+    ///
+    /// 汽水**只支持手填 cookie**，不支持扫码（见 `Capability` 的说明）。
+    /// 留空则匿名使用：搜索、歌词、免费歌曲与试听片段都不受影响。
+    #[arg(long, env = "SODAM_COOKIE", value_name = "COOKIE")]
+    pub sodam_cookie: Option<String>,
+
+    /// 汽水音乐的设备指纹 `device_id`（16 位数字）。
+    ///
+    /// 与签名头绑定：这里填的值必须与当初抓包时的设备一致，
+    /// 否则整曲取流端点会返回空响应。
+    #[arg(long, env = "SODAM_DEVICE_ID", value_name = "ID")]
+    pub sodam_device_id: Option<String>,
+
+    /// 汽水音乐的应用签名头 `x-helios`。
+    ///
+    /// **VIP 整曲与无损才需要它**：没有它时汽水的 App 端点会返回
+    /// 「HTTP 200 + 空 body」，表现为 VIP 歌只能拿到 30 秒试听。
+    /// 抓包方式见 `docs/USER_GUIDE.md` 的「汽水音乐音源」一节。
+    #[arg(long, env = "SODAM_X_HELIOS", value_name = "VALUE")]
+    pub sodam_x_helios: Option<String>,
+
+    /// 汽水音乐的应用签名头 `x-medusa`（与 `--sodam-x-helios` 成对使用）。
+    #[arg(long, env = "SODAM_X_MEDUSA", value_name = "VALUE")]
+    pub sodam_x_medusa: Option<String>,
+
+    /// 汽水音乐的 install id `iid`。
+    #[arg(long, env = "SODAM_IID", value_name = "ID")]
+    pub sodam_iid: Option<String>,
     /// 启动时使用固定色板（16 色），适配老终端。
     #[arg(long)]
     pub basic_color: bool,

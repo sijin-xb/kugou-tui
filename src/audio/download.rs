@@ -63,6 +63,92 @@ impl ChunkRange {
     }
 }
 
+/// `url` 是否指向一个本地文件（汽水解密后的产物）。
+///
+/// 调用方用它决定「要不要走流式下载」：本地文件已经完整躺在盘上，
+/// 流式缓冲那套「边下边播」对它没有意义。
+pub fn is_local_url(url: &str) -> bool {
+    url.starts_with("file://")
+}
+
+/// 把 `file://` URL 还原成本地路径；不是本地 URL 则返回 `None`。
+///
+/// 只认 `file://` 开头，且**必须**是绝对路径（`file:///...`）。
+/// 相对路径的 `file://` 在不同平台上含义不同，宁可当成普通 URL 交给
+/// 上层报错，也不要猜。
+fn local_file_path(url: &str) -> Option<std::path::PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    // Windows 上是 file:///C:/path，Unix 上是 file:///path —— 都要能吃下。
+    // 去掉可能的 leading slash（Unix 保留，Windows 的 /C:/ 需要去掉）。
+    let path = if cfg!(windows) {
+        rest.strip_prefix('/').unwrap_or(rest)
+    } else {
+        rest
+    };
+    // URL 里的百分号编码要还原（路径里有空格/中文时 reqwest 类库会这么写）
+    Some(std::path::PathBuf::from(percent_decode(path)))
+}
+
+/// 还原 `%XX` 编码。非法转义原样保留（宁可路径报错，也不要静默改写）。
+fn percent_decode(value: &str) -> String {
+    if !value.contains('%') {
+        return value.to_string();
+    }
+    let bytes = value.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let high = (bytes[index + 1] as char).to_digit(16);
+            let low = (bytes[index + 2] as char).to_digit(16);
+            if let (Some(high), Some(low)) = (high, low) {
+                out.push((high * 16 + low) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 把本地文件复制到 `target`，带进度回调。
+///
+/// 写 `.part` 再改名，与网络下载路径一致：中途失败不会留下
+/// 「看起来完整」的坏缓存文件。
+///
+/// 整首复制在 `spawn_blocking` 里做：几十 MB 的拷贝是纯 IO，
+/// 放异步线程上会把那个工作线程占住。
+async fn copy_local(source: &Path, target: &Path, progress: ProgressFn<'_>) -> Result<u64> {
+    let metadata = tokio::fs::metadata(source)
+        .await
+        .map_err(|error| AppError::io_at(source.display().to_string(), error))?;
+    let total = metadata.len();
+
+    let source = source.to_path_buf();
+    let target = target.to_path_buf();
+    let temp = target.with_extension("part");
+    let source_for_task = source.clone();
+    let temp_for_task = temp.clone();
+
+    let copied = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        std::fs::copy(&source_for_task, &temp_for_task)
+    })
+    .await
+    .map_err(|error| AppError::Other(format!("本地文件复制任务失败：{error}")))?
+    .map_err(|error| AppError::io_at(source.display().to_string(), error))?;
+
+    // 失败时清掉半截的 .part，否则下次会拿它当缓存（`cache.find` 只看文件存在）
+    if let Err(error) = std::fs::rename(&temp, &target) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(AppError::io_at(target.display().to_string(), error));
+    }
+
+    progress(copied, Some(total));
+    Ok(copied)
+}
+
 /// 解析 `Content-Range: bytes <start>-<end>/<total|*>`。
 ///
 /// 只认这一种写法。服务端回 `Content-Range` 的目的就是声明「这确实是你要的那一段」，
@@ -208,6 +294,17 @@ impl Downloader {
         target: &Path,
         progress: ProgressFn<'_>,
     ) -> Result<u64> {
+        // 本地文件（汽水解密后的产物）：直接复制，不走网络。
+        //
+        // 为什么需要这条分支：汽水的音频是加密的，取链那层已经把
+        // 「下载 + 解密 + 落盘」做完了，交回来的是一个 `file://` 路径
+        // 而不是 HTTP 直链。这里把它复制进音频缓存，于是缓存查找
+        // （`cache.find`）、回收、预取全都照常生效——不必给汽水
+        // 单开一套缓存逻辑。
+        if let Some(path) = local_file_path(url) {
+            return copy_local(&path, target, progress).await;
+        }
+
         // 先问一次 HEAD：拿到文件长度和「是否支持 Range」。
         // 支持并发就并发——一首 8 MB 的歌单连接爬要十几秒，分 4 块通常能砍到
         // 三分之一；不支持（或文件太小）就老老实实单连接，别为省几秒把
@@ -530,6 +627,12 @@ impl Downloader {
     /// 酷狗的直链形如 `http://xxx/yyy.mp3?token=...`，扩展名在路径段里，
     /// 所以要先把 query 和 fragment 去掉再取后缀。
     pub fn extension_from_url(url: &str) -> &'static str {
+        // 汽水的解密产物是 `file:///…/名字.m4a`：路径就是文件名的一部分，
+        // 不能按 URL 那样先砍 query 再猜。直接交给路径解析。
+        if let Some(path) = local_file_path(url) {
+            return Self::extension_from_path(&path);
+        }
+
         let without_fragment = url.split('#').next().unwrap_or(url);
         let without_query = without_fragment
             .split('?')
@@ -550,6 +653,26 @@ impl Downloader {
             "wav" => "wav",
             "ape" => "ape",
             // 推断不出来时按 mp3 存：rodio 走的是内容探测，扩展名只影响缓存查找
+            _ => "mp3",
+        }
+    }
+
+    /// 从本地路径推断缓存扩展名。
+    fn extension_from_path(path: &Path) -> &'static str {
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        match extension.as_str() {
+            "mp3" => "mp3",
+            "flac" => "flac",
+            "m4a" | "mp4" => "m4a",
+            "aac" => "aac",
+            "ogg" | "oga" => "ogg",
+            "wav" => "wav",
+            "ape" => "ape",
             _ => "mp3",
         }
     }

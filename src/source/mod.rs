@@ -20,7 +20,9 @@
 //! - 酷狗的两个平台走同一套接口语义（都是 KuGouMusicApi），差异全部收敛在
 //!   `api_base` / `cookie` / `device_id` 上，因此共用 [`crate::api`] 里的实现；
 //! - 网易云是**另一套服务**（NeteaseCloudMusicApi）：端点、参数名、以及「登录态
-//!   归谁保管」都不一样，实现放在 [`netease`] 子模块，由分派层按 kind 选路。
+//!   归谁保管」都不一样，实现放在 [`netease`] 子模块，由分派层按 kind 选路；
+//! - 汽水**根本不跑本地服务**，直接打公网，而且下发的音频是加密的（取链要把
+//!   「下载 + 解密」做完）。它自带一个 HTTP 客户端与一套解密实现，见 [`sodam`]。
 //!
 //! # 曾经删掉的东西
 //!
@@ -31,6 +33,7 @@
 //!
 
 pub mod netease;
+pub mod sodam;
 
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +63,12 @@ pub enum SourceKind {
     KugouConcept,
     /// 网易云音乐（NeteaseCloudMusicApi）。
     Netease,
+    /// 汽水音乐（Soda Music）。**直连公网**，不需要本地接口服务。
+    ///
+    /// 与前三个的区别不只是「服务在哪儿」：它的音频流是 MP4/CENC 加密的，
+    /// 取链要把「下载 + 解密 + 落盘」整件事做完才能播，因此不能边下边播。
+    /// 详见 [`sodam`] 模块。
+    Sodam,
 }
 
 /// 一个音源具备哪些能力。
@@ -95,10 +104,11 @@ pub struct Capability {
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 3] = [
+    pub const ALL: [SourceKind; 4] = [
         SourceKind::Kugou,
         SourceKind::KugouConcept,
         SourceKind::Netease,
+        SourceKind::Sodam,
     ];
 
     /// 界面显示名。
@@ -107,6 +117,7 @@ impl SourceKind {
             SourceKind::Kugou => "酷狗",
             SourceKind::KugouConcept => "酷狗概念版",
             SourceKind::Netease => "网易云",
+            SourceKind::Sodam => "汽水音乐",
         }
     }
 
@@ -138,6 +149,28 @@ impl SourceKind {
                 cloud: true,
                 vip: false,
             },
+            // 汽水音乐：直连公网，不经本地接口服务。
+            //
+            // * `stream` / `lyric` / `cover`：搜索走免签名网关，这三项匿名可用。
+            // * `login`：支持——但**只支持手填 cookie**，不支持扫码。
+            //   汽水的扫码要驱动 Chromium 跑签名页（libresoda 的 cdp-signer），
+            //   为一个 TUI 拉一整套浏览器依赖不划算，所以这里只提供 cookie 登录。
+            //   `client_token` 为真：登录态由客户端持有并写进配置。
+            // * `catalog` / `cloud`：**都不支持**。汽水的歌单 / 榜单 / 歌手接口
+            //   要么不存在、要么同样要应用签名，且本项目用不上它们的写入能力。
+            //   声明为假，界面就不会展示那些入口，而不是让用户点了才报错。
+            // * `vip`：有 `/luna/pc/me`，但它同样要应用签名；没配签名时探测结果
+            //   不可信。与其给一个可能错的「是不是会员」，不如先不提供这个面板。
+            SourceKind::Sodam => Capability {
+                stream: true,
+                lyric: true,
+                cover: true,
+                login: true,
+                client_token: true,
+                catalog: false,
+                cloud: false,
+                vip: false,
+            },
         }
     }
 
@@ -145,12 +178,38 @@ impl SourceKind {
     ///
     /// 酷狗两个平台各占一个端口：它们需要不同的 `platform` 环境变量，
     /// 而一个 Node 进程只能加载一份 `.env`。
+    ///
+    /// 汽水是**公网**地址（它不跑本地服务），留在这里是为了让「音源档案」
+    /// 的结构对四个音源一致——`switch_source` 与界面展示都按同一套逻辑走，
+    /// 不必为汽水开特例。
     pub fn default_api_base(self) -> &'static str {
         match self {
             SourceKind::Kugou => "http://127.0.0.1:3000",
             SourceKind::KugouConcept => "http://127.0.0.1:3001",
             SourceKind::Netease => "http://127.0.0.1:3002",
+            SourceKind::Sodam => "https://api.qishui.com",
         }
+    }
+
+    /// 该音源是否支持**扫码**登录。
+    ///
+    /// 与 [`Capability::login`] 区分：后者只说「有没有登录态」，
+    /// 汽水有（手填 cookie 即可），但它的扫码要驱动 Chromium 跑签名页，
+    /// 本项目不引入那套依赖。因此它 `login = true` 而本方法为 `false`，
+    /// 登录选择器据此把它排除，改在配置里手填。
+    pub fn supports_qr_login(self) -> bool {
+        match self {
+            SourceKind::Kugou | SourceKind::KugouConcept | SourceKind::Netease => true,
+            SourceKind::Sodam => false,
+        }
+    }
+
+    /// 该音源是否直连公网（不经本机接口服务）。
+    ///
+    /// 影响两件事：`bootstrap` 不为它准备服务；界面不显示「接口地址」那类
+    /// 暗示「本机有个服务在跑」的文案。
+    pub fn is_remote(self) -> bool {
+        matches!(self, SourceKind::Sodam)
     }
 
     /// 该音源服务端的 `platform` 取值，用于启动脚本与文档提示。
@@ -158,7 +217,7 @@ impl SourceKind {
         match self {
             SourceKind::Kugou => None,
             SourceKind::KugouConcept => Some("lite"),
-            SourceKind::Netease => None,
+            SourceKind::Netease | SourceKind::Sodam => None,
         }
     }
 
@@ -178,6 +237,8 @@ impl SourceKind {
         match self {
             SourceKind::Kugou | SourceKind::KugouConcept => "酷狗",
             SourceKind::Netease => "网易云音乐",
+            // 汽水不走扫码（见 `Capability` 的说明），这个值只用于错误提示文案。
+            SourceKind::Sodam => "汽水音乐",
         }
     }
 
@@ -186,6 +247,8 @@ impl SourceKind {
         match self {
             SourceKind::Kugou | SourceKind::KugouConcept => "KuGouMusicApi",
             SourceKind::Netease => "NeteaseCloudMusicApi",
+            // 没有服务：直连公网。
+            SourceKind::Sodam => "汽水公网接口",
         }
     }
 }
@@ -319,6 +382,19 @@ pub struct SourceSet {
     pub kugou_concept: SourceProfile,
     #[serde(default)]
     pub netease: SourceProfile,
+    /// 汽水音乐的连接与身份（公网地址 + 登录态 + 启停与优先级）。
+    ///
+    /// 结构与另外三个一致，这样 `profile()` / `ordered()` / `enabled()`
+    /// 那些遍历全部音源的逻辑不必为它开特例。
+    #[serde(default)]
+    pub sodam: SourceProfile,
+    /// 汽水的应用签名凭证（`x-helios` / `x-medusa` + 设备指纹）。
+    ///
+    /// 单独放一个具名字段而不是塞进 [`SourceProfile`]：这三个值不是「身份」，
+    /// 而是「设备 + 签名」，且**只有汽水用得上**。塞进通用结构会让另外三个
+    /// 音源的档案里也出现永远为空的字段。
+    #[serde(default)]
+    pub sodam_app: sodam::client::AppCredentials,
     /// 当前选中的音源。
     pub active: SourceKind,
 }
@@ -329,6 +405,8 @@ impl Default for SourceSet {
             kugou: SourceProfile::new(SourceKind::Kugou),
             kugou_concept: SourceProfile::new(SourceKind::KugouConcept),
             netease: SourceProfile::new(SourceKind::Netease),
+            sodam: SourceProfile::new(SourceKind::Sodam),
+            sodam_app: sodam::client::AppCredentials::default(),
             active: SourceKind::Kugou,
         }
     }
@@ -340,6 +418,7 @@ impl SourceSet {
             SourceKind::Kugou => &self.kugou,
             SourceKind::KugouConcept => &self.kugou_concept,
             SourceKind::Netease => &self.netease,
+            SourceKind::Sodam => &self.sodam,
         }
     }
 
@@ -348,6 +427,7 @@ impl SourceSet {
             SourceKind::Kugou => &mut self.kugou,
             SourceKind::KugouConcept => &mut self.kugou_concept,
             SourceKind::Netease => &mut self.netease,
+            SourceKind::Sodam => &mut self.sodam,
         }
     }
 
@@ -404,6 +484,20 @@ fn stamp_songs(songs: &mut [Song], kind: SourceKind) {
     }
 }
 
+/// 汽水解密中间文件的存放目录。
+///
+/// 放在**音频缓存目录下的独立子目录**，而不是系统临时目录，理由有二：
+///
+/// * 同盘：临时目录在某些发行版上是个 tmpfs（内存盘），一首无损几十 MB
+///   写进去会直接吃内存；缓存目录是真实磁盘。
+/// * 不干扰缓存统计：缓存容量统计会遍历根目录下的音频文件，
+///   中间文件混进去会让「已用空间」对不上，也可能在回收时被误删。
+///
+/// 子目录名与音频缓存里的命名规则（内容哈希）不冲突，两边互不覆盖。
+fn scratch_dir() -> std::path::PathBuf {
+    crate::config::default_cache_dir().join("sodam")
+}
+
 impl SourceKind {
     /// 单曲搜索。
     pub async fn search_songs(
@@ -416,6 +510,10 @@ impl SourceKind {
         let mut songs = match self {
             Self::Kugou | Self::KugouConcept => client.search_songs(keyword, page, page_size).await,
             Self::Netease => netease::search_songs(client, keyword, page, page_size).await,
+            Self::Sodam => {
+                let soda = sodam::client_of(client)?;
+                sodam::search_songs(&soda, keyword, page, page_size).await
+            }
         }?;
         stamp_songs(&mut songs, self);
         Ok(songs)
@@ -431,6 +529,13 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.song_stream_url(song, quality).await,
             Self::Netease => netease::song_stream_url(client, song, quality).await,
+            Self::Sodam => {
+                let soda = sodam::client_of(client)?;
+                // 解密后的中间文件放在音频缓存目录下的专用子目录里：它不是
+                // 「可直接播放的缓存」（命名也不同），但同属可重建的派生物。
+                let scratch = scratch_dir();
+                sodam::song_stream_url(&soda, song, quality, &scratch).await
+            }
         }
     }
 
@@ -442,6 +547,10 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => Ok(song.cover.clone()),
             Self::Netease => netease::cover_url(client, song).await,
+            Self::Sodam => {
+                let soda = sodam::client_of(client)?;
+                sodam::cover_url(&soda, song).await
+            }
         }
     }
 
@@ -450,6 +559,10 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.fetch_lyric(song).await,
             Self::Netease => netease::fetch_lyric(client, song).await,
+            Self::Sodam => {
+                let soda = sodam::client_of(client)?;
+                sodam::fetch_lyric(&soda, song).await
+            }
         }
     }
 
@@ -458,6 +571,7 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.login_qr_key().await,
             Self::Netease => netease::login_qr_key(client).await,
+            Self::Sodam => Err(sodam::unsupported("扫码登录（请在配置里手填 cookie）")),
         }
     }
 
@@ -466,6 +580,7 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.login_qr_create(key).await,
             Self::Netease => netease::login_qr_create(client, key).await,
+            Self::Sodam => Err(sodam::unsupported("扫码登录（请在配置里手填 cookie）")),
         }
     }
 
@@ -478,6 +593,7 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.login_qr_check(key).await,
             Self::Netease => netease::login_qr_check(client, key).await,
+            Self::Sodam => Err(sodam::unsupported("扫码登录（请在配置里手填 cookie）")),
         }
     }
 
@@ -498,6 +614,7 @@ impl SourceKind {
                 client.plaza_playlists(category_id, page, page_size).await
             }
             Self::Netease => netease::plaza_playlists(client, category_id, page, page_size).await,
+            Self::Sodam => Err(sodam::unsupported("歌单广场")),
         }
     }
 
@@ -538,6 +655,7 @@ impl SourceKind {
             (Self::Netease, PlaylistRef::Public(global_id)) => {
                 netease::playlist_tracks_page(client, global_id, page, page_size).await
             }
+            (Self::Sodam, _) => Err(sodam::unsupported("歌单浏览")),
         }?;
         stamp_songs(&mut songs, self);
         Ok(songs)
@@ -552,6 +670,7 @@ impl SourceKind {
         let mut songs = match self {
             Self::Kugou | Self::KugouConcept => client.playlist_tracks_all(global_id, fresh).await,
             Self::Netease => netease::playlist_tracks_all(client, global_id).await,
+            Self::Sodam => Err(sodam::unsupported("歌单浏览")),
         }?;
         stamp_songs(&mut songs, self);
         Ok(songs)
@@ -566,6 +685,7 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.artist_list(kind, hot_size).await,
             Self::Netease => netease::artist_list(client, kind, hot_size).await,
+            Self::Sodam => Err(sodam::unsupported("歌手浏览")),
         }
     }
 
@@ -578,6 +698,7 @@ impl SourceKind {
         let mut songs = match self {
             Self::Kugou | Self::KugouConcept => client.artist_tracks_all(artist_id, sort).await,
             Self::Netease => netease::artist_tracks_all(client, artist_id).await,
+            Self::Sodam => Err(sodam::unsupported("歌手浏览")),
         }?;
         stamp_songs(&mut songs, self);
         Ok(songs)
@@ -587,6 +708,7 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.rank_boards().await,
             Self::Netease => netease::rank_boards(client).await,
+            Self::Sodam => Err(sodam::unsupported("排行榜")),
         }
     }
 
@@ -594,6 +716,7 @@ impl SourceKind {
         let mut songs = match self {
             Self::Kugou | Self::KugouConcept => client.rank_tracks_all(rank_id).await,
             Self::Netease => netease::rank_tracks_all(client, rank_id).await,
+            Self::Sodam => Err(sodam::unsupported("排行榜")),
         }?;
         stamp_songs(&mut songs, self);
         Ok(songs)
@@ -603,6 +726,7 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.user_playlists().await,
             Self::Netease => netease::user_playlists(client).await,
+            Self::Sodam => Err(sodam::unsupported("云端歌单")),
         }
     }
 
@@ -614,6 +738,7 @@ impl SourceKind {
         match self {
             Self::Kugou | Self::KugouConcept => client.user_detail().await,
             Self::Netease => netease::user_detail(client).await,
+            Self::Sodam => Err(sodam::unsupported("用户资料")),
         }
     }
 
@@ -629,6 +754,7 @@ impl SourceKind {
             }
             // 网易云没有「自己的歌单」专用端点，按 id 取即可
             Self::Netease => netease::playlist_tracks_all(client, &list_id.to_string()).await,
+            Self::Sodam => Err(sodam::unsupported("云端歌单")),
         }?;
         stamp_songs(&mut songs, self);
         Ok(songs)
@@ -728,6 +854,131 @@ mod tests {
             profile.cookie_header(SourceKind::Netease).as_deref(),
             Some("MUSIC_A_T=1; MUSIC_U=abc"),
             "属性段与 `;;` 都要被清掉"
+        );
+    }
+
+    // ==================================================================
+    // 汽水音乐
+    // ==================================================================
+
+    /// `SourceKind::ALL` 是音源管理页、切换轮转、`normalize` 补默认值的共同依据。
+    /// 少登记一个变体，那几处就会静默地漏掉它——用户看不到、也报错不出来。
+    #[test]
+    fn all_lists_every_source_kind_exactly_once() {
+        let all = SourceKind::ALL;
+        assert_eq!(all.len(), 4, "四个音源都要登记");
+        for kind in SourceKind::ALL {
+            let count = all.iter().filter(|candidate| **candidate == kind).count();
+            assert_eq!(count, 1, "{kind:?} 重复登记了");
+        }
+    }
+
+    /// 汽水直连公网：不能被 `bootstrap` 当成本机服务去拉起，
+    /// 界面上也不该显示成「本机接口地址」。
+    #[test]
+    fn sodam_is_remote_and_untouched_by_bootstrap() {
+        assert!(SourceKind::Sodam.is_remote());
+        for kind in [
+            SourceKind::Kugou,
+            SourceKind::KugouConcept,
+            SourceKind::Netease,
+        ] {
+            assert!(!kind.is_remote(), "{kind:?} 是本机服务，不该标成 remote");
+        }
+        // manages_service 为假时 bootstrap 才会跳过（见 bootstrap.rs）
+        assert!(!crate::bootstrap::manages_service(SourceKind::Sodam));
+        assert!(crate::bootstrap::manages_service(SourceKind::Kugou));
+    }
+
+    /// 汽水的凭据与 dfid 不能和酷狗串台。
+    #[test]
+    fn sodam_never_carries_the_kugou_device_fingerprint() {
+        let mut profile = SourceProfile::new(SourceKind::Sodam);
+        profile.cookie = Some("sessionid_ss=abc".to_string());
+        profile.device_id = Some("2204957404565290".to_string());
+
+        // 汽水的 device_id 是它自己的设备标识，不是酷狗的 dfid，
+        // 因此**不能**被拼进 cookie（服务端不认，反而可能被判异常）
+        assert_eq!(
+            profile.cookie_header(SourceKind::Sodam).as_deref(),
+            Some("sessionid_ss=abc")
+        );
+    }
+
+    /// 汽水的档案要与另外三个一样参与排序与启停——否则它在音源管理页里
+    /// 会消失，或者优先级调整对它无效。
+    #[test]
+    fn sodam_profile_participates_in_ordering() {
+        let mut set = SourceSet::default();
+        set.sodam.enabled = false;
+
+        let ordered = set.ordered();
+        assert!(ordered.contains(&SourceKind::Sodam), "排序结果要含汽水");
+        assert!(
+            !set.enabled().contains(&SourceKind::Sodam),
+            "禁用的汽水不该出现在已启用列表里"
+        );
+
+        set.sodam.enabled = true;
+        assert!(set.enabled().contains(&SourceKind::Sodam));
+    }
+
+    /// 登录选择器按 `supports_qr_login` 过滤：汽水有登录态但走不通扫码，
+    /// 混进去会让用户卡在「二维码出不来」。
+    #[test]
+    fn qr_login_candidates_exclude_sodam() {
+        let candidates: Vec<SourceKind> = SourceKind::ALL
+            .iter()
+            .copied()
+            .filter(|kind| kind.capability().login && kind.supports_qr_login())
+            .collect();
+
+        assert!(
+            !candidates.contains(&SourceKind::Sodam),
+            "汽水不该进扫码列表"
+        );
+        assert!(candidates.contains(&SourceKind::Kugou));
+        assert!(candidates.contains(&SourceKind::Netease));
+    }
+
+    /// 汽水的 `catalog` / `cloud` 声明为假，界面据此隐藏歌单广场与云端同步入口。
+    #[test]
+    fn sodam_declares_no_catalog_or_cloud() {
+        let capability = SourceKind::Sodam.capability();
+        assert!(!capability.catalog, "不支持歌单/榜单/歌手");
+        assert!(!capability.cloud, "不支持云端歌单");
+        // 这三项是匿名可用的，必须为真，否则搜索进来也是白搭
+        assert!(capability.stream);
+        assert!(capability.lyric);
+        assert!(capability.cover);
+    }
+
+    /// 老配置文件里没有汽水的段，反序列化后仍要拿到可用的默认值。
+    #[test]
+    fn sodam_defaults_survive_a_config_without_it() {
+        // 模拟老配置：只有酷狗两个音源 + netease，没有 sodam / sodam_app
+        let text = r#"
+            active = "kugou"
+
+            [sources.kugou]
+            api_base = "http://127.0.0.1:3000"
+
+            [sources.kugou_concept]
+            api_base = "http://127.0.0.1:3001"
+
+            [sources.netease]
+            api_base = "http://127.0.0.1:3002"
+        "#;
+
+        let set: SourceSet = toml::from_str(text).expect("老配置应能解析");
+        assert_eq!(set.sodam.api_base, "", "缺失的段走 Default");
+        assert!(set.sodam.enabled, "默认必须是启用的，否则新音源要手动开");
+        assert_eq!(set.sodam_app, sodam::client::AppCredentials::default());
+
+        // normalize 会把空地址补成公网地址（见 config.rs 的 normalize）
+        assert_eq!(
+            SourceKind::Sodam.default_api_base(),
+            "https://api.qishui.com"
         );
     }
 }

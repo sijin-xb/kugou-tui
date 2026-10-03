@@ -237,6 +237,9 @@ fn print_effective_config(config: &Config) {
         kind.label(),
         match kind.platform_env() {
             Some(value) => format!("（服务端需 platform={value}）"),
+            // 汽水直连公网，没有「服务端」这回事；写成「服务端不设 platform」
+            // 会让人以为本机该有个服务在跑。
+            None if kind.is_remote() => "（直连公网，无需本地服务）".to_string(),
             None => "（服务端不设 platform）".to_string(),
         }
     );
@@ -248,6 +251,22 @@ fn print_effective_config(config: &Config) {
             "未登录（云端歌单不可用）"
         }
     );
+
+    // 汽水的签名凭证单独说清：它决定「VIP 整曲 / 无损能不能拿到」，
+    // 而现象是「只有 30 秒试听」——不说清的话用户很难联想到要配这个。
+    if kind == crate::source::SourceKind::Sodam {
+        let app = &config.sources.sodam_app;
+        println!(
+            "签名凭证  : {}",
+            if app.is_complete() {
+                "完整（可取整曲）"
+            } else if app.has_device_fingerprint() {
+                "缺 x-helios / x-medusa（VIP 整曲与无音乐会退化成试听片段）"
+            } else {
+                "未配置（仅试听片段与免费音质）"
+            }
+        );
+    }
     println!(
         "设备指纹  : {}",
         config.dfid.as_deref().unwrap_or("（尚未获取）")

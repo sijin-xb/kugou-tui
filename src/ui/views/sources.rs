@@ -82,6 +82,11 @@ pub fn render_sources(
                 spans.push(Span::styled("  当前", theme.now_playing()));
             }
 
+            // 地址。汽水直连公网，标一下，免得用户以为本机该有个服务在跑
+            // 却发现 3000/3001/3002 端口上什么都没有。
+            if kind.is_remote() {
+                spans.push(Span::styled("  公网直连", theme.dim()));
+            }
             spans.push(Span::styled(format!("  {}", profile.api_base), theme.dim()));
 
             ratatui::widgets::ListItem::new(Line::from(spans))
