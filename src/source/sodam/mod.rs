@@ -340,7 +340,19 @@ pub async fn song_stream_url(
         )?;
 
         let is_trial = info.is_preview || libresoda::soda::quality::is_preview(&info, full_seconds);
-        let reason = describe_reason(is_trial, &info, &detail);
+
+        // 只拿到试听时，用 libresoda 的专用诊断**问清原因**。
+        //
+        // 它的 `StreamAccessReport` 正是为这件事设计的：`hint` 是可直接展示的
+        // 人话结论，`app_error` 是 App 端点失败时的原始原因，另有三个标志说明
+        // 「差哪一环」（cookie / 设备指纹 / 签名服务）。只回一句「只有试听片段」
+        // 等于把排查工作全推给用户——而这里有现成的答案。
+        let report = if is_trial {
+            libresoda::soda::stream::check_stream_access(soda, &track_id).ok()
+        } else {
+            None
+        };
+        let reason = describe_reason(is_trial, &info, &detail, report.as_ref());
         tlog!(
             LEVEL_INFO,
             "汽水取流完成：{}（{} {}）",
@@ -378,12 +390,39 @@ fn describe_reason(
     is_trial: bool,
     info: &libresoda::soda::types::DownloadInfo,
     detail: &libresoda::Song,
+    report: Option<&libresoda::soda::stream::StreamAccessReport>,
 ) -> Option<String> {
     if is_trial {
         let mut reason = "只有试听片段".to_string();
-        if detail.is_vip {
+
+        // 优先用 libresoda 的结论：它已经判断过「缺 cookie / 缺设备指纹 /
+        // 缺签名服务 / 端点回空 body」这些情况，比我们自己猜准。
+        if let Some(report) = report {
+            if !report.hint.trim().is_empty() {
+                reason.push_str(&format!("：{}", report.hint.trim()));
+            }
+            // 差哪一环，逐项列出来——用户据此才知道下一步做什么。
+            let mut blockers: Vec<&str> = Vec::new();
+            if !report.has_cookie {
+                blockers.push("未登录");
+            }
+            if !report.has_app_credentials {
+                blockers.push("未配设备指纹");
+            }
+            if !report.has_signature_provider {
+                blockers.push("未配签名服务");
+            }
+            if !blockers.is_empty() {
+                reason.push_str(&format!("〔{}〕", blockers.join("、")));
+            }
+            // App 端点被拒的原始原因。有它才能区分「没签名」与「签名过期」。
+            if !report.app_error.trim().is_empty() {
+                reason.push_str(&format!("（App 端点：{}）", report.app_error.trim()));
+            }
+        } else if detail.is_vip {
             reason.push_str("：该曲需要汽水会员");
         }
+
         if info.bitrate > 0 {
             reason.push_str(&format!("（已下到 {} kbps）", info.bitrate / 1000));
         }
@@ -847,7 +886,7 @@ mod tests {
             is_vip: true,
             ..Default::default()
         };
-        let reason = describe_reason(true, &info, &detail).unwrap();
+        let reason = describe_reason(true, &info, &detail, None).unwrap();
         assert!(reason.contains("试听"), "实际：{reason}");
         assert!(reason.contains("会员"), "实际：{reason}");
     }
@@ -858,7 +897,7 @@ mod tests {
             quality: "standard".to_string(),
             ..Default::default()
         };
-        let reason = describe_reason(false, &info, &libresoda::Song::default()).unwrap();
+        let reason = describe_reason(false, &info, &libresoda::Song::default(), None).unwrap();
         assert!(reason.contains("standard"), "音质降级要如实说明：{reason}");
     }
 
@@ -866,7 +905,7 @@ mod tests {
     #[test]
     fn describe_reason_is_none_when_there_is_nothing_to_say() {
         let info = libresoda::soda::types::DownloadInfo::default();
-        assert!(describe_reason(false, &info, &libresoda::Song::default()).is_none());
+        assert!(describe_reason(false, &info, &libresoda::Song::default(), None).is_none());
     }
 
     #[test]
