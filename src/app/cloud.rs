@@ -341,17 +341,18 @@ impl App {
                 .sources
                 .profile_mut(SourceKind::Sodam)
                 .cookie = Some(cookie);
-            // 客户端每次按音源重建（`client_of`），这里同步热更新当前那个，
-            // 让「登录成功后立刻查会员/资料」不必等下一次切音源。
-            if let Ok(mut api) = self.client_for(SourceKind::Sodam) {
-                api.set_cookie(
-                    self.state
-                        .config
-                        .sources
-                        .profile(SourceKind::Sodam)
-                        .cookie_header(SourceKind::Sodam),
-                );
-            }
+            // ⚠️ 必须改 `self.api` 本身，不能写 `self.client_for(Sodam)`。
+            // 音源已激活时 `client_for` 返回的是 `self.api.clone()`，改那个副本
+            // 对 `self.api` 毫无影响——于是「登录成功后立刻查会员/资料」用的仍是
+            // 没有 cookie 的客户端，服务端回 `1000016 登录状态已失效`。
+            // （`client_for` 只在**跨音源**取链时才有意义，那时它确实会新建。）
+            self.api.set_cookie(
+                self.state
+                    .config
+                    .sources
+                    .profile(SourceKind::Sodam)
+                    .cookie_header(SourceKind::Sodam),
+            );
         } else {
             self.state.config.cookie = Some(cookie);
             self.api.set_cookie(self.state.config.cookie_header());

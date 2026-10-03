@@ -336,6 +336,18 @@ impl Config {
     /// 登录成功或自动取到 dfid 后调用，保证切走再切回来时身份还在。
     pub fn sync_active_source(&mut self) {
         let kind = self.sources.active;
+
+        // 汽水**不参与镜像**：它的凭据存在自己档案里（`[sources.sodam].cookie`），
+        // 而顶层 `cookie` 是酷狗的地盘。
+        //
+        // 镜像会让刚登录成功的汽水被顶层的空值覆盖——`save()` 第一件事就是调
+        // 这里，所以时序是「写入 cookie → 立刻 save → 被覆盖成 None」，
+        // 表现出来就是**登录成功、一重启却说没登录**，而且配置文件里根本找不到
+        // cookie 这个键（用户看到的现象正是如此）。
+        if kind == SourceKind::Sodam {
+            return;
+        }
+
         let profile = self.sources.profile_mut(kind);
         // 刻意**不**回写 api_base：它是音源自己的身份，不该被运行时的地址覆盖。
         // 否则一旦用 `--api-base` 临时指向别处，就会把该音源的地址改坏——
@@ -831,6 +843,58 @@ mod tests {
         assert_eq!(profile.device_id.as_deref(), Some("df-1"));
         // 另一个音源不该被牵连（两个平台的登录态不通用）
         assert!(config.sources.profile(SourceKind::Kugou).cookie.is_none());
+    }
+
+    /// **回归**：`save()` 不能把刚登录的汽水凭据覆盖掉。
+    ///
+    /// 真实现象：汽水扫码登录成功、配置文件里却找不到 cookie，重启后显示「未登录」。
+    /// 根因是 `save()` 第一件事就是调 `sync_active_source()`，而它会执行
+    /// `profile.cookie = self.cookie.clone()`——顶层 cookie 是酷狗的地盘，汽水时
+    /// 恒为 None，于是刚写进去的凭据立刻被覆盖成 None。
+    #[test]
+    fn saving_must_not_clobber_the_soda_cookie() {
+        let mut config = Config::default();
+        config.sources.active = SourceKind::Sodam;
+        // 模拟「扫码登录成功」：凭据写进汽水档案。顶层 cookie 保持为空（那是酷狗的）。
+        config.sources.profile_mut(SourceKind::Sodam).cookie =
+            Some("sessionid_ss=abc; sid_guard=xyz".to_string());
+
+        config.sync_active_source();
+
+        assert_eq!(
+            config.sources.profile(SourceKind::Sodam).cookie.as_deref(),
+            Some("sessionid_ss=abc; sid_guard=xyz"),
+            "汽水的凭据不能被顶层的空 cookie 覆盖"
+        );
+        // 顶层不该被反向写入汽水的凭据
+        assert!(config.cookie.is_none(), "顶层 cookie 是酷狗的地盘");
+    }
+
+    /// 反过来，酷狗/网易云仍要按老规矩把顶层身份镜像进档案——这是它们
+    /// 从顶层字段读登录态的既有路径，不能一起取消。
+    #[test]
+    fn other_sources_still_mirror_the_top_level_identity() {
+        for kind in [
+            SourceKind::Kugou,
+            SourceKind::KugouConcept,
+            SourceKind::Netease,
+        ] {
+            let mut config = Config {
+                cookie: Some("token=t; userid=1".to_string()),
+                dfid: Some("df-1".to_string()),
+                ..Config::default()
+            };
+            config.sources.active = kind;
+            config.sync_active_source();
+
+            let profile = config.sources.profile(kind);
+            assert_eq!(
+                profile.cookie.as_deref(),
+                Some("token=t; userid=1"),
+                "{kind:?}"
+            );
+            assert_eq!(profile.device_id.as_deref(), Some("df-1"), "{kind:?}");
+        }
     }
 
     /// 同步刻意**不**回写 api_base：地址属于音源自己，不该被运行时的临时值污染。
