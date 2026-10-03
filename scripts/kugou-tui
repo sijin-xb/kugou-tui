@@ -121,7 +121,21 @@ prefer_system_api_dir() {
 
 # 实例名（standard / lite）—— 与 `scripts/kugou-api` 的实例名、PID 文件命名保持一致。
 # 这样启动器拉起来的服务，`kugou-api status` 看得见、`kugou-api stop` 停得掉。
+#
+# `NEEDS_SERVICE=0` 表示**该音源没有本机服务**，下面整套探活/拉起/等就绪都要跳过。
+# 目前只有汽水是这样：它直连公网（api.qishui.com），本机既没有、也不该有它的进程。
+NEEDS_SERVICE=1
+
 case "$ACTIVE_SOURCE" in
+  sodam)
+    # 汽水直连公网。这里刻意不给 API_DIR 兜底成酷狗的目录——那正是老的
+    # `*)` 分支干的事：用户选了汽水，启动器却去把 KuGouMusicApi 拉起来，
+    # 提示写着「未运行，正在启动…（端口 3000）」，而汽水根本用不上它。
+    NEEDS_SERVICE=0
+    API_DIR=""
+    SERVICE_NAME="汽水公网接口"
+    INSTANCE_NAME="sodam"
+    ;;
   netease)
     API_DIR="${NETEASE_API_DIR:-$(prefer_system_api_dir netease "$HOME/NeteaseCloudMusicApi")}"
     SERVICE_NAME="NeteaseCloudMusicApi"
@@ -252,22 +266,27 @@ if [ -n "$DRY_RUN" ]; then
   printf '配置文件    : %s\n' "$config_file"
   printf '当前音源    : %s%s\n' "${ACTIVE_SOURCE:-kugou}" \
     "$([ -n "$ACTIVE_SOURCE" ] || printf '（默认）')"
-  printf '实例        : %s（PID 文件 %s）\n' "$INSTANCE_NAME" "$PID_FILE"
-  printf '探测地址    : %s（端口 %s%s）\n' \
-    "$CHECK_BASE" "$API_PORT" "${API_PLATFORM:+，平台 $API_PLATFORM}"
-  printf '服务目录    : %s\n' "$API_DIR"
-  printf '服务日志    : %s\n' "$API_LOG"
   printf '播放器      : %s\n' "$BIN"
   printf '透传参数    : %s\n' "${PLAYER_ARGS[*]-}"
-  if api_alive; then
-    printf '服务在跑吗  : 在跑\n'
+  if [ "$NEEDS_SERVICE" = 0 ]; then
+    # 说清「不需要」而不是打一串用不上的端口/目录：那会让人以为还得去准备点东西。
+    printf '接口服务    : 不需要（该音源直连公网，本机没有服务）\n'
   else
-    printf '服务在跑吗  : 没起\n'
+    printf '实例        : %s（PID 文件 %s）\n' "$INSTANCE_NAME" "$PID_FILE"
+    printf '探测地址    : %s（端口 %s%s）\n' \
+      "$CHECK_BASE" "$API_PORT" "${API_PLATFORM:+，平台 $API_PLATFORM}"
+    printf '服务目录    : %s\n' "$API_DIR"
+    printf '服务日志    : %s\n' "$API_LOG"
+    if api_alive; then
+      printf '服务在跑吗  : 在跑\n'
+    else
+      printf '服务在跑吗  : 没起\n'
+    fi
   fi
   exit 0
 fi
 
-if ! api_alive; then
+if [ "$NEEDS_SERVICE" = 1 ] && ! api_alive; then
   if [ ! -d "$API_DIR" ]; then
     printf '\033[33m%s 未运行，且目录不存在：%s\033[0m\n' "$SERVICE_NAME" "$API_DIR" >&2
     printf '先执行：\n  kugou-api-install %s\n' "${ACTIVE_SOURCE:-kugou}" >&2

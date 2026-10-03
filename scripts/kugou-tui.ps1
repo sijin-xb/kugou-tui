@@ -171,14 +171,19 @@ if (-not (Test-Path -LiteralPath $bin -PathType Leaf)) {
 $activeSource = Get-ConfigValue -Text $configText -Key 'active'
 if (-not $activeSource) { $activeSource = 'kugou' }
 
+# 汽水直连公网（api.qishui.com），本机既没有、也不该有它的服务进程。
+# `$needsService` 为假时，下面整套探活/拉起/等就绪都要跳过——否则用户选了汽水，
+# 启动器却去把 KuGouMusicApi 拉起来，提示写着「未运行，正在启动…」，而它根本用不上。
+$isSodam = $activeSource -eq 'sodam'
 $isNetease = $activeSource -eq 'netease'
-$serviceName = if ($isNetease) { 'NeteaseCloudMusicApi' } else { 'KuGouMusicApi' }
+$needsService = -not $isSodam
+$serviceName = if ($isSodam) { '汽水公网接口' } elseif ($isNetease) { 'NeteaseCloudMusicApi' } else { 'KuGouMusicApi' }
 $defaultApiDirName = if ($isNetease) { 'NeteaseCloudMusicApi' } else { 'KuGouMusicApi' }
 
 # 实例名（standard / lite）——与 `kugou-api`（bash 版与 kugou-api.ps1）的实例名、
 # PID 文件命名保持一致。这样启动器拉起来的服务，`kugou-api.ps1 status` 看得见、
 # `kugou-api.ps1 stop` 停得掉；否则就只能靠任务管理器手杀 node。
-$instanceName = if ($activeSource -eq 'kugou_concept') { 'lite' } else { 'standard' }
+$instanceName = if ($isSodam) { 'sodam' } elseif ($activeSource -eq 'kugou_concept') { 'lite' } else { 'standard' }
 $pidFile = Join-Path $cacheDir "api-$instanceName.pid"
 
 # 服务目录按**当前音源**选择。写死 KuGouMusicApi 会导致：当前音源是网易云时，
@@ -238,20 +243,26 @@ if ($dryRun) {
     Write-Host '--- dry-run：只打印决策，不启动任何东西 ---' -ForegroundColor Cyan
     Write-Host "配置        : $configFile"
     Write-Host "当前音源    : $activeSource"
-    Write-Host "实例        : $instanceName（PID 文件 $pidFile）"
-    Write-Host "探测地址    : $checkBase（端口 $apiPort$platformNote）"
-    Write-Host "服务目录    : $apiDir"
-    Write-Host "服务日志    : $apiLog"
     Write-Host "播放器      : $bin"
     Write-Host "透传参数    : $($playerArgs -join ' ')"
-    Write-Host "服务在跑吗  : $(if (Test-ApiAlive $checkBase) { '在跑' } else { '没起' })"
+    if (-not $needsService) {
+        # 说清「不需要」而不是打一串用不上的端口/目录：那会让人以为还得去准备点东西。
+        Write-Host '接口服务    : 不需要（该音源直连公网，本机没有服务）'
+    }
+    else {
+        Write-Host "实例        : $instanceName（PID 文件 $pidFile）"
+        Write-Host "探测地址    : $checkBase（端口 $apiPort$platformNote）"
+        Write-Host "服务目录    : $apiDir"
+        Write-Host "服务日志    : $apiLog"
+        Write-Host "服务在跑吗  : $(if (Test-ApiAlive $checkBase) { '在跑' } else { '没起' })"
+    }
     exit 0
 }
 
 # ==================================================================
 # 服务没起就拉起来
 # ==================================================================
-if (-not (Test-ApiAlive $checkBase)) {
+if ($needsService -and -not (Test-ApiAlive $checkBase)) {
     if (-not (Test-Path $apiDir)) {
         Write-Host "$serviceName 未运行，且目录不存在：$apiDir" -ForegroundColor Yellow
         Write-Host '先执行：'
