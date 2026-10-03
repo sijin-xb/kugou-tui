@@ -16,10 +16,12 @@
 | `--page-size <N>` | — | 搜索结果与歌单广场的每页条目数，5–200 |
 | `--proxy <URL>` | `KUGOU_PROXY` | 访问 API 服务时用的 HTTP 代理 |
 | `--sodam-cookie <COOKIE>` | `SODAM_COOKIE` | 汽水音乐的登录态，形如 `sessionid_ss=…; sessionid=…` |
-| `--sodam-device-id <ID>` | `SODAM_DEVICE_ID` | 汽水的设备指纹，必须与签名凭证里的设备一致 |
+| `--sodam-device-id <ID>` | `SODAM_DEVICE_ID` | 汽水的设备指纹（走签名服务时**可留空**） |
 | `--sodam-iid <ID>` | `SODAM_IID` | 汽水的 install id |
-| `--sodam-x-helios <VALUE>` | `SODAM_X_HELIOS` | 汽水应用签名头；**VIP 整曲与无损音质靠它**，缺了只剩试听 |
-| `--sodam-x-medusa <VALUE>` | `SODAM_X_MEDUSA` | 汽水应用签名头（与上面成对使用） |
+| `--sodam-signer-url <URL>` | `QISHUI_SIGNER_URL` | 应用签名服务地址；留空用内置**公共默认**，填 `none` 关闭签名 |
+| `--sodam-signer-token <TOKEN>` | `QISHUI_SIGNER_TOKEN` | 签名服务的 Bearer Token（公共地址留空即可） |
+| `--sodam-x-helios <VALUE>` | `SODAM_X_HELIOS` | 手工抓包的静态签名头（走签名服务时用不到） |
+| `--sodam-x-medusa <VALUE>` | `SODAM_X_MEDUSA` | 同上，成对使用 |
 | `--basic-color` | — | 使用 16 色固定色板，适配老终端 |
 | `--no-tray` | — | 不注册系统托盘图标（也可用配置里的 `tray = false` 长期关闭） |
 | `--no-api-start` | `KUGOU_API_AUTO_START=0` | 不自动拉起本机接口服务（服务由你自己管理，端口上没服务时直接报错） |
@@ -116,17 +118,21 @@ priority = 20
 enabled = true
 api_base = "https://api.qishui.com" # 汽水**直连公网**，本机不需要服务
 cookie = "sessionid_ss=…; sessionid=…"
-device_id = "…"                      # 与下面 sodam_app 里的设备保持一致
 priority = 30
+# 设备指纹走签名服务时可留空；只有手工抓包那条路才需要填
+# device_id = "…"
 
-# 汽水的应用级签名凭证：决定「VIP 整曲与无损能不能拿到」。
-# 三者齐了才有整曲；缺了会退化成 30/60 秒试听（现象很像「会员没生效」）。
-# 抓包方式见「使用指南」的汽水章节。
+# 汽水的签名服务：决定「VIP 整曲与无损能不能拿到」。
+# 缺签名时服务端回的是「HTTP 200 + 空 body」，现象像「会员没生效」，
+# 所以这一项值得先确认。
 [sources.sodam_app]
-device_id = "…"                      # 与 [sources.sodam].device_id 一致
-iid = "…"                            # install id
-x_helios = "…"                       # 请求头 x-helios（会过期）
-x_medusa = "…"                       # 请求头 x-medusa（会过期）
+# 留空 = 用上游内置的公共签名服务（开箱即用）。
+# 换成自建的，或填 "none" 显式关掉签名。
+# signer_url = "http://127.0.0.1:8899/sign"
+# signer_token = "服务开了鉴权才需要填"
+# 以下仅在**手工抓包**那条路才需要（走签名服务时留空即可）：
+# device_id / iid / fp 留空 = 用签名侧自己的设备身份
+# x_helios / x_medusa 是抓来的静态签名头，会过期
 ```
 
 ### 接口服务的自动拉起
