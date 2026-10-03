@@ -101,6 +101,13 @@ base64 = "0.23"
 crossbeam-channel = "0.5"
 qrcode = { version = "0.14.1", default-features = false }
 
+# --- 汽水音乐音源：音频流解密 ---
+# 汽水下发的音频是 MP4/CENC 加密流，密钥藏在 `play_auth` 里，要按样本逐段做
+# AES-128-CTR 才能解出可解码的音频（见 source/sodam/crypto.rs）。
+# 这两个 crate 只用在这个地方，都是纯 Rust 实现，不碰 C 库、不拖额外运行时。
+aes = "0.8"
+ctr = "0.9"
+
 # --- 终端图片（封面）---
 # 关掉默认的 image-defaults：那会打开 image 的全部格式解码器并拖进 rayon，
 # 和本项目「只开 jpeg / png」的取舍冲突。crossterm 是探测终端能力所必需的。
