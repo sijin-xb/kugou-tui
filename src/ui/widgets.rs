@@ -75,11 +75,19 @@ pub fn qr_needed_size(content: &str, aspect: f32) -> Option<(usize, usize)> {
 fn qr_modules(content: &str) -> Option<Vec<Vec<bool>>> {
     /// 静默区（二维码外围留白）的模块数。
     ///
-    /// 规范要求 4 个模块，但终端里每多一圈就多占半行。这里取 2——配合固定的
-    /// 「白底」配色，留白本身就是静默区，2 个模块足以被识别。
-    const QUIET: usize = 2;
+    /// 规范要求 4 个模块，但终端里每多一圈就多占一列和半行。这里取 1——
+    /// 配合固定的纯白底，留白本身就是静默区。取 2 时实测多占 2 列 1 行，
+    /// 而扫码距离与成功率没有可感差别。
+    const QUIET: usize = 1;
 
-    let code = qrcode::QrCode::new(content.as_bytes()).ok()?;
+    // 纠错级别刻意用 **L**（约 7%）而不是默认的 M（约 15%）。
+    //
+    // 这是尺寸的唯一杠杆：二维码的模块数由「内容长度 + 纠错级别」决定，
+    // 内容（服务端下发的扫码地址）我们改不了，所以想变小只能降纠错。
+    // 屏幕上的二维码是理想条件——像素精确、无污损、无眩光，L 足够；
+    // 而汽水的扫码地址明显比酷狗长，不降的话在窄终端上根本放不下。
+    let code =
+        qrcode::QrCode::with_error_correction_level(content.as_bytes(), qrcode::EcLevel::L).ok()?;
     let image = code.render::<char>().quiet_zone(false).build();
 
     let core: Vec<Vec<bool>> = image
@@ -531,5 +539,45 @@ mod tests {
         let huge = "x".repeat(10_000);
         assert!(qr_needed_size(&huge, 2.0).is_none());
         assert!(qr_lines_fitted(&huge, 2.0, 200, 100).is_none());
+    }
+
+    // ---- 尺寸回归 ----
+
+    /// 二维码的模块数只由「内容长度 + 纠错级别」决定，所以尺寸是**内容决定的**，
+    /// 不是画法能优化的。这条把实测值钉住，防止哪天纠错级别或静默区被无意改大。
+    ///
+    /// 汽水的扫码地址接近 200 字符（酷狗只有 40 上下），这也是「汽水二维码
+    /// 特别大」的根因：它本来就该更大，不是渲染出了问题。
+    #[test]
+    fn qr_size_is_driven_by_content_length() {
+        let kugou = "https://m.kugou.com/qr?key=abc123def456";
+        let soda = "https://bff-pc.qishui.com/ucenter_web/app/sdk-next?aid=386088&device_id=2204957404565290&token=0123456789abcdef0123456789abcdef&next=https%3A%2F%2Fapi.qishui.com&uc_sdk=scan-auth&is_new_login=1";
+
+        let (kugou_w, kugou_rows) = qr_needed_size(kugou, 2.0).unwrap();
+        let (soda_w, soda_rows) = qr_needed_size(soda, 2.0).unwrap();
+
+        // 短地址落在 31x16 左右；长地址落在 51x26 左右
+        assert!((30..=33).contains(&kugou_w), "酷狗宽度异常：{kugou_w}");
+        assert!(
+            (15..=17).contains(&kugou_rows),
+            "酷狗高度异常：{kugou_rows}"
+        );
+        assert!((50..=53).contains(&soda_w), "汽水宽度异常：{soda_w}");
+        assert!((25..=28).contains(&soda_rows), "汽水高度异常：{soda_rows}");
+
+        // 内容越长尺寸越大：这是二维码的固有性质，不是 bug
+        assert!(soda_w > kugou_w && soda_rows > kugou_rows);
+    }
+
+    /// 纠错级别用 L 而不是默认的 M——这是尺寸的**唯一**杠杆（内容改不了）。
+    /// 换回 M 会让长地址明显变大，这条挡住那次回归。
+    #[test]
+    fn low_error_correction_keeps_the_qr_small() {
+        let soda = "https://bff-pc.qishui.com/ucenter_web/app/sdk-next?aid=386088&device_id=2204957404565290&token=0123456789abcdef0123456789abcdef&next=https%3A%2F%2Fapi.qishui.com&uc_sdk=scan-auth&is_new_login=1";
+        let (width, _) = qr_needed_size(soda, 2.0).unwrap();
+        assert!(
+            width <= 53,
+            "长地址的宽度应被 L 级别压在 53 以内，实际 {width}（是否被改回 M 了？）"
+        );
     }
 }

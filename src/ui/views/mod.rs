@@ -406,9 +406,9 @@ pub fn render_login(
     //
     // 可用空间 = 画面减去弹窗边框（左右各 1 列 + 内边距）与提示文字占的行。
     let area = frame.area();
-    let max_width = usize::from(area.width.saturating_sub(6));
-    // 提示语 + 空行 + 「Esc 取消」各占一行，再留一行余量给边框
-    let max_rows = usize::from(area.height.saturating_sub(9)).max(1);
+    let max_width = usize::from(area.width.saturating_sub(4));
+    // 提示语 + 空行 + 「Esc 取消」各占一行，再留给边框
+    let max_rows = usize::from(area.height.saturating_sub(7)).max(1);
 
     let fitted =
         crate::ui::widgets::qr_lines_fitted(&login.qr_content, aspect, max_width, max_rows)
@@ -433,8 +433,9 @@ pub fn render_login(
         .first()
         .map(|line| line.chars().count())
         .unwrap_or(0) as u16;
-    let popup_width = (qr_width + 6).max(30);
-    let popup_height = (qr_lines.len() as u16 + 7).clamp(9, area.height);
+    // 边距收到最小：二维码本来就大，多一圈留白就把「装不下」的临界点往前推
+    let popup_width = (qr_width + 4).max(30);
+    let popup_height = (qr_lines.len() as u16 + 5).clamp(7, area.height);
     let popup = crate::ui::widgets::centered_rect(area, popup_width, popup_height);
     frame.render_widget(Clear, popup);
 
