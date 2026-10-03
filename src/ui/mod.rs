@@ -129,7 +129,13 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     }
 
     if let Some(login) = state.login.as_ref() {
-        views::render_login(frame, login, state.config.active_source_kind(), &theme);
+        views::render_login(
+            frame,
+            login,
+            state.config.active_source_kind(),
+            state.config.qr_aspect,
+            &theme,
+        );
     }
 
     // 文本输入弹窗画在登录弹窗之上

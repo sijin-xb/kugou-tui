@@ -1301,6 +1301,12 @@ impl QualityPicker {
 pub struct LoginState {
     /// 二维码的显示行（每模块两字符宽以修正终端字符的高宽比）。
     pub qr: Vec<String>,
+    /// 二维码**原始内容**（一段 URL）。
+    ///
+    /// 留着它是为了在绘制时按终端实际尺寸重新渲染：二维码的行数由内容长度
+    /// 决定、不能压缩，所以「装不装得下」只有在知道画面大小时才判得出来。
+    /// 汽水的扫码地址明显比酷狗长，正是靠这里才能在窄终端上优雅降级。
+    pub qr_content: String,
     /// 二维码 key，轮询时用。
     pub key: String,
     /// 当前提示语。
@@ -1310,27 +1316,9 @@ pub struct LoginState {
     pub succeeded: bool,
 }
 
-impl LoginState {
-    /// 弹窗所需的高度：二维码高度 + 提示与内边距。
-    pub fn dialog_height(&self) -> u16 {
-        let qr_height = self.qr.len() as u16;
-        if qr_height == 0 { 5 } else { qr_height + 4 }
-    }
-
-    /// 弹窗所需的宽度。
-    pub fn dialog_width(&self) -> u16 {
-        let qr_width = self
-            .qr
-            .first()
-            .map(|line| line.chars().count())
-            .unwrap_or(0) as u16;
-        if qr_width == 0 {
-            44
-        } else {
-            qr_width.max(40) + 4
-        }
-    }
-}
+// 弹窗尺寸不再由这里算：二维码的行数由内容长度决定，而「画不画得下」只有在
+// 知道终端大小时才判得出来。所以尺寸在绘制时按实际区域现算
+//（见 `ui/views/mod.rs` 的登录弹窗），状态这边只留数据。
 
 /// 需要二次确认的操作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

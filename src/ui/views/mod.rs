@@ -395,13 +395,47 @@ pub fn render_login(
     frame: &mut Frame,
     login: &LoginState,
     source: crate::source::SourceKind,
+    aspect: f32,
     theme: &Theme,
 ) {
-    let popup = crate::ui::widgets::centered_rect(
-        frame.area(),
-        login.dialog_width(),
-        login.dialog_height(),
-    );
+    // 按**终端实际尺寸**决定二维码怎么画。
+    //
+    // 二维码的行数由内容长度决定、不能压缩（压缩就扫不出来），所以窄终端上
+    // 唯一正确的做法是承认画不下、改成给一句能照做的提示。汽水的扫码地址比
+    // 酷狗长得多，正是它先在这个场景里撑满了整屏。
+    //
+    // 可用空间 = 画面减去弹窗边框（左右各 1 列 + 内边距）与提示文字占的行。
+    let area = frame.area();
+    let max_width = usize::from(area.width.saturating_sub(6));
+    // 提示语 + 空行 + 「Esc 取消」各占一行，再留一行余量给边框
+    let max_rows = usize::from(area.height.saturating_sub(9)).max(1);
+
+    let fitted =
+        crate::ui::widgets::qr_lines_fitted(&login.qr_content, aspect, max_width, max_rows)
+            // 没有原始内容时（理论上不会）退回预先渲染好的那份
+            .or_else(|| {
+                if login.qr.len() <= max_rows {
+                    Some(login.qr.clone())
+                } else {
+                    None
+                }
+            });
+
+    let (qr_lines, too_small): (Vec<String>, Option<(usize, usize)>) = match fitted {
+        Some(lines) => (lines, None),
+        None => (
+            Vec::new(),
+            crate::ui::widgets::qr_needed_size(&login.qr_content, aspect),
+        ),
+    };
+
+    let qr_width = qr_lines
+        .first()
+        .map(|line| line.chars().count())
+        .unwrap_or(0) as u16;
+    let popup_width = (qr_width + 6).max(30);
+    let popup_height = (qr_lines.len() as u16 + 7).clamp(9, area.height);
+    let popup = crate::ui::widgets::centered_rect(area, popup_width, popup_height);
     frame.render_widget(Clear, popup);
 
     let title = if login.succeeded {
@@ -415,8 +449,23 @@ pub fn render_login(
 
     let qr_style = theme.qr();
     let mut lines: Vec<Line> = Vec::new();
-    for row in &login.qr {
+    for row in &qr_lines {
         lines.push(Line::from(Span::styled(row.clone(), qr_style)));
+    }
+    if let Some((need_width, need_rows)) = too_small {
+        // 明确说清「差多少」，并给出两条出路（放大终端 / 手填 cookie）。
+        lines.push(Line::from(Span::styled(
+            "终端太小，二维码放不下（被裁掉的码扫不出来）",
+            theme.title(),
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("需要约 {need_width} 列 × {need_rows} 行，当前窗口不够大"),
+            theme.dim(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "放大终端窗口后按 Esc 再按 L 重试；或直接在配置里手填 cookie",
+            theme.dim(),
+        )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(

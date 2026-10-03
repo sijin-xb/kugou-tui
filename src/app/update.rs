@@ -2086,6 +2086,9 @@ impl App {
                     .unwrap_or_default();
                 let login = self.state.login.get_or_insert_with(LoginState::default);
                 login.qr = qr;
+                // 原始内容也要留着：绘制时会按终端实际尺寸重新渲染，
+                // 装不下就改成给一句提示（见 ui/views 里的登录弹窗）。
+                login.qr_content = content;
                 login.key = key;
                 login.message = format!(
                     "用 {} App 扫码登录",
