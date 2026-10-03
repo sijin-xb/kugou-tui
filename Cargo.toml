@@ -24,8 +24,12 @@ categories = ["command-line-utilities", "multimedia"]
 name = "kugou-tui"
 path = "src/main.rs"
 
+# 随包内置的汽水 SDK（见 crates/libresoda/Cargo.toml 顶部的说明）。
+[workspace]
+members = ["crates/libresoda"]
+
 [dependencies]
-libresoda = { git = "https://github.com/sodahub-org/libresoda.git", rev = "f02497e" }
+libresoda = { path = "crates/libresoda" }
 # --- TUI ---
 # 只依赖 ratatui，crossterm 通过 ratatui::crossterm 复用，避免版本错配
 ratatui = { version = "0.30", default-features = false, features = [

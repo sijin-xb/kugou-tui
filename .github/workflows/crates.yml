@@ -14,9 +14,12 @@
 #
 # # ⚠️ 当前会失败的已知原因
 #
-# `Cargo.toml` 里的 `libresoda` 是 **git 依赖**，而 **crates.io 不允许 git 依赖**：
-# 发布时 `cargo publish` 会直接拒绝，报
-# 「all dependencies must have a version specified when publishing」之类。
+# `Cargo.toml` 里的 `libresoda` 是**本地路径依赖**（源码已随包内置在
+# `crates/libresoda/`），而 **crates.io 要求每个依赖都必须有 `version`**——
+# 发布时会用 registry 上的版本替换掉路径。crates.io 上没有 libresoda，
+# 所以必然被拒，报
+# 「all dependencies must have a version specified when publishing」。
+# （此前用 git 依赖时是同一个错误，只是提示里说的是 `git`。）
 # 下面的「检查依赖可发布性」步骤会先把它拦下来，给出人话说明，
 # 免得跑到一半看到一句 cargo 的原始报错。
 #
@@ -76,12 +79,13 @@ jobs:
       - name: 检查依赖可发布性
         run: |
           set -euo pipefail
-          # crates.io 不接受 git 依赖：发布包必须只引用 registry 上的版本。
-          if grep -qE '^\s*[A-Za-z0-9_-]+\s*=.*git\s*=' Cargo.toml; then
-            echo "::error title=crates.io 不接受 git 依赖::Cargo.toml 里有 git 依赖，cargo publish 必然失败。"
+          # crates.io 要求每个依赖都有 version（git / 无 version 的 path 都不行）：
+          # 发布包必须只引用 registry 上的版本。
+          if grep -qE '^\s*[A-Za-z0-9_-]+\s*=.*(git\s*=|path\s*=)' Cargo.toml; then
+            echo "::error title=依赖缺少 version::Cargo.toml 里有 git / 纯 path 依赖，cargo publish 必然失败。"
             echo
-            echo "当前带 git 依赖的条目："
-            grep -nE '^\s*[A-Za-z0-9_-]+\s*=.*git\s*=' Cargo.toml | sed 's/^/  /'
+            echo "当前不可发布的依赖条目："
+            grep -nE '^\s*[A-Za-z0-9_-]+\s*=.*(git\s*=|path\s*=)' Cargo.toml | sed 's/^/  /'
             echo
             echo "cargo 的原始报错（已实测确认，失败发生在打包阶段、编译之前）："
             echo
@@ -91,8 +95,9 @@ jobs:
             echo "    dependency libresoda does not specify a version"
             echo
             echo "解决方向（详见本工作流文件顶部的注释）："
-            echo "  1. 请上游把该库发布到 crates.io，然后改成 version 依赖（最干净）"
-            echo "  2. 把该库源码并进本仓库当模块，使发布包自包含"
+            echo "  1. 给随包内置的 crates/libresoda 换个名字发到 crates.io，"
+            echo "     然后这里改成 version 依赖（crates.io 要求名字不与上游冲突）"
+            echo "  2. 等上游 sodahub-org/libresoda 自己发 crates.io"
             echo "  3. 不在 crates.io 发，只走 GitHub Release"
             exit 1
           fi

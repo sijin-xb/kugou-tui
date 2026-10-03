@@ -1,0 +1,54 @@
+# 随包内置的 libresoda 副本（vendored）。
+#
+# # 为什么不继续用 git 依赖
+#
+# crates.io **不接受 git 依赖**，而汽水 SDK 没有发到 crates.io——两条路只能
+# 选一条：要么不发布到 crates.io，要么把源码随包带上。选了后者。
+#
+# # 与上游的关系
+#
+# 源码原样取自 sodahub-org/libresoda 的 f02497e（2026-09-30），**未做任何改动**。
+# 上游修了问题之后，用 `cargo vendored` 式的手工同步把新提交搬进来即可；
+# 本地这份的存在让构建可复现、可离线，也不再受上游 force-push 影响。
+#
+# # 为什么是独立 crate 而不是模块
+#
+# 它内部大量用 `crate::model`、`crate::error` 这样的路径，并进主包会与本项目
+# 自己的 `crate::error` 冲突。独立 crate 的 `crate::` 各自指向各自根，代码零改动。
+
+[package]
+name = "libresoda"
+# 上游是 0.1.0（未发布）。保持一致便于对照；不要发到 crates.io。
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Rust port of music-lib's soda (汽水音乐 / Soda Music) implementation: search, playlists, albums, lyrics, VIP-aware stream resolution and CENC/MP4 audio decryption."
+license = "AGPL-3.0-or-later"
+keywords = ["soda-music", "qishui", "douyin", "music", "decrypt"]
+categories = ["multimedia::audio", "api-bindings"]
+
+[lib]
+name = "libresoda"
+path = "src/lib.rs"
+
+[features]
+default = ["cdp-signer"]
+## 扫码登录签名页：Rust 通过 CDP 驱动 Chromium，不再依赖 Node。
+cdp-signer = ["dep:chromiumoxide", "dep:futures", "dep:tokio"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2.12", default-features = false, features = ["tls", "gzip"] }
+aes = "0.8"
+ctr = "0.9"
+base64 = "0.22"
+chromiumoxide = { version = "0.9", optional = true }
+futures = { version = "0.3", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
+dirs = "6"
+
+[dev-dependencies]
+serde_json = "1"
+aes = "0.8"
+ctr = "0.9"
