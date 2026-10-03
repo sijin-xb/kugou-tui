@@ -25,7 +25,7 @@ name = "kugou-tui"
 path = "src/main.rs"
 
 [dependencies]
-libresoda = { git = "https://github.com/sodahub-org/libresoda.git", rev = "0485908" }
+libresoda = { git = "https://github.com/sodahub-org/libresoda.git", rev = "f02497e" }
 # --- TUI ---
 # 只依赖 ratatui，crossterm 通过 ratatui::crossterm 复用，避免版本错配
 ratatui = { version = "0.30", default-features = false, features = [

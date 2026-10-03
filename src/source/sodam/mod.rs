@@ -193,6 +193,24 @@ pub fn quality_preference(quality: &str) -> &'static str {
     }
 }
 
+/// 结合**账号权益**决定最终的音质偏好。
+///
+/// 照 SodaM 的 `Session::auto_quality_for(account.vip)`：
+///
+/// * 会员 → 用映射后的档位（无损封顶；单曲没有无损时由服务端往下匹配）
+/// * 非会员 → `"auto"`，让服务端给**免费档里实际可用的最高一档**
+///
+/// 为什么非会员不能沿用用户设的档位：那等于向服务端**索取会员档位**
+/// （`flac` → `lossless`），而官方客户端在这种情况明确要 `"auto"`。
+/// 这是本模块此前与官方客户端**唯一**的实质差异。
+fn preference_for_account(vip: bool, quality: &str) -> &'static str {
+    if vip {
+        quality_preference(quality)
+    } else {
+        "auto"
+    }
+}
+
 // ============================================================================
 // 搜索
 // ============================================================================
@@ -301,7 +319,22 @@ pub async fn song_stream_url(
     let scratch = scratch_dir.to_path_buf();
 
     blocking("取流", move || {
-        // 先把音质偏好设进实例；"best" = 让它自己挑能拿到的最高档。
+        // 音质偏好要**按账号权益**决定，不能无脑用客户端的档位设置。
+        //
+        // 照 SodaM 的 \`Session::auto_quality_for(account.vip)\`：
+        //   VIP   → 无损封顶（单曲没有无损时由服务端往下匹配）
+        //   非 VIP → "auto"，让服务端给**免费档里实际可用的最高一档**
+        //
+        // 差别很关键：非会员若按 \`flac\` 映射成 lossless 去要，那是在向服务端
+        // **索取会员档位**——上游的做法是明确要 "auto"，让服务端在免费档里挑。
+        // 这条是本模块此前与官方客户端唯一的实质差异。
+        //
+        // 查询失败时退回用户设置（\`unwrap_or(true)\`）：宁可对非会员多要一档
+        // （服务端会自己降级），也不要让真会员被莫名降到免费档。
+        let preference = preference_for_account(
+            libresoda::soda::account::is_vip_account(soda).unwrap_or(true),
+            preference,
+        );
         soda.set_quality_preference(preference);
 
         // 时长与 VIP 标记要用于「这是不是试听片段」的判断。
@@ -617,46 +650,57 @@ fn to_playlist(source: &libresoda::Playlist, is_own: bool) -> crate::api::model:
 /// 云端「我的歌单」。
 ///
 /// 需要登录（cookie）；未登录时服务端会拒绝。
+///
+/// 用官方 PC 客户端走的那条路（`GET /luna/pc/me/playlist`）。注意：
+/// 这个接口是 libresoda **较新**的提交才补上的（此前只有按页的老版本），
+/// 所以依赖 rev 要跟上。
 pub async fn user_playlists(api: &ApiClient) -> Result<Vec<crate::api::model::Playlist>> {
     let soda = client::configure(api);
     blocking("取云端歌单", move || {
-        // 这个端点只接受 libresoda 的 `(page, limit)`，没有游标。第 1 页一次
-        // 取够——界面另有「加载更多」，但先给足一次刷完的量，省得来回。
-        let playlists =
-            libresoda::soda::user_playlist::get_user_playlists(soda, 1, 100).map_err(convert)?;
-        Ok(playlists
+        // 一次取 100 条（上游默认 50）：界面另有「加载更多」，但先给足
+        // 一次刷完的量，省得来回。`has_more` 非空说明还有下一页。
+        let page =
+            libresoda::soda::user_playlist::get_my_playlists(soda, "", 100).map_err(convert)?;
+        if page.has_more {
+            tlog!(LEVEL_DEBUG, "汽水云端歌单还有更多（游标未空）");
+        }
+        Ok(page
+            .playlists
             .iter()
-            // 它只回自己创建的歌单，所以 is_own 恒为真
+            // 这个端点只回自己创建的歌单，所以 is_own 恒为真
             .map(|playlist| to_playlist(playlist, true))
             .collect())
     })
     .await
 }
 
-/// 歌单广场（推荐歌单）。
+/// 歌单广场。
 ///
-/// 汽水**没有分类广场**（`get_playlist_categories` 在 libresoda 里就是
-/// `Unsupported`），只有一份推荐列表，因此忽略 `category_id`/`page` 参数——
-/// 界面的分类切换在汽水下会一直看到同一份内容，这比报错更符合预期（用户按的
-/// 是「换个分类看看」，而不是「我要报错」）。
+/// 汽水的「广场」只有一份**推荐歌单**（`GET /luna/me/playlist/recommend`），
+/// 没有分类维度，所以忽略 `category_id` 与分页参数——界面切换分类时会一直看到
+/// 同一份内容。这比报错更符合预期：用户按的是「换个分类看看」，不是「我要报错」。
+///
+/// ⚠️ 依赖 rev：这个端点在 libresoda 的旧提交里是 `Err(Unsupported)` 空壳，
+/// 升级后才真正可用。所以「歌单广场能不能用」取决于 `Cargo.toml` 里锁的 rev。
 pub async fn plaza_playlists(
     api: &ApiClient,
     category_id: i64,
     page: u32,
     page_size: u32,
 ) -> Result<Vec<crate::api::model::Playlist>> {
-    let _ = (api, category_id, page, page_size);
-    Err(AppError::Other(
-        "汽水没有「歌单广场」：参考实现里没有推荐歌单与分类端点\
-         （仅 `search_playlist` 可按关键词搜歌单）。\
-         可以切到别的音源看广场，或用搜索找歌单。"
-            .to_string(),
-    ))
+    let _ = (category_id, page, page_size);
+    let soda = client::configure(api);
+    blocking("取推荐歌单", move || {
+        let playlists =
+            libresoda::soda::playlist::get_recommend_playlists(soda).map_err(convert)?;
+        Ok(playlists
+            .iter()
+            .map(|playlist| to_playlist(playlist, false))
+            .collect())
+    })
+    .await
 }
 
-/// 取一个歌单的全部曲目。
-///
-/// `list_id` 是歌单主键（汽水的 id 就是数字串）。
 pub async fn playlist_tracks(api: &ApiClient, playlist_id: &str) -> Result<Vec<Song>> {
     let soda = client::configure(api);
     let playlist_id = playlist_id.trim().to_string();
@@ -860,6 +904,29 @@ mod tests {
                 "{quality} → {preference} 没有被 libresoda 识别"
             );
         }
+    }
+
+    /// 非会员不能按「用户设的档位」去要——那是在索取会员档位。
+    /// 这条对齐 SodaM 的 `auto_quality_for`。
+    #[test]
+    fn non_vip_always_asks_for_auto() {
+        for quality in crate::config::SUPPORTED_QUALITIES {
+            assert_eq!(
+                preference_for_account(false, quality),
+                "auto",
+                "非会员时 {quality} 也应落到 auto"
+            );
+        }
+    }
+
+    /// 会员才用用户设的档位（无损封顶）。
+    #[test]
+    fn vip_uses_the_configured_quality() {
+        assert_eq!(preference_for_account(true, "flac"), "lossless");
+        assert_eq!(preference_for_account(true, "128"), "128k");
+        assert_eq!(preference_for_account(true, "super"), "highest");
+        // 酷狗特有的档位在汽水没有对应概念 → 不限制
+        assert_eq!(preference_for_account(true, "viper_atmos"), "best");
     }
 
     #[test]
