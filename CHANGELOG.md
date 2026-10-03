@@ -57,10 +57,16 @@
 - 启动脚本（bash 与 PowerShell 两份）新增 `sodam` 分支并引入 `NEEDS_SERVICE`：
   选中汽水时整套探活/拉起/等就绪全部跳过。此前它落进兜底分支，会去拉
   KuGouMusicApi 并提示「未运行，正在启动…（端口 3000）」。
-- **目录浏览与云端歌单仍声明为不可用**。需要说清楚的是：**不是汽水没有这些
-  接口**——`/luna/pc/me/playlist`（我的歌单）、歌手、专辑、排行榜都有，签名服务
-  接上后技术上已可用，libresoda 也有现成实现；差的是把它们接进界面面板。
-  在接完之前声明为真会弹出「点了就报错」的入口。
+- **云端歌单、歌单详情、用户资料、会员状态全部接上**。此前它们对汽水一律返回
+  「不支持」，表现出来就是「登录上了但所有功能都没生效」。真因是分派层没接，
+  不是汽水没有这些接口。现在都走 libresoda 的公开实现（get_user_playlists /
+  get_playlist_songs / fetch_pc_me / is_vip_account），Capability 的
+  catalog / cloud / vip 一并改为真。
+
+  **三项确实没有对应接口，保持明确报错**（核过 libresoda 代码，不是漏接）：
+  歌单广场（get_recommended_playlists 与 get_playlist_categories 在上游就是
+  Unsupported，只有歌单搜索可用）、歌手列表（只有按 id 查，没有热门歌手列表）、
+  排行榜（无等价端点）。报错文案里写清了原因与替代做法。
 
 ### 修复
 
