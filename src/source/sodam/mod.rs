@@ -415,6 +415,14 @@ fn describe_reason(
             if !blockers.is_empty() {
                 reason.push_str(&format!("〔{}〕", blockers.join("、")));
             }
+            // **决定性判据**：流来自哪个端点。
+            // `web` = 走的是降级路径（App 端点被拒后回退），问题在客户端这一侧；
+            // `pc`  = 服务端在**带签名的 App 端点**上就只给了试听，问题在服务端
+            //         的权益判定，客户端无从补救。没有这一项就无法区分两者，
+            //         后面的排查会一直在错误的方向上打转。
+            if !report.source.trim().is_empty() {
+                reason.push_str(&format!("〔端点 {}〕", report.source.trim()));
+            }
             // App 端点被拒的原始原因。有它才能区分「没签名」与「签名过期」。
             if !report.app_error.trim().is_empty() {
                 reason.push_str(&format!("（App 端点：{}）", report.app_error.trim()));
