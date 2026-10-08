@@ -93,6 +93,10 @@ async function runPlatform(platform) {
     hash: '6af00fbd4d444a82c005843eef9dc2d4',
     keywords: 'Letter - arkady sevidov', man: 'yes', cookie: COOKIE,
   });
+  await run(`${platform}/lyric`, '/module/lyric.js', {
+    id: 19525574, accesskey: '0123456789ABCDEF0123456789ABCDEF',
+    fmt: 'krc', decode: true, cookie: COOKIE,
+  });
   await run(`${platform}/privilege_lite`, '/module/privilege_lite.js', {
     hash: '6af00fbd4d444a82c005843eef9dc2d4,11111111111111111111111111111111',
     cookie: COOKIE,

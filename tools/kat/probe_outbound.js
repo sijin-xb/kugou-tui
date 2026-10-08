@@ -69,6 +69,10 @@ async function main() {
         hash: '0a69169202de95aaf24a9944ccf0730d',
         keywords: 'Letter - arkady sevidov', man: 'yes', cookie,
       }],
+      ['lyric', '/module/lyric.js', {
+        id: 19525574, accesskey: '0123456789ABCDEF0123456789ABCDEF',
+        fmt: 'krc', decode: true, cookie,
+      }],
     ];
 
     for (const [name, file, params] of cases) {

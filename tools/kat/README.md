@@ -56,6 +56,22 @@ node tools/kat/probe_outbound.js lite   # 只跑 lite 平台
 `krc_probe.json` 是 `kat_notsign.js` 之外的一份真实 `/lyric` 响应样本，
 `krc.rs` 的解密 KAT 用的是它的 `content` 字段（逐字歌词、含 `[language:]` 标签）。
 
+`krc_real_qt.json` 是**整首歌**的真实样本（周杰伦《晴天》，68 行、63 行带时间
+标签），由 Node 版 `decode=true` 的 `/lyric` 响应原样保存。它的 `decodeContent`
+是**上游自己解出来的明文**，`api/native/mod.rs` 的
+`real_song_decode_matches_node_byte_for_byte` 断言 native 的解密结果与它逐字节
+相同，并把 `故事的小黄花` 一行的六个逐字区间一并锁死——这条用例同时覆盖
+「解密算法一致」与「逐字时间戳一致」，是阶段 4 的验收依据。
+
+抓取方式（用本机 Node 服务，`decode=true` 让它把 `decodeContent` 一并给出）：
+
+```sh
+curl -s "http://127.0.0.1:3001/lyric?id=<lyric_id>&accesskey=<accesskey>&fmt=krc&decode=true&charset=utf8"
+```
+
+入库时只保留 `status/error_code/fmt/contenttype/content/decodeContent/id`
+七个字段，其余（`info`、`_source`、`charset`）与歌词无关。
+
 ## 已知坑
 
 - **`process.env.platform` 的时序**：上游 `util/helper.js` 与各 module 在调用时
