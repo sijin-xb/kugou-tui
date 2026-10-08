@@ -40,7 +40,7 @@ use crate::source::SourceKind;
 
 /// 一个音源平台要实现的全部接口。
 ///
-/// 方法集就是迁移范围：只包含 TUI 实际调用到的接口，见 `docs/NATIVE_API.md`。
+/// 方法集就是迁移范围：只包含 TUI 实际调用到的接口。
 #[allow(async_fn_in_trait)] // 见模块头：现在不做 dyn
 pub trait MusicApi: Send + Sync {
     // ------------------------------------------------------------------
