@@ -29,11 +29,11 @@
 
 use serde_json::Value;
 
-use crate::api::node::NodeApi;
 use crate::api::model::{
     Artist, Playlist, RankBoard, Song, artist_from_json, extract_songs, pick_array, pick_i64,
     pick_string, playlist_from_json, rank_board_from_json,
 };
+use crate::api::node::NodeApi;
 use crate::api::{data_of, extract_list};
 use crate::error::{AppError, Result};
 use crate::logger::tlog;
@@ -247,122 +247,9 @@ impl NodeApi {
     // 取全（翻页）
     // ------------------------------------------------------------------
 
-    /// 逐页取全量歌曲的通用实现（**并发**翻页）。
-    ///
-    /// # 为什么要并发
-    ///
-    /// 歌单接口硬限每页 30 条，400 首歌就是 14 次往返。串行做的话 RTT 直接累加，
-    /// 大歌单要等好几秒——而这几秒里界面只有一个"加载中"。改成一批页同时发，
-    /// 耗时就接近单页的延迟。
-    ///
-    /// # 批次策略
-    ///
-    /// 不知道总数，所以**先取第 1 页**：它满页说明后面可能还有，就按
-    /// [`CONCURRENT_PAGES`] 一批继续取；某一页不满就停（同串行版的判定）。
-    /// 一批里只要有一页失败就整体报错，避免静默漏歌。
-    async fn collect_all_pages<F, Fut>(&self, make: F) -> Result<Vec<Song>>
-    where
-        F: Fn(NodeApi, u32) -> Fut,
-        Fut: std::future::Future<Output = Result<Vec<Song>>> + Send + 'static,
-    {
-        let mut all: Vec<Song> = Vec::new();
-
-        // 第 1 页单独取：确定后面还有没有内容，避免一上来就并发一堆空请求
-        let first = make(self.clone(), 1).await?;
-        // 只有**空**才说明真没了。
-        //
-        // 不能用「不足 PAGE_LIMIT」判断：解析时会有条目被过滤掉
-        // （缺 hash、字段类型不对等），一页 30 条剩 29 条是常事，
-        // 那样会误判成"没有下一页"，歌单直接被截断在 29 首。
-        all.extend(first);
-        if all.is_empty() {
-            return Ok(all);
-        }
-
-        let mut page: u32 = 2;
-        while page <= MAX_PAGES {
-            let batch_end = (page + CONCURRENT_PAGES - 1).min(MAX_PAGES);
-
-            let mut set = tokio::task::JoinSet::new();
-            for batch_page in page..=batch_end {
-                // 每页一份克隆：NodeApi 内部是 Arc，克隆很便宜。
-                // 把页码跟着结果一起搬回来——下面要按页码重排，见 `collected`。
-                let future = make(self.clone(), batch_page);
-                set.spawn(async move { future.await.map(|songs| (batch_page, songs)) });
-            }
-
-            // `join_next()` 返回的是**任务完成顺序**，不是发起顺序。并发请求谁先回来
-            // 是不确定的，直接按返回顺序 `extend` 会让整表的页序被打乱：
-            // 榜单尤其致命——它的「顺序」就是榜单本身的内容。
-            //
-            // 所以先把一批的结果收进 `collected`，再按页码排好序拼上去。
-            let mut collected: Vec<(u32, Vec<Song>)> = Vec::with_capacity(
-                (batch_end.saturating_sub(page) + 1)
-                    .try_into()
-                    .unwrap_or(usize::MAX),
-            );
-
-            let mut stop = false;
-            while let Some(joined) = set.join_next().await {
-                match joined {
-                    Ok(Ok((_batch_page, songs))) => {
-                        // 同理，只有空页才停；短页后面可能还有内容
-                        if songs.is_empty() {
-                            stop = true;
-                        }
-                        collected.push((_batch_page, songs));
-                    }
-                    Ok(Err(error)) => {
-                        // 页码越界 = 后面没有了，属正常终止，保留已取到的内容。
-                        if error.is_page_out_of_range() {
-                            stop = true;
-                            continue;
-                        }
-
-                        // 后续某页失败（限流、超时、上游偶发错误）：
-                        // **不再让整次失败**，而是记日志并停在已取到的内容上。
-                        //
-                        // 之前整次失败时，界面会退回首屏那一页——用户刚做完一次
-                        // 搜索、紧接着打开几百首的歌单时很容易碰到，表现为
-                        // "明明有几百首却只显示 30 首"。部分结果比没有强，
-                        // 而且首屏已经显示过了，中断只是少后面几页。
-                        if all.is_empty() {
-                            // 一首都还没取到，那确实是失败
-                            return Err(error);
-                        }
-                        crate::logger::tlog!(
-                            crate::logger::LEVEL_WARN,
-                            "翻到第 {page} 页起失败，保留已取到的 {} 首：{error}",
-                            all.len()
-                        );
-                        stop = true;
-                    }
-                    Err(error) => {
-                        // 任务本身panic/取消。不该发生，报出来而不是静默丢页
-                        crate::logger::tlog!(crate::logger::LEVEL_WARN, "翻页任务失败：{error}");
-                        return Err(AppError::Other(format!("翻页任务失败：{error}")));
-                    }
-                }
-            }
-
-            // 按页码重排再拼——顺序错了整张表就是乱的（见上面那条注释）
-            collected.sort_by_key(|(batch_page, _)| *batch_page);
-            for (_batch_page, songs) in collected {
-                all.extend(songs);
-            }
-
-            if stop {
-                break;
-            }
-            page = batch_end + 1;
-        }
-
-        Ok(all)
-    }
-
     /// 歌单内**全部**歌曲（公开歌单）。
     pub async fn playlist_tracks_all(&self, global_id: &str, fresh: bool) -> Result<Vec<Song>> {
-        self.collect_all_pages(|client, page| {
+        collect_all_pages(self.clone(), |client, page| {
             let global_id = global_id.to_string();
             async move {
                 client
@@ -375,7 +262,7 @@ impl NodeApi {
 
     /// 用户歌单内**全部**歌曲（自建/收藏，按数字 `listid`）。
     pub async fn user_playlist_tracks_all(&self, list_id: i64, fresh: bool) -> Result<Vec<Song>> {
-        self.collect_all_pages(move |client, page| async move {
+        collect_all_pages(self.clone(), move |client, page| async move {
             client
                 .user_playlist_tracks(list_id, page, PAGE_LIMIT, fresh)
                 .await
@@ -385,7 +272,7 @@ impl NodeApi {
 
     /// 歌手**全部**歌曲。`sort` 同 [`Self::artist_tracks`]。
     pub async fn artist_tracks_all(&self, artist_id: i64, sort: &str) -> Result<Vec<Song>> {
-        self.collect_all_pages(|client, page| {
+        collect_all_pages(self.clone(), |client, page| {
             let sort = sort.to_string();
             async move {
                 client
@@ -401,7 +288,7 @@ impl NodeApi {
     /// `/rank/audio` 不像歌单那样硬限 30（传 100 能回 100），但统一按页取更省心，
     /// 也避免榜单扩容后要回头改。
     pub async fn rank_tracks_all(&self, rank_id: i64) -> Result<Vec<Song>> {
-        self.collect_all_pages(move |client, page| async move {
+        collect_all_pages(self.clone(), move |client, page| async move {
             client.rank_tracks(rank_id, page, PAGE_LIMIT).await
         })
         .await
@@ -418,6 +305,120 @@ impl NodeApi {
     pub async fn song_stream_url(&self, song: &Song, quality: &str) -> Result<StreamUrl> {
         resolve_stream_url(self, song, quality).await
     }
+}
+
+/// 逐页取全量歌曲的通用实现（**并发**翻页）。
+///
+/// # 为什么要并发
+///
+/// 歌单接口硬限每页 30 条，400 首歌就是 14 次往返。串行做的话 RTT 直接累加，
+/// 大歌单要等好几秒——而这几秒里界面只有一个"加载中"。改成一批页同时发，
+/// 耗时就接近单页的延迟。
+///
+/// # 批次策略
+///
+/// 不知道总数，所以**先取第 1 页**：它满页说明后面可能还有，就按
+/// [`CONCURRENT_PAGES`] 一批继续取；某一页不满就停（同串行版的判定）。
+/// 一批里只要有一页失败就整体报错，避免静默漏歌。
+pub(crate) async fn collect_all_pages<C, F, Fut>(client: C, make: F) -> Result<Vec<Song>>
+where
+    C: Clone + Send + 'static,
+    F: Fn(C, u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Song>>> + Send + 'static,
+{
+    let mut all: Vec<Song> = Vec::new();
+
+    // 第 1 页单独取：确定后面还有没有内容，避免一上来就并发一堆空请求
+    let first = make(client.clone(), 1).await?;
+    // 只有**空**才说明真没了。
+    //
+    // 不能用「不足 PAGE_LIMIT」判断：解析时会有条目被过滤掉
+    // （缺 hash、字段类型不对等），一页 30 条剩 29 条是常事，
+    // 那样会误判成"没有下一页"，歌单直接被截断在 29 首。
+    all.extend(first);
+    if all.is_empty() {
+        return Ok(all);
+    }
+
+    let mut page: u32 = 2;
+    while page <= MAX_PAGES {
+        let batch_end = (page + CONCURRENT_PAGES - 1).min(MAX_PAGES);
+
+        let mut set = tokio::task::JoinSet::new();
+        for batch_page in page..=batch_end {
+            // 每页一份克隆：NodeApi 内部是 Arc，克隆很便宜。
+            // 把页码跟着结果一起搬回来——下面要按页码重排，见 `collected`。
+            let future = make(client.clone(), batch_page);
+            set.spawn(async move { future.await.map(|songs| (batch_page, songs)) });
+        }
+
+        // `join_next()` 返回的是**任务完成顺序**，不是发起顺序。并发请求谁先回来
+        // 是不确定的，直接按返回顺序 `extend` 会让整表的页序被打乱：
+        // 榜单尤其致命——它的「顺序」就是榜单本身的内容。
+        //
+        // 所以先把一批的结果收进 `collected`，再按页码排好序拼上去。
+        let mut collected: Vec<(u32, Vec<Song>)> = Vec::with_capacity(
+            (batch_end.saturating_sub(page) + 1)
+                .try_into()
+                .unwrap_or(usize::MAX),
+        );
+
+        let mut stop = false;
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(Ok((_batch_page, songs))) => {
+                    // 同理，只有空页才停；短页后面可能还有内容
+                    if songs.is_empty() {
+                        stop = true;
+                    }
+                    collected.push((_batch_page, songs));
+                }
+                Ok(Err(error)) => {
+                    // 页码越界 = 后面没有了，属正常终止，保留已取到的内容。
+                    if error.is_page_out_of_range() {
+                        stop = true;
+                        continue;
+                    }
+
+                    // 后续某页失败（限流、超时、上游偶发错误）：
+                    // **不再让整次失败**，而是记日志并停在已取到的内容上。
+                    //
+                    // 之前整次失败时，界面会退回首屏那一页——用户刚做完一次
+                    // 搜索、紧接着打开几百首的歌单时很容易碰到，表现为
+                    // "明明有几百首却只显示 30 首"。部分结果比没有强，
+                    // 而且首屏已经显示过了，中断只是少后面几页。
+                    if all.is_empty() {
+                        // 一首都还没取到，那确实是失败
+                        return Err(error);
+                    }
+                    crate::logger::tlog!(
+                        crate::logger::LEVEL_WARN,
+                        "翻到第 {page} 页起失败，保留已取到的 {} 首：{error}",
+                        all.len()
+                    );
+                    stop = true;
+                }
+                Err(error) => {
+                    // 任务本身panic/取消。不该发生，报出来而不是静默丢页
+                    crate::logger::tlog!(crate::logger::LEVEL_WARN, "翻页任务失败：{error}");
+                    return Err(AppError::Other(format!("翻页任务失败：{error}")));
+                }
+            }
+        }
+
+        // 按页码重排再拼——顺序错了整张表就是乱的（见上面那条注释）
+        collected.sort_by_key(|(batch_page, _)| *batch_page);
+        for (_batch_page, songs) in collected {
+            all.extend(songs);
+        }
+
+        if stop {
+            break;
+        }
+        page = batch_end + 1;
+    }
+
+    Ok(all)
 }
 
 /// 一次取流要用到的两个上游请求。两个后端各自实现：`NodeApi` 打本机服务，
@@ -449,7 +450,7 @@ pub(crate) async fn resolve_stream_url<S: StreamSource>(
     song: &Song,
     quality: &str,
 ) -> Result<StreamUrl> {
-// 登录用户先调 `/privilege/lite` 问「这账号能听哪几档音质」——不同音质的
+    // 登录用户先调 `/privilege/lite` 问「这账号能听哪几档音质」——不同音质的
     // hash 不一样（VIP 用户有 flac 的 hash，普通用户没有），用同一个 hash
     // 试所有音质会一直碰壁。**这是「设了 flac 但没 VIP 就只能听试听片段」的
     // 真凶**：之前直接拿原 hash 调 `/song/url`，服务端一看这个 hash 没 flac
@@ -530,7 +531,8 @@ pub(crate) async fn resolve_stream_url<S: StreamSource>(
 
     // 试听兜底：这一路失败也别抛出去了——上面完整版已经试过一轮，能到这里说明
     // 全都没成，应该给用户一个**完整的原因**而不是最后这次的网络错误。
-    let trial = source.song_url(&song.hash, quality, true)
+    let trial = source
+        .song_url(&song.hash, quality, true)
         .await
         .unwrap_or_else(|error| {
             tlog!(
@@ -680,7 +682,8 @@ impl StreamSource for NodeApi {
     }
 
     async fn song_url(&self, hash: &str, quality: &str, free_part: bool) -> Result<Value> {
-        self.request_song_url_with_hash(hash, quality, free_part).await
+        self.request_song_url_with_hash(hash, quality, free_part)
+            .await
     }
 }
 
@@ -1026,7 +1029,7 @@ pub struct StreamUrl {
 /// 「当前用户可写」处理。**只有 `/user/playlist` 能这么假设**：歌单广场返回的是
 /// 别人创建的歌单，同样带 `specialid` 却没有 `is_self`，误判会把陌生人的歌单
 /// 标成「可写」，还能被设成同步目标。
-fn collect_playlists(root: &Value, assume_own: bool) -> Vec<Playlist> {
+pub(crate) fn collect_playlists(root: &Value, assume_own: bool) -> Vec<Playlist> {
     extract_list(
         root,
         &["info", "list", "lists", "special_list", "data"],
@@ -1050,7 +1053,7 @@ fn collect_playlists(root: &Value, assume_own: bool) -> Vec<Playlist> {
 /// 然后掉进 `extract_list` 的兜底扫描，只命中第一组（热门 60 人），
 /// A–Z 全表被静默丢掉，同时每加载一次就刷一条「请核对字段布局」的警告。
 /// 所以先把各组的 `singer` 展平再解析。
-fn collect_artists(root: &Value) -> Vec<Artist> {
+pub(crate) fn collect_artists(root: &Value) -> Vec<Artist> {
     let data = data_of(root);
     let mut artists = Vec::new();
     for group in pick_array(data, &["info", "list", "singer_list"]) {
@@ -1252,8 +1255,7 @@ mod tests {
         let quality = std::env::var("KUGOU_TUI_PROBE_QUALITY").unwrap_or(config.quality);
         println!("API={api_base}  hash={hash}  请求档位={quality}");
 
-        let client =
-            NodeApi::new(&api_base, cookie, config.proxy.as_deref()).expect("构造客户端");
+        let client = NodeApi::new(&api_base, cookie, config.proxy.as_deref()).expect("构造客户端");
         let song = Song {
             hash: hash.clone(),
             name: "probe".to_string(),
@@ -1291,10 +1293,7 @@ mod tests {
 
         // ---- 降级链逐档 /song/url：看每一档实际给的是什么文件 ----
         for tier in fallback_chain(&quality) {
-            let response = match client
-                .request_song_url_with_hash(&hash, tier, false)
-                .await
-            {
+            let response = match client.request_song_url_with_hash(&hash, tier, false).await {
                 Ok(response) => response,
                 Err(error) => {
                     println!("{tier:>6}: 请求失败 {}", error.user_hint());
