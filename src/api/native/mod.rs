@@ -11,6 +11,8 @@
 // 阶段 3 接完网络后删掉这些 `allow`。
 #[allow(dead_code)]
 pub mod crypto;
+#[allow(dead_code)]
+pub mod krc;
 
 use crate::api::cloud::{QrCheck, UserInfo, VipInfo};
 use crate::api::catalog::StreamUrl;
