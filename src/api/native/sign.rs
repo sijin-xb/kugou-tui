@@ -27,13 +27,16 @@
 //!
 //! # `JSON.stringify` 的次序风险
 //!
-//! 上游对**对象类型**的参数值先 `JSON.stringify` 再参与拼接。JS 的对象键序是
-//! **插入序**，而本仓库 `serde_json` 没开 `preserve_order`，`Value::Object` 是
-//! `BTreeMap`——键序是字典序。当参数里出现多键对象时，两边可能得到不同的
-//! JSON 串，进而签名不同。迁移范围内的 26 个接口里，只有
-//! `/playlist/tracks/add`（`module/playlist_tracks_add.js`）会在 **body** 里带
-//! 对象数组，而 body 是 `data`、不参与 `key=value` 渲染。真接上那个接口前
-//! 要复核一次，见阶段 5。
+//! 上游对**对象类型**的参数值先 `JSON.stringify` 再参与拼接（`helper.js:61-80`）。
+//! JS 的对象键序是**插入序**，所以本仓库必须开 `serde_json` 的 `preserve_order`
+//! （`Value::Object` 用 `IndexMap`）才能得到同一份串；默认的 `BTreeMap` 会按
+//! 字典序重排，签名直接算错——而且不会报错，只会 403。
+//! `object_valued_params_keep_insertion_order` 锁定这一点。
+//!
+//! 注意 `preserve_order` 只保证「解析出来的键序 = JSON 文档里的键序」，
+//! 而 `BTreeMap` 形态的参数表（[`signature_android_params`] 收的是
+//! `BTreeMap`）在渲染 `key=value` 时本来就要先 `.sort()`，与上游一致，
+//! 不受影响。
 
 use std::collections::BTreeMap;
 
@@ -653,5 +656,39 @@ mod tests {
         for kept in ["dfid", "mid", "uuid", "clienttime"] {
             assert!(song_keys.contains_key(kept), "song_url 应当带 {kept}");
         }
+    }
+
+    /// 对象型参数值必须按**插入序**序列化，与 JS 的 `JSON.stringify` 一致。
+    ///
+    /// 上游 `helper.js:61-80` 对 `typeof === 'object'` 的值先 `JSON.stringify`；
+    /// JS 对象键序是插入序。这条测试的期望值来自
+    /// `tools/kat/kat_object_order.js`，其中对象故意让插入序（`zeta,alpha,mid`）
+    /// 与字典序（`alpha,mid,zeta`）不同——用默认的 `BTreeMap` 会得到另一份串。
+    ///
+    /// 依赖 `Cargo.toml` 里 `serde_json` 的 `preserve_order` 特性：关掉它这条会红。
+    #[test]
+    fn object_valued_params_keep_insertion_order() {
+        // serde_json 的 Value 解析出来就是插入序（开了 preserve_order）。
+        let nested: Value = serde_json::from_str(r#"{"zeta":1,"alpha":2,"mid":3}"#).unwrap();
+        assert_eq!(
+            serde_json::to_string(&nested).unwrap(),
+            r#"{"zeta":1,"alpha":2,"mid":3}"#,
+            "preserve_order 没生效：Value::Object 又变回字典序了"
+        );
+
+        let params = map(vec![
+            ("keyword", ParamValue::from("x")),
+            ("nested", ParamValue::Json(nested)),
+        ]);
+
+        // tools/kat/kat_object_order.js 的 paramsString
+        assert_eq!(
+            signature_android_params(SourceKind::Kugou, &params, b""),
+            "78c4cafe98a52eab308b1a6403812774"
+        );
+        assert_eq!(
+            signature_android_params(SourceKind::KugouConcept, &params, b""),
+            "5bcb30fb10df49df0e87d0beaaa9e590"
+        );
     }
 }

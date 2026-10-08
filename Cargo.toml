@@ -75,7 +75,11 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 
 # --- 序列化 ---
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# preserve_order：`Value::Object` 用 IndexMap 而不是 BTreeMap，保住 JSON 的键序。
+# 上游 `util/request.js:119` 对对象型 data 直接 `JSON.stringify`，键序即插入序；
+# 而 android 签名把这份字符串算进 MD5，键序一变签名就错。默认的 BTreeMap 会把
+# 键按字典序重排，签名与上游对不上（且不会报错，只是 403）。
+serde_json = { version = "1", features = ["preserve_order"] }
 toml = "1"
 
 # --- 本地日期 ---
