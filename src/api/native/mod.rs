@@ -9,9 +9,8 @@
 //! `NodeApi` 的一个优势：`module/song_url.js` 里那些 `isLite` 分支依赖
 //! `process.env.platform`，客户端根本看不到，而这里可以直接按平台取对的那一支。
 
-// 尚未接入网络的底层纯函数。`sign`/`device`/`krc` 都已被用上，不再需要 allow；
-// `crypto`（RSA/AES）等阶段 5 的设备注册与云端歌单。
-#[allow(dead_code)]
+// 尚未接入网络的底层纯函数。`sign`/`device`/`krc`/`crypto` 都已被用上，不再需要
+// 模块级 allow；`crypto` 里个别函数（裸 RSA）等阶段 5 的登录接口。
 pub mod crypto;
 pub mod device;
 pub mod krc;
@@ -23,7 +22,9 @@ use crate::api::cloud::{QrCheck, UserInfo, VipInfo};
 use crate::api::data_of;
 use crate::api::model::{Artist, Lyric, Playlist, RankBoard, Song, extract_songs};
 use crate::api::native::device::random_string;
-use crate::api::native::transport::{Endpoint, GATEWAY_BASE, LYRICS_BASE, Transport};
+use crate::api::native::transport::{
+    Endpoint, GATEWAY_BASE, LYRICS_BASE, Transport, USER_SERVICE_BASE,
+};
 use crate::api::traits::MusicApi;
 use crate::error::{AppError, Result};
 use crate::source::SourceKind;
@@ -291,6 +292,106 @@ pub(crate) fn inject_decoded_lyric(root: &mut Value) {
     object.insert("decodeContent".to_string(), Value::String(decoded));
 }
 
+/// 上游 `module/register_dev.js` 的设备信息表（31 键，插入序即 JSON 键序）。
+///
+/// `imei` 与 `uuid` 都取 `cookie.KUGOU_API_GUID`，上游对两者都用 `||`——GUID 缺失时
+/// 它们会变成 `undefined` 并被 `JSON.stringify` **整个丢掉**（31 键变 29 键，AES
+/// 明文随之改变，而且不会报错）。native 的 `Transport::cookie_map` 保证
+/// `KUGOU_API_GUID` 始终存在（缺时用本地设备标识补），所以这里不会走到那一支。
+pub(crate) fn register_dev_data_map(guid: &str) -> Value {
+    serde_json::json!({
+        "availableRamSize": 4983533568u64,
+        "availableRomSize": 48114719u64,
+        "availableSDSize": 48114717u64,
+        "basebandVer": "",
+        "batteryLevel": 100,
+        "batteryStatus": 3,
+        "brand": "Redmi",
+        "buildSerial": "unknown",
+        "device": "marble",
+        "imei": guid,
+        "imsi": "",
+        "manufacturer": "Xiaomi",
+        "uuid": guid,
+        "accelerometer": false,
+        "accelerometerValue": "",
+        "gravity": false,
+        "gravityValue": "",
+        "gyroscope": false,
+        "gyroscopeValue": "",
+        "light": false,
+        "lightValue": "",
+        "magnetic": false,
+        "magneticValue": "",
+        "orientation": false,
+        "orientationValue": "",
+        "pressure": false,
+        "pressureValue": "",
+        "step_counter": false,
+        "step_counterValue": "",
+        "temperature": false,
+        "temperatureValue": "",
+    })
+}
+
+/// 上游 `module/register_dev.js` 的请求规格（路由 `/register/dev`）。
+///
+/// 随机量与时间**全部由调用方注入**，所以能用固定输入对着上游实跑基准逐字节断言：
+/// `aes_key` 对应 `playlistAesEncrypt` 内部那次 `randomString(6).toLowerCase()`，
+/// `rsa_fill` 对应 `rsaEncrypt2` 里 `forge.random.getBytes` 的填充源。
+///
+/// 请求体是 AES 密文的 base64，**同时参与 android 签名**（上游
+/// `util/request.js` 把 `options.data` 原样拼进签名输入）；`p` 是
+/// `{"aes":…,"uid":…,"token":…}` 的 PKCS#1 v1.5 密文。两者都用平台公钥/盐值，
+/// 所以标准版与概念版各有一套基准。
+pub(crate) fn register_dev_endpoint(
+    kind: SourceKind,
+    guid: &str,
+    userid: Option<&str>,
+    token: &str,
+    aes_key: &str,
+    rsa_fill: &[u8],
+) -> Result<Endpoint<'static>> {
+    let plain = serde_json::to_string(&register_dev_data_map(guid))
+        .map_err(|error| AppError::Other(format!("序列化设备信息失败：{error}")))?;
+    let (encrypt_key, iv) = crate::api::native::crypto::playlist_key_material(aes_key);
+    let body = crate::api::native::crypto::aes_cbc_encrypt(&encrypt_key, &iv, plain.as_bytes())?;
+
+    // 上游 `params?.userid || params?.cookie?.userid || 0`：缺省是**数字** 0，
+    // 有值时是 cookie 里的字符串。这个区别会原样进 JSON、进而进 RSA 明文，
+    // 写错不报错，只是服务端不认。
+    let uid = match userid {
+        Some(value) if !value.is_empty() => Value::String(value.to_string()),
+        _ => Value::from(0),
+    };
+    let rsa_input = serde_json::to_string(&serde_json::json!({
+        "aes": aes_key,
+        "uid": uid,
+        "token": token,
+    }))
+    .map_err(|error| AppError::Other(format!("序列化 RSA 明文失败：{error}")))?;
+    let p = crate::api::native::crypto::pkcs1_v15_encrypt(kind, rsa_input.as_bytes(), rsa_fill)?;
+
+    Ok(Endpoint::post(USER_SERVICE_BASE, "/risk/v2/r_register_dev")
+        .param("part", "1")
+        .param("platid", "1")
+        .param("p", p)
+        .body(body))
+}
+
+/// 解开 `/register/dev` 的 `arraybuffer` 响应，等价于上游
+/// `playlistAesDecrypt({ str: res.body.toString('base64'), key })`。
+///
+/// `toString('base64')` 之后再 `Base64.parse` 是**恒等变换**，所以直接拿原始字节
+/// 当密文。解出的文本按上游那样先试 `JSON.parse`，失败则原样返回字符串——
+/// 响应被网关换成 HTML 时不会报错，只是后面取不到 `dfid`。
+pub(crate) fn parse_register_dev_response(aes_key: &str, body: &[u8]) -> Result<Value> {
+    let (encrypt_key, iv) = crate::api::native::crypto::playlist_key_material(aes_key);
+    let plain = crate::api::native::crypto::aes_cbc_decrypt(&encrypt_key, &iv, body)?;
+    let text = String::from_utf8_lossy(&plain).into_owned();
+    Ok(serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)))
+}
+
 /// `NativeApi` 的歌词实现。
 ///
 /// 算法在 [`crate::api::lyric::fetch_lyric_via`]，与 `NodeApi` **共用同一份**；
@@ -449,12 +550,39 @@ impl MusicApi for NativeApi {
         Err(unimplemented("claimed_vip_days"))
     }
 
-    /// 设备指纹要打 `/register/dev`（AES-CBC + RSA + `arraybuffer` 响应），属阶段 5。
+    /// 上游 `module/register_dev.js`（路由 `/register/dev`）。
     ///
-    /// 启动路径会调用它，失败只记一条 WARN——搜索与播放都不依赖 `dfid`
-    /// （没有它时上游自己退化成随机值），所以这里不实现也不影响阶段 3 的出口。
+    /// 请求体的 AES 密钥由本地随机生成，响应再用同一把密钥解开——上游把
+    /// `dfid` 放在解密后的 `data.dfid` 里，同时以 `Set-Cookie` 下发；native
+    /// 直接把值返回给调用方（`Loaded::DeviceFingerprint` 会写进配置）。
     async fn fetch_device_fingerprint(&self) -> Result<String> {
-        Err(unimplemented("fetch_device_fingerprint"))
+        let cookies = self.transport.cookie_map();
+        // `cookie_map` 保证 KUGOU_API_GUID 存在（缺时用本地设备标识补），
+        // 它同时充当上游的 imei 与 uuid。
+        let guid = cookies.get("KUGOU_API_GUID").cloned().unwrap_or_default();
+        let token = cookies.get("token").cloned().unwrap_or_default();
+        let userid = cookies.get("userid").cloned();
+
+        // 上游 `randomString(6).toLowerCase()` 与 `forge.random.getBytes`：
+        // 保持可注入的分层——这里只在生产路径上消费随机数。
+        let aes_key = random_string(6, &mut random_f64).to_lowercase();
+        let rsa_fill = crate::api::native::crypto::random_fill();
+
+        let endpoint = register_dev_endpoint(
+            self.kind(),
+            &guid,
+            userid.as_deref(),
+            &token,
+            &aes_key,
+            &rsa_fill,
+        )?;
+        let (_status, body) = self.transport.post_bytes(&endpoint).await?;
+        let root = parse_register_dev_response(&aes_key, &body)?;
+
+        let data = data_of(&root);
+        crate::api::model::pick_string(data, &["dfid", "DFID"])
+            .or_else(|| crate::api::model::pick_string(&root, &["dfid"]))
+            .ok_or_else(|| AppError::NotFound("`/register/dev` 未返回 dfid".to_string()))
     }
 
     async fn add_tracks_to_playlist(
@@ -849,7 +977,8 @@ mod tests {
     }
 
     /// 与上游 KAT 同一首歌：`singer_text() - name` 要拼出 `Letter - arkady sevidov`。
-    fn kat_song() -> Song {        Song {
+    fn kat_song() -> Song {
+        Song {
             name: "arkady sevidov".to_string(),
             hash: "6af00fbd4d444a82c005843eef9dc2d4".to_string(),
             duration_ms: 243722,
@@ -859,5 +988,139 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// 阶段 5a：`/register/dev` 的固定输入，全部取自 `tools/kat/kat_aes.js`
+    /// 的上游实跑基准（`/tmp/kat_aes_out.json` 的 `registerDev` 段）。
+    const KAT_GUID: &str = "5f2b1c3d4e5f60718293a4b5c6d7e8f9";
+    const KAT_AES_KEY: &str = "15iw0r";
+    const KAT_RSA_FILL: [u8; 16] = [
+        0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10,
+    ];
+    const KAT_REGISTER_P_STANDARD: &str = "02c6bdaa766f54607c2fdf52fb9292b948f849361a00c7bb88cde84bdfe25028d8daba3dde2f7c1eae3691158d89d54c00649bf8efe397a5d4e87f4a45221ea49b61e9f71ea27da879e200ba36b187f47f5fe5b9305e4a9c33cd60194fa0c14042921bfeaa96c87bf662152226f95ea7a7269d1114251a30aa0783a9458763a3";
+    const KAT_REGISTER_P_LITE: &str = "6e0ec9a555b6555ca3c461c1ab2e00944bb773cc185bfecc3e136eb1094fbd8bb16269f5ad04ab3efd42357031ae49ef536480ab8366d2d23a1e9aed9933caa377a14ca4688a422e7c7fef9bc76fb9d94239e5f5618c8339eba1d2378c6fc8c4cf2661917e6dbaff854cc26f4dae16eda505eceada5dd6b93bc64c8ba6e89fa1";
+    /// 上游 31 键明文，插入序即 JSON 键序。
+    const KAT_REGISTER_PLAIN: &str = r#"{"availableRamSize":4983533568,"availableRomSize":48114719,"availableSDSize":48114717,"basebandVer":"","batteryLevel":100,"batteryStatus":3,"brand":"Redmi","buildSerial":"unknown","device":"marble","imei":"5f2b1c3d4e5f60718293a4b5c6d7e8f9","imsi":"","manufacturer":"Xiaomi","uuid":"5f2b1c3d4e5f60718293a4b5c6d7e8f9","accelerometer":false,"accelerometerValue":"","gravity":false,"gravityValue":"","gyroscope":false,"gyroscopeValue":"","light":false,"lightValue":"","magnetic":false,"magneticValue":"","orientation":false,"orientationValue":"","pressure":false,"pressureValue":"","step_counter":false,"step_counterValue":"","temperature":false,"temperatureValue":""}"#;
+
+    /// `register_dev_data_map` 的键序与值必须与上游 `dataMap` 逐字节一致。
+    ///
+    /// 这条是「31 键一个不多一个不少、顺序不错」的护栏：`JSON.stringify` 的
+    /// 键序就是插入序，而这段 JSON 是要被 AES 加密并签名的。
+    #[test]
+    fn register_dev_data_map_matches_upstream() {
+        assert_eq!(register_dev_data_map(KAT_GUID).to_string(), KAT_REGISTER_PLAIN);
+        assert_eq!(register_dev_data_map(KAT_GUID).as_object().unwrap().len(), 31);
+    }
+
+    /// 阶段 5a 出口：`/register/dev` 的出站 URL 与上游逐字节一致（标准版）。
+    #[test]
+    fn register_dev_endpoint_matches_kat() {
+        let endpoint = register_dev_endpoint(
+            SourceKind::Kugou,
+            KAT_GUID,
+            Some("10001"),
+            "TOKENFIXTURE",
+            KAT_AES_KEY,
+            &KAT_RSA_FILL,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &endpoint),
+            format!("https://userservice.kugou.com/risk/v2/r_register_dev?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&part=1&platid=1&p={KAT_REGISTER_P_STANDARD}&signature=9560aafc5263cea5b6c4133dd5180016")
+        );
+    }
+
+    /// 概念版换 `appid`/`clientver`/公钥/盐值，`p` 与签名随之全变。
+    #[test]
+    fn lite_register_dev_endpoint_matches_kat() {
+        let endpoint = register_dev_endpoint(
+            SourceKind::KugouConcept,
+            KAT_GUID,
+            Some("10001"),
+            "TOKENFIXTURE",
+            KAT_AES_KEY,
+            &KAT_RSA_FILL,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &endpoint),
+            format!("https://userservice.kugou.com/risk/v2/r_register_dev?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&part=1&platid=1&p={KAT_REGISTER_P_LITE}&signature=20acedab6f254572eff1b5151f4cd0a1")
+        );
+    }
+
+    /// 请求体是 AES 密文，两平台相同（AES 不依赖平台），长度固定 896 字符。
+    ///
+    /// 它同时参与 android 签名，所以长度错一块（PKCS#7 少补一整块）会让
+    /// 上面的签名断言一起失败——这里单独锁一次，失败时能一眼看出是哪一步。
+    #[test]
+    fn register_dev_body_is_the_kat_ciphertext() {
+        let endpoint = register_dev_endpoint(
+            SourceKind::Kugou,
+            KAT_GUID,
+            Some("10001"),
+            "TOKENFIXTURE",
+            KAT_AES_KEY,
+            &KAT_RSA_FILL,
+        )
+        .unwrap();
+        let body = endpoint.data.clone().unwrap();
+        assert_eq!(body.len(), 896);
+        // 密文的 md5 也写死，避免「长度对但内容错」这种情况漏过。
+        assert_eq!(
+            crate::api::native::crypto::md5_hex(body.as_bytes()),
+            "21504e4c49cc44d354e71c036640784e"
+        );
+    }
+
+    /// `uid` 缺省时是**数字** 0，不是字符串 `"0"`——两者进 RSA 明文后不同，
+    /// 服务端不认也不报错。上游 `params?.userid || params?.cookie?.userid || 0`。
+    #[test]
+    fn register_dev_uid_defaults_to_a_number() {
+        let with_user = register_dev_endpoint(
+            SourceKind::Kugou,
+            KAT_GUID,
+            Some("10001"),
+            "TOKENFIXTURE",
+            KAT_AES_KEY,
+            &KAT_RSA_FILL,
+        )
+        .unwrap();
+        let without = register_dev_endpoint(
+            SourceKind::Kugou,
+            KAT_GUID,
+            None,
+            "TOKENFIXTURE",
+            KAT_AES_KEY,
+            &KAT_RSA_FILL,
+        )
+        .unwrap();
+        // 未登录时 `p` 与登录时不同（RSA 明文里的 uid 变了）。
+        assert_ne!(with_user.params[2].1, without.params[2].1);
+        assert_eq!(with_user.params[0], ("part".to_string(), "1".to_string()));
+        assert_eq!(with_user.params[1], ("platid".to_string(), "1".to_string()));
+    }
+
+    /// `arraybuffer` 响应解密：上游基准里 `key="1jx5zx"` 的密文解出
+    /// `{"status":1,"data":{"dfid":"DFIDFIXTURE0123456789ab"}}`。
+    #[test]
+    fn register_dev_response_decrypts_matches_kat() {
+        let cipher = crate::api::native::crypto::base64_decode(
+            "02H1lHOQIzwMrj05HOAgLvLiPkqf9yl7uV+kZlcfSDuaw7BimABc+k0W8KH/NWgYcBAQu8TiWtQYtmsE6ZXj7g==",
+        )
+        .unwrap();
+        let root = parse_register_dev_response("1jx5zx", &cipher).unwrap();
+        assert_eq!(root["status"], Value::from(1));
+        assert_eq!(root["data"]["dfid"], Value::from("DFIDFIXTURE0123456789ab"));
+        assert_eq!(
+            crate::api::model::pick_string(data_of(&root), &["dfid"]).as_deref(),
+            Some("DFIDFIXTURE0123456789ab")
+        );
+    }
+
+    /// 解不开的密文不能 panic，只能报错（上游 `playlistAesDecrypt` 会给出垃圾）。
+    #[test]
+    fn register_dev_response_rejects_unaligned_ciphertext() {
+        assert!(parse_register_dev_response("15iw0r", b"not-a-block").is_err());
     }
 }

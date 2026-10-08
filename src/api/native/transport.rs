@@ -40,6 +40,9 @@ pub const GATEWAY_BASE: &str = "https://gateway.kugou.com";
 #[allow(dead_code)]
 pub const LYRICS_BASE: &str = "https://lyrics.kugou.com";
 
+/// 设备注册接口的独立域名（`module/register_dev.js` 自带 `baseURL`）。
+pub const USER_SERVICE_BASE: &str = "https://userservice.kugou.com";
+
 /// 上游默认 UA（`util/request.js:143`）。**不是** `kugou-tui/…`——
 /// 网关按 UA 判客户端类型，换掉它取流会失败。
 pub const USER_AGENT: &str = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";
@@ -330,6 +333,19 @@ impl Transport {
         self.get_json_once(endpoint, cached).await
     }
 
+    /// 取一次**原始字节**。
+    ///
+    /// `/register/dev` 的 `responseType` 是 `arraybuffer`：响应体是一段 AES 密文，
+    /// 不是文本。用 `response.text()` 会按 UTF-8 做有损替换，密文就毁了——而且
+    /// 不会报错，只是解密出一堆垃圾。所以这条路径必须拿到字节。
+    ///
+    /// 与上游一致，不做重试判定之外的任何处理：上游 `createRequest` 在
+    /// `responseType === 'arraybuffer'` 下把 `Buffer` 原样塞进 `answer.body`。
+    pub async fn post_bytes(&self, endpoint: &Endpoint<'_>) -> Result<(u16, Vec<u8>)> {
+        let prepared = self.prepare(endpoint);
+        self.send_bytes(&prepared).await
+    }
+
     /// 跑一次 `once`，失败且属于瞬时故障时按 [`crate::api::client::RetryPolicy`] 重试。
     async fn with_retry<F, Fut, T>(&self, once: F) -> Result<T>
     where
@@ -441,6 +457,37 @@ impl Transport {
         let response = request.send().await?;
         let status = response.status().as_u16();
         let body = response.text().await?;
+        Ok((status, body))
+    }
+
+    /// [`Self::send`] 的字节版本，给 `arraybuffer` 响应（`/register/dev`）用。
+    async fn send_bytes(&self, prepared: &Prepared) -> Result<(u16, Vec<u8>)> {
+        tlog!(
+            crate::logger::LEVEL_DEBUG,
+            "native 出站 {} {} headers={:?} body={:?}",
+            match prepared.method {
+                Method::Post => "POST",
+                Method::Get => "GET",
+            },
+            prepared.url,
+            prepared.headers,
+            prepared.body
+        );
+
+        let mut request = match prepared.method {
+            Method::Post => self.http.post(&prepared.url),
+            Method::Get => self.http.get(&prepared.url),
+        };
+        for (key, value) in &prepared.headers {
+            request = request.header(key.as_str(), value.as_str());
+        }
+        if let Some(body) = &prepared.body {
+            request = request.body(body.clone());
+        }
+
+        let response = request.send().await?;
+        let status = response.status().as_u16();
+        let body = response.bytes().await?.to_vec();
         Ok((status, body))
     }
 }
