@@ -3,14 +3,16 @@
 //! 来源：KuGouMusicApi v1.6.0 `util/crypto.js`
 //! （commit a5a98013cce79fe0ae2ad65fc84b68176ebcfc1e，2026-08-14）。
 //!
-//! 只移植迁移范围用得到的三个：
+//! 只移植迁移范围用得到的四个：
 //!
 //! * `cryptoMd5` —— 全部签名的基础；
 //! * `cryptoRSAEncrypt` / `rsaRawEncrypt` —— **裸 RSA，无填充**；
-//! * `rsaEncrypt2` —— PKCS#1 v1.5，块类型 `0x02`。
+//! * `rsaEncrypt2` —— PKCS#1 v1.5，块类型 `0x02`；
+//! * `playlistAesEncrypt` / `playlistAesDecrypt` —— AES-128-CBC + PKCS#7，
+//!   密钥与 IV 由 6 字符 `key` 的 MD5 前 16 / 后 16 个十六进制字符充当。
 //!
-//! 上游的 `cryptoAesEncrypt` / `playlistAesEncrypt` 系列只有 `playlist_del`
-//! （本客户端的 `delete_playlist`）用得到，留到阶段 5 接云端歌单时再移植。
+//! 上游的 `cryptoAesEncrypt`（另一个函数：key 取 MD5 全 32 字符、iv 取 key
+//! 末 16）迁移范围用不到，没有移植。
 //!
 //! # 公钥从哪来
 //!
@@ -96,6 +98,7 @@ fn encrypt_block(kind: SourceKind, block: &[u8]) -> String {
 ///
 /// 对应上游 `util/crypto.js` 的 `cryptoRSAEncrypt` 与 `rsaRawEncrypt`。
 /// 确定性函数——同样的输入永远得到同样的密文，可直接做 KAT。
+#[allow(dead_code)] // 阶段 5b 的 /user/detail 用（module/user_detail.js 的 cryptoRSAEncrypt）
 pub fn raw_rsa_encrypt(kind: SourceKind, data: &[u8]) -> Result<String> {
     if data.len() > KEY_BYTES {
         // 上游抛 `'Data length exceeds key size'`。
@@ -157,6 +160,129 @@ pub fn pkcs1_v15_encrypt(kind: SourceKind, data: &[u8], fill: &[u8]) -> Result<S
     block.extend_from_slice(data);
     debug_assert_eq!(block.len(), KEY_BYTES);
     Ok(encrypt_block(kind, &block))
+}
+
+/// 由 `playlistAesEncrypt` 的 6 字符 `key` 派生 AES 的密钥与 IV。
+///
+/// 对应上游 `util/crypto.js:272-285`：
+///
+/// ```text
+/// encryptKey = cryptoMd5(key).substring(0, 16)
+/// iv         = cryptoMd5(key).substring(16, 32)
+/// ```
+///
+/// **这两个值是那 16 个十六进制字符本身**（各 16 个 ASCII 字节），不是把
+/// hex 解码后的 8 字节。上游 `utf8WordArray`（`util/crypto.js:134-136`）对
+/// 字符串走 `CryptoJS.enc.Utf8.parse`，所以进 AES 的就是 ASCII 字节。
+/// 按 hex 解码写会得到另一个密文，而且不会有任何报错。
+pub fn playlist_key_material(key: &str) -> ([u8; 16], [u8; 16]) {
+    let digest = md5_hex(key.as_bytes());
+    let mut encrypt_key = [0u8; 16];
+    let mut iv = [0u8; 16];
+    encrypt_key.copy_from_slice(&digest.as_bytes()[..16]);
+    iv.copy_from_slice(&digest.as_bytes()[16..32]);
+    (encrypt_key, iv)
+}
+
+/// AES-128-CBC + PKCS#7 加密，返回 base64。
+///
+/// 对应上游 `util/crypto.js` 的 `playlistAesEncrypt`。上游把密文交给
+/// `CryptoJS.enc.Base64.stringify`，即标准 base64（带 `=` 填充）。
+///
+/// 没有引 `cbc` crate（`Cargo.lock` 里也没有），CBC 的异或链在这里手写：
+/// 每块先与前一块密文异或再送进 `Aes128::encrypt_block`。块数很少
+/// （`/register/dev` 的明文约 1.2 KB），不需要分块并行。
+pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plain: &[u8]) -> Result<String> {
+    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::cipher::generic_array::GenericArray;
+    use aes::Aes128;
+
+    if key.len() != 16 || iv.len() != 16 {
+        return Err(AppError::Other(format!(
+            "AES-CBC 需要 16 字节密钥与 IV，收到 {} 与 {}",
+            key.len(),
+            iv.len()
+        )));
+    }
+
+    // PKCS#7：补到块大小整数倍，且**恰好是整数倍时也要补满一整块**
+    // （CryptoJS `cipher-core.js:404` 的 `blockSizeBytes - sigBytes % blockSizeBytes`）。
+    let pad = 16 - (plain.len() % 16);
+    let mut buffer = Vec::with_capacity(plain.len() + pad);
+    buffer.extend_from_slice(plain);
+    buffer.extend(std::iter::repeat_n(pad as u8, pad));
+
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    let mut previous = [0u8; 16];
+    previous.copy_from_slice(iv);
+
+    for chunk in buffer.chunks_mut(16) {
+        for (byte, chain) in chunk.iter_mut().zip(previous.iter()) {
+            *byte ^= chain;
+        }
+        let block = GenericArray::from_mut_slice(chunk);
+        cipher.encrypt_block(block);
+        previous.copy_from_slice(chunk);
+    }
+
+    use base64::Engine as _;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&buffer))
+}
+
+/// AES-128-CBC + PKCS#7 解密，输入是 base64。
+///
+/// 对应上游 `util/crypto.js` 的 `playlistAesDecrypt`。上游的 `CryptoJS` 解填充
+/// 只按最后一字节截断、**不校验**（`cipher-core.js:431-437`），所以密文不对时
+/// 它给出的是垃圾而不是报错。这里行为一致：不校验填充内容，只按最后一字节截断，
+/// 剩下的字节原样返回给调用方去 `JSON.parse` 或当文本用。
+pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    use aes::cipher::{BlockDecrypt, KeyInit};
+    use aes::cipher::generic_array::GenericArray;
+    use aes::Aes128;
+
+    if key.len() != 16 || iv.len() != 16 {
+        return Err(AppError::Other(format!(
+            "AES-CBC 需要 16 字节密钥与 IV，收到 {} 与 {}",
+            key.len(),
+            iv.len()
+        )));
+    }
+    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
+        return Err(AppError::Other(format!(
+            "AES-CBC 密文长度 {} 不是 16 的正整数倍",
+            ciphertext.len()
+        )));
+    }
+
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    let mut previous = [0u8; 16];
+    previous.copy_from_slice(iv);
+
+    let mut out = Vec::with_capacity(ciphertext.len());
+    for chunk in ciphertext.chunks(16) {
+        let mut block = GenericArray::clone_from_slice(chunk);
+        cipher.decrypt_block(&mut block);
+        for (byte, chain) in block.iter_mut().zip(previous.iter()) {
+            *byte ^= chain;
+        }
+        out.extend_from_slice(&block);
+        previous.copy_from_slice(chunk);
+    }
+
+    let pad = usize::from(*out.last().expect("密文非空"));
+    if pad > 0 && pad <= 16 && pad <= out.len() {
+        out.truncate(out.len() - pad);
+    }
+    Ok(out)
+}
+
+/// base64 → 字节。
+#[allow(dead_code)] // 阶段 5d 的云歌单写接口用（module/playlist_del.js 的响应解密）
+pub fn base64_decode(text: &str) -> Result<Vec<u8>> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .map_err(|error| AppError::Other(format!("base64 解码失败：{error}")))
 }
 
 /// 生产路径的 PKCS#1 v1.5 填充源。
@@ -279,5 +405,91 @@ mod tests {
         let expected =
             pkcs1_v15_encrypt(SourceKind::Kugou, b"hello world", &FIXED_FILL).expect("加密");
         assert_eq!(got, expected);
+    }
+
+    /// `tools/kat/kat_aes.js` 钉死的 6 字符 key。
+    const KAT_AES_KEY: &str = "15iw0r";
+
+    #[test]
+    fn playlist_key_material_matches_upstream() {
+        // 上游：cryptoMd5('15iw0r') = bb2d33d8684710549dd97a8a58d90250
+        //       encryptKey = 前 16 字符，iv = 后 16 字符（都是 ASCII 字节）
+        let (key, iv) = playlist_key_material(KAT_AES_KEY);
+        assert_eq!(&key, b"bb2d33d868471054");
+        assert_eq!(&iv, b"9dd97a8a58d90250");
+    }
+
+    #[test]
+    fn aes_cbc_matches_upstream_object() {
+        // 上游 playlistAesEncrypt({"hello":"world","中文":"值","n":42,"nested":{"a":[1,2]}})
+        let (key, iv) = playlist_key_material(KAT_AES_KEY);
+        let plain = r#"{"hello":"world","中文":"值","n":42,"nested":{"a":[1,2]}}"#;
+        let got = aes_cbc_encrypt(&key, &iv, plain.as_bytes()).expect("加密");
+        assert_eq!(
+            got,
+            "NT568O7l3E83PNQy5gEbv6YZ3dXr7r2B0Xb7NmnWbZlBvfBfeJDec4hGNcv09JvgjGPxUBUWwAPxNmOHpwsiJg=="
+        );
+    }
+
+    #[test]
+    fn aes_cbc_matches_upstream_empty_object() {
+        let (key, iv) = playlist_key_material(KAT_AES_KEY);
+        let got = aes_cbc_encrypt(&key, &iv, b"{}").expect("加密");
+        assert_eq!(got, "jMix3CfCIvfHcUxSdPqECg==");
+    }
+
+    #[test]
+    fn aes_cbc_pads_a_full_block() {
+        // 明文恰好 16 字节时 PKCS#7 要补满一整块，否则密文会短 16 字节。
+        let (key, iv) = playlist_key_material(KAT_AES_KEY);
+        let got = aes_cbc_encrypt(&key, &iv, b"0123456789abcdef").expect("加密");
+        assert_eq!(got, "oeYFHQbj0GWrHP/FuCGatahrd7SNPCwLNpEnb/3bgmU=");
+        assert_eq!(
+            aes_cbc_decrypt(&key, &iv, &base64_decode(&got).expect("解码")).expect("解密"),
+            b"0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn aes_cbc_matches_upstream_partial_block() {
+        let (key, iv) = playlist_key_material(KAT_AES_KEY);
+        let got = aes_cbc_encrypt(&key, &iv, b"0123456789abcde").expect("加密");
+        assert_eq!(got, "ok0TkDTmEBc1Z2gwnome0Q==");
+    }
+
+    #[test]
+    fn aes_cbc_matches_upstream_multibyte() {
+        // 多字节按 UTF-8 字节数补齐，不是按字符数。
+        let (key, iv) = playlist_key_material(KAT_AES_KEY);
+        let got = aes_cbc_encrypt(&key, &iv, "酷狗".as_bytes()).expect("加密");
+        assert_eq!(got, "29VD+Egh7lpkppfjSZ41gg==");
+    }
+
+    #[test]
+    fn aes_cbc_decrypt_matches_upstream_response() {
+        // 上游 playlistAesDecrypt 的对照：key='1jx5zx'，
+        // 明文 {"status":1,"data":{"dfid":"DFIDFIXTURE0123456789ab"}}
+        let (key, iv) = playlist_key_material("1jx5zx");
+        let ciphertext = base64_decode(
+            "02H1lHOQIzwMrj05HOAgLvLiPkqf9yl7uV+kZlcfSDuaw7BimABc+k0W8KH/NWgYcBAQu8TiWtQYtmsE6ZXj7g==",
+        )
+        .expect("解码");
+        let plain = aes_cbc_decrypt(&key, &iv, &ciphertext).expect("解密");
+        assert_eq!(
+            String::from_utf8(plain).expect("utf8"),
+            r#"{"status":1,"data":{"dfid":"DFIDFIXTURE0123456789ab"}}"#
+        );
+    }
+
+    #[test]
+    fn aes_cbc_rejects_bad_key_length() {
+        assert!(aes_cbc_encrypt(b"short", b"0123456789abcdef", b"x").is_err());
+        assert!(aes_cbc_decrypt(b"0123456789abcdef", b"short", &[0u8; 16]).is_err());
+    }
+
+    #[test]
+    fn aes_cbc_rejects_unaligned_ciphertext() {
+        assert!(aes_cbc_decrypt(b"0123456789abcdef", b"0123456789abcdef", &[0u8; 15]).is_err());
+        assert!(aes_cbc_decrypt(b"0123456789abcdef", b"0123456789abcdef", b"").is_err());
     }
 }
