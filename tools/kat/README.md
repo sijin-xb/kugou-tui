@@ -32,6 +32,7 @@ node tools/kat/kat_object_order.js  # 对象型参数值的 JSON 键序（preser
 node tools/kat/kat_aes.js       # AES-128-CBC+PKCS7 与 /register/dev 的整份请求
 node tools/kat/kat_login.js     # 扫码登录三个接口与用户信息两个接口的整份请求
 node tools/kat/kat_cloud.js     # 云歌单/歌手/榜单/会员领取记录九个只读接口的整份请求
+node tools/kat/kat_write.js     # 云歌单四个写接口的整份请求
 node tools/kat/kat_request.js       # 固定时间与随机，录 request.js 构造出的整份请求
 node tools/kat/probe_outbound.js    # 录真实出站请求：URL / 参数 / 头
 node tools/kat/probe_outbound.js lite   # 只跑 lite 平台
@@ -51,6 +52,7 @@ node tools/kat/probe_outbound.js lite   # 只跑 lite 平台
 | `kat_aes.js` | `src/api/native/crypto.rs`、`mod.rs` | 钉死 `Math.random`/`Date.now`/`forge.random.getBytes`，录 `playlistAesEncrypt` 的加解密与 `/register/dev` 的整份请求 |
 | `kat_login.js` | `src/api/native/mod.rs` | 钉死 `Math.random`/`Date.now`，录 `/v2/qrcode`、`/v2/get_userinfo_qrcode`、`/v3/get_my_info`、`/v1/get_union_vip` 的整份请求；`user_detail` 额外截获裸 RSA 的明文 |
 | `kat_cloud.js` | `src/api/native/mod.rs` | 钉死 `Math.random` 与**整个 `Date`**（`artist_audios` 用 `new Date().getTime()`，只覆盖 `Date.now` 会让时间戳不可复现），录九个只读接口的整份请求 |
+| `kat_write.js` | `src/api/native/mod.rs` | 钉死 `Math.random`/`Date.now`/`forge.random.getBytes`，录 `/playlist/add`、`/playlist/del`、`/playlist/tracks/add`、`/playlist/tracks/del` 的整份请求；`playlist_del` 额外截获 AES 密钥与 RSA 明文。**不用假 axios**，而是把 baseURL 指到本地假服务器，好让 axios 在 `dispatchRequest` 里补的 `Content-Type` 也进基准 |
 | `kat_request.js` | `src/api/native/transport.rs`、`mod.rs` | 钉死 `Date.now`/`Math.random`，录 `request.js` 构造出的 URL/参数/头/body，供逐字节断言 |
 | `probe_outbound.js` | `src/api/native/`（网络层） | 本地假 gateway 录真实出站请求，供 native 逐项对齐 |
 
@@ -126,3 +128,20 @@ curl -s "http://127.0.0.1:3001/lyric?id=<lyric_id>&accesskey=<accesskey>&fmt=krc
   Express 解析出的 query 一律是字符串。传数字会改变上游 `params.x || fallback`
   的分支——`withsong: 0` 是 falsy 会被换成 `1`，而 `'0'` 是真值会原样保留，
   两者的签名不同。`kat_cloud.js` 因此全程传字符串。
+- **`playlist_add.js` 的 `params.type === 0` 永远不成立**：Express 给的 `type`
+  是字符串 `'0'`，严格等于数字 `0` 的判据为假，所以 `is_pri` 不会被
+  `params.is_pri || 0` 覆盖，`params` 也不会带上 `last_time`/`last_area`。
+  照「看着像 0 就当 0」写会让 URL 与签名都不对。
+- **`playlist_add.js` 的 `list_create_userid`/`list_create_listid` 会被整个丢掉**：
+  未传时是 `undefined`，`JSON.stringify` 直接跳过该键，body 只有 9 个键。
+  写成 `null` 或 `0` 都会多出键。
+- **`kat_write.js` 不用假 axios，改指本地假服务器**：`Content-Type` 不是
+  `module/*.js` 写的，而是 axios 在 `dispatchRequest` 里按 `data` 类型补的
+  （对象 → `application/json`，字符串 → `application/x-www-form-urlencoded`）。
+  假 axios 截到的是 `config.headers`，拿不到这一步；让请求真的发到
+  `127.0.0.1` 上的假服务器才录得到。
+- **标准版 `playlist_del` 的 `p` 与 `/register/dev` 的 `p` 逐字节相同不是巧合**：
+  两次录制的 RSA 明文都是 `{"aes":"15iw0r","uid":"10001","token":"TOKENFIXTURE"}`、
+  填充都是 `0x01..0x10`（lite 的公钥与填充序列都不同，两者不一致）。两者独立录制
+  却一致，等于互证 `rsaEncrypt2`（PKCS#1 v1.5）与 `cryptoRSAEncrypt`（裸 RSA）在
+  **这一组输入**下同解——但填充规则不同，不能互相替换。
