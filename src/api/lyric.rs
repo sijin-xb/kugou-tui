@@ -5,7 +5,7 @@
 //! 酷狗取歌词要两个请求：
 //!
 //! 1. `GET /search/lyric?hash=&keywords=` → 拿到 `(id, accesskey)`
-//! 2. `GET /lyric?id=&accesskey=&fmt=lrc&decode=true` → 拿到 LRC 正文
+//! 2. `GET /lyric?id=&accesskey=&fmt=krc&decode=true` → 拿到歌词正文
 //!
 //! 服务端在 `decode=true` 时会把结果放进 `decodeContent`；如果只给了 base64 的
 //! `content`，本地再解一次。
@@ -13,8 +13,10 @@
 //! # 关于 KRC
 //!
 //! 酷狗原生的逐字歌词格式是 KRC（`[起始毫秒,持续毫秒]字<偏移,时长,0>…`）。
-//! 本项目只要整行歌词，所以请求 `fmt=lrc`；但解析器仍然兼容 KRC 的时间标签，
-//! 万一服务端回落到 KRC 也不会整篇解析失败——只是退化成逐行。
+//! 本项目要逐字高亮，所以请求 `fmt=krc`，解析器解析 `<本行内偏移,持续,0>`
+//! 标记（见 `parse_krc_words`）；翻译与音译只存在于 KRC 的 `[language:]` 标签里，
+//! 请求 lrc 就拿不到。解析器同时兼容纯 LRC 的时间标签，服务端万一回落到 LRC
+//! 也不会整篇解析失败——只是退化成逐行。
 
 use base64::Engine;
 use serde_json::Value;
