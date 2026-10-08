@@ -21,12 +21,218 @@ pub mod cloud;
 pub(crate) mod lyric;
 /// 领域模型要对 crate 内其它层可见（`app` / `ui` 都要用 `Song` 等类型）。
 pub mod model;
+/// 内嵌的纯 Rust 后端。
+pub(crate) mod native;
+/// KuGouMusicApi（Node）后端：酷狗接口的方法体挂在这里。
+pub(crate) mod node;
+/// 后端抽象。上层只认这个 trait，不认具体是 Node 还是 native。
+pub(crate) mod traits;
+
+use crate::error::{AppError, Result};
+use client::HttpClient;
+use native::NativeApi;
+use node::NodeApi;
+use serde::{Deserialize, Serialize};
+use traits::MusicApi;
+
+use crate::source::SourceKind;
+
+/// 用哪套后端实现。
+///
+/// 默认 [`ApiBackend::Node`]：内嵌后端在阶段 2 起逐步接入，全部验收通过之前
+/// 不改变默认行为。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ApiBackend {
+    /// 走本机 KuGouMusicApi（Node）。
+    #[default]
+    Node,
+    /// 内嵌的纯 Rust 实现，不需要 Node。
+    Native,
+}
+
+impl ApiBackend {
+    /// 该后端**实际**能用在哪类音源上。
+    ///
+    /// native 只覆盖酷狗两个平台：网易云与汽水的接口语义没有进 [`MusicApi`]，
+    /// 它们直接架在 HTTP 传输层上（见 [`crate::source::netease`]），而 native
+    /// 没有那一层。所以在这些音源上强行用 native 只会得到「需要 HTTP 传输层」
+    /// 的报错，不如在这里就落回 Node，让 `--api native` 的语义是
+    /// 「酷狗不用 Node，其它音源照旧」。
+    pub fn effective_for(self, kind: SourceKind) -> Self {
+        match self {
+            Self::Native if kind.uses_device_fingerprint() => Self::Native,
+            _ => Self::Node,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Node => "node（本机 KuGouMusicApi）",
+            Self::Native => "native（内嵌，不依赖 Node）",
+        }
+    }
+}
+
+impl std::fmt::Display for ApiBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Node => "node",
+            Self::Native => "native",
+        })
+    }
+}
 
 /// 客户端是这一层唯一对外暴露的类型。
 ///
 /// 领域模型不在这里 re-export：各层直接从 `crate::api::model` 取，
 /// 少一层转发，`use` 语句也更能说明「这个东西从哪来」。
-pub use client::ApiClient;
+///
+/// # 为什么是枚举而不是 `Box<dyn MusicApi>`
+///
+/// 上游调用点与测试都以「一个具体类型 + 值语义克隆」为前提（`ApiClient` 要
+/// `Clone`、能塞进 `JoinSet`、能在切音源时整体替换），而 `async fn in trait`
+/// 当前不满足 dyn 兼容。枚举分派保住这些前提，代价是多一层 match——
+/// 两个分支都**只调用 trait 实现**，不含任何接口逻辑，将来换成
+/// `async-trait` + `dyn` 是机械改动。
+#[derive(Debug, Clone)]
+pub enum ApiClient {
+    /// 走本机 KuGouMusicApi 的 HTTP 后端。
+    Node(NodeApi),
+    /// 内嵌的纯 Rust 后端。
+    Native(NativeApi),
+}
+
+impl ApiClient {
+    /// 构造 Node 后端。**签名与行为保持与迁移前一致**，测试直接依赖它。
+    pub fn new(base: &str, cookie: Option<String>, proxy: Option<&str>) -> Result<Self> {
+        Ok(Self::Node(NodeApi::new(base, cookie, proxy)?))
+    }
+
+    /// 构造内嵌后端。`kind` 决定平台盐值与 `appid`。
+    pub fn native(kind: SourceKind, cookie: Option<String>) -> Self {
+        Self::Native(NativeApi::new(kind, cookie))
+    }
+
+    /// 按配置选后端。**这是全程序构造客户端的唯一入口**。
+    ///
+    /// `kind` 参与判定：native 只覆盖酷狗两个平台，其余音源无论配置怎么写都走
+    /// Node（理由见 [`ApiBackend::effective_for`]）。
+    pub fn for_backend(
+        backend: ApiBackend,
+        kind: SourceKind,
+        base: &str,
+        cookie: Option<String>,
+        proxy: Option<&str>,
+    ) -> Result<Self> {
+        match backend.effective_for(kind) {
+            ApiBackend::Native => Ok(Self::native(kind, cookie)),
+            ApiBackend::Node => Self::new(base, cookie, proxy),
+        }
+    }
+
+    /// 当前后端的传输层。**只有 Node 后端有**；网易云音源架在它上面。
+    fn http(&self) -> Result<&HttpClient> {
+        match self {
+            Self::Node(api) => Ok(api.transport()),
+            Self::Native(_) => Err(AppError::Other(
+                "该接口需要 HTTP 传输层，native 后端不支持".to_string(),
+            )),
+        }
+    }
+
+    pub fn base(&self) -> &str {
+        match self {
+            Self::Node(api) => api.base(),
+            Self::Native(api) => api.base(),
+        }
+    }
+
+    pub fn cookie(&self) -> Option<&str> {
+        match self {
+            Self::Node(api) => api.cookie(),
+            Self::Native(api) => api.cookie(),
+        }
+    }
+
+    pub fn set_cookie(&mut self, cookie: Option<String>) {
+        match self {
+            Self::Node(api) => api.set_cookie(cookie),
+            Self::Native(api) => api.set_cookie(cookie),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 传输转发。网易云音源直接把这些当自己的 HTTP 层用，签名不能变。
+    //
+    // 只暴露网易云**实际用到**的两个：它全部 21 个请求都走 `get_json_uncached`，
+    // 四个写接口走 `get_json_uncached_mutating`。酷狗自己的读接口不走这里
+    // （在 `NodeApi` 内部直接持有 `HttpClient`），所以不预留另外三个。
+    // ------------------------------------------------------------------
+
+    pub(crate) async fn get_json_uncached(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<serde_json::Value> {
+        self.http()?.get_json_uncached(path, query).await
+    }
+
+    pub(crate) async fn get_json_uncached_mutating(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<serde_json::Value> {
+        self.http()?.get_json_uncached_mutating(path, query).await
+    }
+}
+
+/// 把 [`MusicApi`] 的每个方法转发给内部后端。
+///
+/// 这里**只做分派**：两个分支各自调对方的 trait 实现，接口逻辑一律不在本文件。
+macro_rules! delegate_to_backend {
+    ($( async fn $name:ident ( &self $(, $arg:ident : $ty:ty)* ) -> $ret:ty ; )*) => {
+        impl MusicApi for ApiClient {
+            $(
+                async fn $name(&self $(, $arg: $ty)*) -> $ret {
+                    match self {
+                        Self::Node(api) => MusicApi::$name(api $(, $arg)*).await,
+                        Self::Native(api) => MusicApi::$name(api $(, $arg)*).await,
+                    }
+                }
+            )*
+        }
+    };
+}
+
+delegate_to_backend! {
+    async fn search_songs(&self, keywords: &str, page: u32, page_size: u32) -> Result<Vec<model::Song>>;
+    async fn plaza_playlists(&self, category_id: i64, page: u32, page_size: u32) -> Result<Vec<model::Playlist>>;
+    async fn playlist_tracks(&self, global_id: &str, page: u32, page_size: u32, fresh: bool) -> Result<Vec<model::Song>>;
+    async fn user_playlists(&self) -> Result<Vec<model::Playlist>>;
+    async fn user_playlist_tracks(&self, list_id: i64, page: u32, page_size: u32, fresh: bool) -> Result<Vec<model::Song>>;
+    async fn artist_list(&self, kind: i64, hot_size: u32) -> Result<Vec<model::Artist>>;
+    async fn rank_boards(&self) -> Result<Vec<model::RankBoard>>;
+    async fn playlist_tracks_all(&self, global_id: &str, fresh: bool) -> Result<Vec<model::Song>>;
+    async fn user_playlist_tracks_all(&self, list_id: i64, fresh: bool) -> Result<Vec<model::Song>>;
+    async fn artist_tracks_all(&self, artist_id: i64, sort: &str) -> Result<Vec<model::Song>>;
+    async fn rank_tracks_all(&self, rank_id: i64) -> Result<Vec<model::Song>>;
+    async fn song_stream_url(&self, song: &model::Song, quality: &str) -> Result<catalog::StreamUrl>;
+    async fn fetch_lyric(&self, song: &model::Song) -> Result<model::Lyric>;
+    async fn login_qr_key(&self) -> Result<String>;
+    async fn login_qr_create(&self, key: &str) -> Result<String>;
+    async fn login_qr_check(&self, key: &str) -> Result<cloud::QrCheck>;
+    async fn user_detail(&self) -> Result<cloud::UserInfo>;
+    async fn user_vip_detail(&self) -> Result<cloud::VipInfo>;
+    async fn claim_day_vip(&self, receive_day: &str) -> Result<Value>;
+    async fn upgrade_day_vip(&self) -> Result<Value>;
+    async fn claimed_vip_days(&self) -> Result<Vec<String>>;
+    async fn fetch_device_fingerprint(&self) -> Result<String>;
+    async fn add_tracks_to_playlist(&self, source: SourceKind, list_id: i64, songs: &[model::Song]) -> Result<usize>;
+    async fn remove_tracks_from_playlist(&self, source: SourceKind, list_id: i64, songs: &[model::Song]) -> Result<usize>;
+    async fn delete_playlist(&self, source: SourceKind, list_id: i64) -> Result<()>;
+    async fn create_playlist(&self, source: SourceKind, name: &str) -> Result<Option<i64>>;
+}
 
 use serde_json::Value;
 
@@ -177,5 +383,60 @@ mod tests {
     fn data_of_falls_back_to_root() {
         let root = json!({"lists": []});
         assert!(data_of(&root).get("lists").is_some());
+    }
+
+    /// 默认必须是 node：阶段 1 的出口条件就是「默认行为与改动前一致」。
+    #[test]
+    fn node_is_the_default_backend() {
+        assert_eq!(ApiBackend::default(), ApiBackend::Node);
+    }
+
+    /// `--api native` 只覆盖酷狗两个平台。
+    ///
+    /// 网易云与汽水的接口语义没有进 [`MusicApi`]，它们直接架在 HTTP 传输层上，
+    /// 而 native 没有那一层。这里锁住「落回 node」这个决定，而不是让它们
+    /// 在运行期才报「需要 HTTP 传输层」。
+    #[test]
+    fn native_backend_only_covers_kugou_sources() {
+        for kind in [SourceKind::Kugou, SourceKind::KugouConcept] {
+            assert_eq!(
+                ApiBackend::Native.effective_for(kind),
+                ApiBackend::Native,
+                "{} 应当能走 native",
+                kind.label()
+            );
+        }
+        for kind in [SourceKind::Netease, SourceKind::Sodam] {
+            assert_eq!(
+                ApiBackend::Native.effective_for(kind),
+                ApiBackend::Node,
+                "{} 没有 native 实现，应当落回 node",
+                kind.label()
+            );
+        }
+    }
+
+    /// node 后端在任何音源上都是 node，不被 `effective_for` 改写。
+    #[test]
+    fn node_backend_is_never_rewritten() {
+        for kind in SourceKind::ALL {
+            assert_eq!(ApiBackend::Node.effective_for(kind), ApiBackend::Node);
+        }
+    }
+
+    /// 构造 native 客户端不碰网络，也不需要服务地址。
+    #[test]
+    fn native_client_needs_no_service() {
+        let api = ApiClient::for_backend(
+            ApiBackend::Native,
+            SourceKind::KugouConcept,
+            "http://127.0.0.1:3001",
+            None,
+            None,
+        )
+        .expect("native 构造不该失败");
+        assert!(matches!(api, ApiClient::Native(_)));
+        // 界面会把这串字显示在「接口地址」的位置，必须能看出是内嵌的
+        assert!(api.base().contains("native"), "实际：{}", api.base());
     }
 }

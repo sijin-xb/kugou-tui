@@ -162,6 +162,18 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     if cli.api_start {
+        // native 后端没有「服务」这个东西，`--api-start` 的语义（把服务留在后台
+        // 常驻）无从谈起。明确说清而不是打印一句「已就绪」——那会让用户以为
+        // 后台真有个进程，下次启动时又找不到。
+        if config.api_backend.effective_for(config.active_source_kind())
+            == crate::api::ApiBackend::Native
+        {
+            println!(
+                "当前后端为 native：{} 的接口在进程内实现，没有需要常驻的本机服务。",
+                config.active_source_kind().label()
+            );
+            return Ok(());
+        }
         // 显式要求常驻：本次拉起的实例不随进程退出停止
         bootstrap::detach();
         println!("接口服务已就绪：{}", config.api_base);
@@ -229,9 +241,20 @@ fn print_effective_config(config: &Config) {
     println!("kugou-tui {}", env!("CARGO_PKG_VERSION"));
     println!("配置文件  : {}", Config::path().display());
     println!("日志文件  : {}", Config::log_path().display());
+    // 后端要说清「这一项实际生效在哪些音源上」：native 只覆盖酷狗两个平台，
+    // 用户对着网易云看到「native」会以为整程序都不用 Node 了。
+    let kind = config.active_source_kind();
+    println!(
+        "API 后端  : {}{}",
+        config.api_backend.label(),
+        if config.api_backend.effective_for(kind) != config.api_backend {
+            "（当前音源不适用，实际走 node）"
+        } else {
+            ""
+        }
+    );
     println!("API 地址  : {}", config.api_base);
     // 顺带提示服务端该配什么 `platform`：两个平台的鉴权不通用，配错了会退化成试听
-    let kind = config.active_source_kind();
     println!(
         "当前音源  : {}{}",
         kind.label(),

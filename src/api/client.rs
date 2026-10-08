@@ -7,7 +7,7 @@
 //!
 //! 该服务内置了 2 分钟响应缓存（相同 URL 只回源一次）。对搜索、榜单这类希望拿到
 //! 最新数据的接口，需要在 query 里塞一个时间戳让 URL 唯一。这类请求走
-//! [`ApiClient::get_json_uncached`]。
+//! [`HttpClient::get_json_uncached`]。
 
 use std::future::Future;
 use std::sync::Arc;
@@ -65,18 +65,21 @@ impl RetryPolicy {
     }
 }
 
-/// KuGouMusicApi 客户端。
+/// 纯 HTTP 传输层：拼 URL、带 cookie、取响应体。
+///
+/// 接口语义不在这里——酷狗的接口在 [`crate::api::node::NodeApi`]，
+/// 网易云 / 汽水各自在 `source/` 下。
 ///
 /// 内部 `reqwest::Client` 自带连接池，克隆它不会复制连接池，因此可以放心地
 /// 在每个异步任务里 clone 一份。
 #[derive(Debug, Clone)]
-pub struct ApiClient {
+pub struct HttpClient {
     http: reqwest::Client,
     base: Arc<str>,
     cookie: Option<Arc<str>>,
 }
 
-impl ApiClient {
+impl HttpClient {
     /// 构造客户端。`proxy` 形如 `http://127.0.0.1:7890`。
     pub fn new(base: &str, cookie: Option<String>, proxy: Option<&str>) -> Result<Self> {
         let mut builder = reqwest::Client::builder()
@@ -110,7 +113,7 @@ impl ApiClient {
 
     /// 当前带的 cookie（未经请求头拼装，原始值）。
     ///
-    /// 音源模块（如汽水）用它重建自己的客户端：`ApiClient` 的请求形态
+    /// 音源模块（如汽水）用它重建自己的客户端：`HttpClient` 的请求形态
     /// （只发 GET、只能往 `{base}{path}` 拼、只带 cookie 一个身份）不满足它们，
     /// 但「有哪些身份凭据」这个信息是通用的，不该被这里藏起来。
     pub fn cookie(&self) -> Option<&str> {

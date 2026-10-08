@@ -201,6 +201,13 @@ pub struct Config {
     /// 切换音源时，`api_base` / `cookie` / `dfid` 会从选中的音源同步过来。
     /// 这三个字段仍是运行时实际读取的值，这样改动面最小，也不会漏掉某处引用。
     pub sources: SourceSet,
+
+    /// 酷狗接口由哪套后端实现。
+    ///
+    /// 默认 `node`（本机 KuGouMusicApi）。`native` 是内嵌的纯 Rust 实现，
+    /// 不需要 Node.js；两个酷狗平台共享这个开关，网易云与汽水不受影响。
+    #[serde(default)]
+    pub api_backend: crate::api::ApiBackend,
 }
 
 /// 把命令行传上来的可选字符串收拾成「有内容才 Some」。
@@ -310,6 +317,7 @@ impl Default for Config {
             api_auto_start: default_api_auto_start(),
             api_dir: None,
             sources: SourceSet::default(),
+            api_backend: crate::api::ApiBackend::default(),
         }
     }
 }
@@ -489,6 +497,9 @@ impl Config {
         }
         if cli.no_api_start {
             self.api_auto_start = false;
+        }
+        if let Some(backend) = cli.api {
+            self.api_backend = backend;
         }
 
         // 汽水的凭据与签名：只覆盖**显式传了**的项，其余保留配置文件里的值。
@@ -926,6 +937,37 @@ volume = 0.5
         // 断言字面量而不是那个函数：这里要锁的是「对外承诺的默认值就是 200ms」，
         // 拿常量比自己跟自己比，改了默认值也照样通过。
         assert_eq!(parsed.lyric_anim_ms, 200);
+        // 新增的 `api_backend` 同理：老配置里没有这一项，必须落到 node。
+        // 若这里悄悄变成 native，老用户升级后会在毫不知情的情况下换掉整条接口链路。
+        assert_eq!(parsed.api_backend, crate::api::ApiBackend::Node);
+    }
+
+    /// `--api native` 要能覆盖配置里的值，也要能落盘、读回。
+    #[test]
+    fn cli_api_backend_overrides_and_round_trips() {
+        let cli = Cli::parse_from(["kugou-tui", "--api", "native"]);
+        let mut config = Config::default();
+        assert_eq!(config.api_backend, crate::api::ApiBackend::Node);
+
+        config.merge_cli(&cli);
+        assert_eq!(config.api_backend, crate::api::ApiBackend::Native);
+
+        let text = toml::to_string_pretty(&config).expect("要能序列化");
+        assert!(text.contains("api_backend = \"native\""), "实际：\n{text}");
+        let parsed: Config = toml::from_str(&text).expect("要能读回");
+        assert_eq!(parsed.api_backend, crate::api::ApiBackend::Native);
+    }
+
+    /// 不传 `--api` 时保留配置里已有的值，不要被默认值抹掉。
+    #[test]
+    fn missing_api_flag_keeps_the_configured_backend() {
+        let cli = Cli::parse_from(["kugou-tui"]);
+        let mut config = Config {
+            api_backend: crate::api::ApiBackend::Native,
+            ..Config::default()
+        };
+        config.merge_cli(&cli);
+        assert_eq!(config.api_backend, crate::api::ApiBackend::Native);
     }
 
     #[test]

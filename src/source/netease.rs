@@ -31,7 +31,7 @@
 
 use serde_json::Value;
 
-use crate::api::client::ApiClient;
+use crate::api::ApiClient;
 use crate::api::model::{Lyric, Singer, Song, pick_i64, pick_string, pick_u32, pick_u64};
 use crate::api::{data_of, extract_list};
 use crate::error::Result;

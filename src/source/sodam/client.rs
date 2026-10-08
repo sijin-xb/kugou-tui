@@ -24,7 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::client::ApiClient;
+use crate::api::ApiClient;
 
 /// 上游内置的公共签名服务地址。
 ///

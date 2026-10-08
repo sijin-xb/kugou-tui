@@ -137,7 +137,7 @@ pub fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     // 指纹有没有拿到），别处看不到；播放块的内容在播放条上都有（音量、循环模式），
     // 缓存块在设置页里有。
     let mut connect: Vec<Line> = vec![
-        kv("API", api_host(&state.config.api_base), width, theme),
+        kv("API", &api_endpoint_label(state), width, theme),
         kv(
             "音源",
             state.config.active_source_kind().label(),
@@ -217,7 +217,13 @@ pub fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         ]),
     ];
 
-    let connect_title = format!("连接 · {}", state.connection.label());
+    // native 下没有「连接」这回事：接口就在进程里，不存在连不通。标题照旧写
+    // 「已连通」会让人以为在跟某个服务说话，出问题时去查端口。
+    let connect_title = if is_native(state) {
+        "接口 · 内嵌".to_string()
+    } else {
+        format!("连接 · {}", state.connection.label())
+    };
     let blocks: [(&str, Vec<Line>); 3] = [
         (&connect_title, connect),
         ("播放", playback),
@@ -300,6 +306,28 @@ fn api_host(api_base: &str) -> &str {
     api_base
         .trim_start_matches("https://")
         .trim_start_matches("http://")
+}
+
+/// 当前配置下接口是不是内嵌在进程里的。
+fn is_native(state: &AppState) -> bool {
+    state
+        .config
+        .api_backend
+        .effective_for(state.config.active_source_kind())
+        == crate::api::ApiBackend::Native
+}
+
+/// 侧边栏「API」那一行显示什么。
+///
+/// native 后端下接口在进程内，`config.api_base` 里那个 `127.0.0.1:3001` 只是
+/// 历史遗留的配置值，**没有任何进程在监听它**。照着配置显示会让用户以为背后
+/// 还有个服务（甚至以为 Node 还在跑），排查时往错的方向找。
+fn api_endpoint_label(state: &AppState) -> String {
+    if is_native(state) {
+        "内嵌".to_string()
+    } else {
+        api_host(&state.config.api_base).to_string()
+    }
 }
 
 /// 底部状态栏：左侧消息 + 右侧忙碌指示与快捷键提示。
@@ -910,6 +938,40 @@ mod tests {
         for block in ["连接", "播放", "缓存"] {
             assert!(text.contains(block), "60 行终端应显示完整的「{block}」块");
         }
+    }
+
+    /// native 后端下「API」那一行不能显示 `127.0.0.1:3001`。
+    ///
+    /// 那个地址是历史配置值，native 时**没有进程在监听它**。照着配置显示会让用户
+    /// 以为背后还有个服务（甚至以为 Node 还在跑），排查时往错的方向找。
+    #[test]
+    fn native_backend_does_not_advertise_a_service_address() {
+        let mut state = AppState::new(Config::default());
+        state.config.api_backend = crate::api::ApiBackend::Native;
+        state.config.sources.active = crate::source::SourceKind::KugouConcept;
+        state.config.api_base = "http://127.0.0.1:3001".to_string();
+
+        let text = screen_text(&draw_sidebar(&state, 112, 60));
+        assert!(
+            !text.contains("127.0.0.1:3001"),
+            "native 下不该显示服务地址：{text}"
+        );
+        assert!(text.contains("内嵌"), "应当说明接口是内嵌的：{text}");
+        assert!(
+            !text.contains("已连通"),
+            "native 下没有「连接」这回事，不该报连通状态：{text}"
+        );
+    }
+
+    /// node 后端照旧显示主机端口，方便排查连的是哪个实例。
+    #[test]
+    fn node_backend_still_shows_the_host_and_port() {
+        let mut state = AppState::new(Config::default());
+        state.config.api_backend = crate::api::ApiBackend::Node;
+        state.config.api_base = "http://127.0.0.1:3001".to_string();
+
+        let text = screen_text(&draw_sidebar(&state, 112, 60));
+        assert!(text.contains("127.0.0.1:3001"), "实际：{text}");
     }
 
     /// 帮助面板必须能滚到最后一条。

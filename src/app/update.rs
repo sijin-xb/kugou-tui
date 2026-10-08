@@ -1165,7 +1165,9 @@ impl App {
             return Ok(self.api.clone());
         }
         let profile = self.state.config.sources.profile(kind);
-        crate::api::ApiClient::new(
+        crate::api::ApiClient::for_backend(
+            self.state.config.api_backend,
+            kind,
             &profile.api_base,
             profile.cookie_header(kind),
             self.state.config.proxy.as_deref(),

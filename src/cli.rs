@@ -19,9 +19,16 @@ use clap::Parser;
     long_about = None,
 )]
 pub struct Cli {
-    /// KuGouMusicApi 服务地址。
+    /// 接口服务地址（`--api node` 时使用）。
     #[arg(short = 'a', long, env = "KUGOU_API_BASE", value_name = "URL")]
     pub api_base: Option<String>,
+
+    /// 用哪套后端实现酷狗接口。
+    ///
+    /// `node`（默认）走本机 KuGouMusicApi；`native` 用内嵌的纯 Rust 实现，
+    /// 不需要 Node.js。只对酷狗两个音源生效，网易云与汽水照旧。
+    #[arg(long, env = "KUGOU_API_BACKEND", value_name = "node|native")]
+    pub api: Option<crate::api::ApiBackend>,
 
     /// 登录 cookie，形如 `token=xxx; userid=xxx; dfid=xxx`。
     #[arg(short = 'c', long, env = "KUGOU_COOKIE", value_name = "COOKIE")]

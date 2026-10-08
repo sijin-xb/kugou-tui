@@ -19,12 +19,12 @@
 use base64::Engine;
 use serde_json::Value;
 
-use crate::api::client::ApiClient;
+use crate::api::node::NodeApi;
 use crate::api::data_of;
 use crate::api::model::{Lyric, LyricLine, LyricWord, Song, pick_string};
 use crate::error::{AppError, Result};
 
-impl ApiClient {
+impl NodeApi {
     /// 取某首歌的歌词。
     ///
     /// # 为什么要试多个候选

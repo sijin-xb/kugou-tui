@@ -84,6 +84,7 @@ use anyhow::Context;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 use crate::api::ApiClient;
+use crate::api::traits::MusicApi;
 use crate::app::state::Tab;
 use crate::audio::engine::PlaybackState;
 use crate::audio::{AudioCache, AudioHandle, Downloader};
@@ -207,7 +208,9 @@ impl App {
 
         let (bus, receiver) = EventBus::new();
 
-        let api = ApiClient::new(
+        let api = ApiClient::for_backend(
+            config.api_backend,
+            config.active_source_kind(),
             &config.api_base,
             config.cookie_header(),
             config.proxy.as_deref(),

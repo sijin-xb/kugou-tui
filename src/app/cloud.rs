@@ -29,6 +29,7 @@
 use std::time::Instant;
 
 use crate::api::cloud::{QrStatus, VipInfo, VipKind};
+use crate::api::traits::MusicApi;
 use crate::app::App;
 use crate::app::state::{ConfirmAction, LoginPicker, LoginState};
 use crate::app::update::describe_song;
@@ -521,6 +522,7 @@ impl App {
         // 秒，冻住界面不可接受。而依赖目录是各平台共用的，装过一次就够，正常情况只是
         // 起一个进程、一到两秒。真没装过时下面会给一句「先跑 --api-start」的提示。
         if let Err(error) = crate::bootstrap::ensure_running(
+            self.state.config.api_backend,
             kind,
             &self.state.config.api_base,
             self.state.config.api_dir.as_deref(),
@@ -528,7 +530,9 @@ impl App {
             self.state.warn(format!("{error}"));
         }
 
-        match crate::api::ApiClient::new(
+        match crate::api::ApiClient::for_backend(
+            self.state.config.api_backend,
+            kind,
             &self.state.config.api_base,
             self.state.config.cookie_header(),
             self.state.config.proxy.as_deref(),

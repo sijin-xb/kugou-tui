@@ -29,7 +29,7 @@
 
 use serde_json::Value;
 
-use crate::api::client::ApiClient;
+use crate::api::node::NodeApi;
 use crate::api::model::{
     Artist, Playlist, RankBoard, Song, artist_from_json, extract_songs, pick_array, pick_i64,
     pick_string, playlist_from_json, rank_board_from_json,
@@ -50,7 +50,7 @@ const MAX_PAGES: u32 = 60;
 /// 并发翻页时一批发多少页。太大容易触发上游限流，太小提速不明显；6 是个折中。
 const CONCURRENT_PAGES: u32 = 6;
 
-impl ApiClient {
+impl NodeApi {
     // ------------------------------------------------------------------
     // 搜索
     // ------------------------------------------------------------------
@@ -262,7 +262,7 @@ impl ApiClient {
     /// 一批里只要有一页失败就整体报错，避免静默漏歌。
     async fn collect_all_pages<F, Fut>(&self, make: F) -> Result<Vec<Song>>
     where
-        F: Fn(ApiClient, u32) -> Fut,
+        F: Fn(NodeApi, u32) -> Fut,
         Fut: std::future::Future<Output = Result<Vec<Song>>> + Send + 'static,
     {
         let mut all: Vec<Song> = Vec::new();
@@ -285,7 +285,7 @@ impl ApiClient {
 
             let mut set = tokio::task::JoinSet::new();
             for batch_page in page..=batch_end {
-                // 每页一份克隆：ApiClient 内部是 Arc，克隆很便宜。
+                // 每页一份克隆：NodeApi 内部是 Arc，克隆很便宜。
                 // 把页码跟着结果一起搬回来——下面要按页码重排，见 `collected`。
                 let future = make(self.clone(), batch_page);
                 set.spawn(async move { future.await.map(|songs| (batch_page, songs)) });
@@ -414,7 +414,7 @@ impl ApiClient {
     /// 取播放直链。
     ///
     /// 注意：该接口依赖 `dfid`，缺失时酷狗会返回「本次请求需要验证」并给出空 url。
-    /// 调用方应保证 [`crate::api::cloud::ApiClient::fetch_device_fingerprint`] 已成功执行。
+    /// 调用方应保证 [`crate::api::cloud::NodeApi::fetch_device_fingerprint`] 已成功执行。
     ///
     /// # 为什么分两步
     ///
@@ -800,7 +800,7 @@ struct QualityCandidate {
 /// # 为什么要按 `album_audio_id` 分两遍
 ///
 /// 请求时是把「主 hash + `audio_info` 里那几个 hash」逗号拼接一起发的
-/// （见 [`ApiClient::request_privilege_lite`]），响应因此可能是**多个 item**，
+/// （见 [`NodeApi::request_privilege_lite`]），响应因此可能是**多个 item**，
 /// 每个 item 自带一组 variant。把全部 item 的 variant 混进一张表（老写法）意味着
 /// **谁先出现谁赢**——而服务端并不保证 item 的顺序，一旦某个 hash 指向的是
 /// **另一个版本**（同曲不同版 / 翻唱 / 铃声），就可能挑到别的版本的文件。
@@ -811,7 +811,7 @@ struct QualityCandidate {
 /// 2. 第 1 遍一个候选都没拿到时才放开到全部 item。这一路必须留着：
 ///    「搜索给的 hash 已下架、歌在 `audio_info` 的另一个 hash 下」靠的就是它。
 ///
-/// 两遍都空就返回空，由调用方退回 [`ApiClient::fallback_candidates`]。
+/// 两遍都空就返回空，由调用方退回 [`NodeApi::fallback_candidates`]。
 fn parse_quality_candidates(
     response: &Value,
     requested: &str,
@@ -1216,7 +1216,7 @@ mod tests {
         println!("API={api_base}  hash={hash}  请求档位={quality}");
 
         let client =
-            ApiClient::new(&api_base, cookie, config.proxy.as_deref()).expect("构造客户端");
+            NodeApi::new(&api_base, cookie, config.proxy.as_deref()).expect("构造客户端");
         let song = Song {
             hash: hash.clone(),
             name: "probe".to_string(),
@@ -1398,7 +1398,7 @@ mod tests {
     /// 榜单内容本身。
     #[tokio::test]
     async fn concurrent_pages_are_assembled_in_page_order() {
-        let client = ApiClient::new(&spawn_paged_server(), None, None).expect("构造客户端");
+        let client = NodeApi::new(&spawn_paged_server(), None, None).expect("构造客户端");
 
         let songs = client
             .playlist_tracks_all("any", false)
@@ -1737,7 +1737,7 @@ mod tests {
             source: crate::source::SourceKind::Kugou,
         };
 
-        let candidates = ApiClient::fallback_candidates(&song, "128");
+        let candidates = NodeApi::fallback_candidates(&song, "128");
         // 主 hash 在前，其余两个在后；每个都用用户选的音质
         assert_eq!(candidates.len(), 3);
         assert_eq!(
@@ -1765,7 +1765,7 @@ mod tests {
             extra_hashes: Default::default(),
             source: crate::source::SourceKind::Kugou,
         };
-        let candidates = ApiClient::fallback_candidates(&song, "320");
+        let candidates = NodeApi::fallback_candidates(&song, "320");
         assert_eq!(
             candidates,
             vec![("ONLY_HASH".to_string(), "320".to_string())]
@@ -1774,13 +1774,13 @@ mod tests {
 
     /// `/privilege/lite` 那一档里的 `album_audio_id` 要能被解析出来。
     ///
-    /// 这个字段**目前只解析、不发送**——见 [`ApiClient::request_song_url_with_hash`]
+    /// 这个字段**目前只解析、不发送**——见 [`NodeApi::request_song_url_with_hash`]
     /// 里的说明：实测四种参数组合都能拿到直链，而带错 id 反而会让服务端回
     /// `status=3`。留着它是因为那是「用户买的究竟是哪个版本」的唯一凭据，
     /// 将来要在 `/song/url` 上补字段时，值就在这里，不用重新解析一遍。
     ///
     /// 注意别把它和搜索接口给的 `MixSongID` 混为一谈：实测同一个值在两处都出现过，
-    /// 但 [`ApiClient::status_reason`] 记着「带 privilege 那个会 status=3」的
+    /// 但 [`NodeApi::status_reason`] 记着「带 privilege 那个会 status=3」的
     /// 反面案例，所以两者在 `Song` 上是**分开存的**（`album_audio_id` 与 `audio_id`）。
     #[test]
     fn privilege_candidates_keep_the_server_side_album_audio_id() {
@@ -1815,7 +1815,7 @@ mod tests {
         };
         let _ = &mut song;
         assert_eq!(
-            ApiClient::fallback_candidates(&song, "128")[0],
+            NodeApi::fallback_candidates(&song, "128")[0],
             ("h_128".to_string(), "128".to_string())
         );
     }
@@ -2147,7 +2147,7 @@ mod tests {
     #[tokio::test]
     async fn song_stream_url_skips_mp4_candidates() {
         let base = spawn_mp4_server();
-        let client = ApiClient::new(&base, None, None).expect("构造客户端");
+        let client = NodeApi::new(&base, None, None).expect("构造客户端");
         let song = Song {
             hash: "AAAA".to_string(),
             name: "测试曲".to_string(),
@@ -2169,7 +2169,7 @@ mod tests {
     #[tokio::test]
     async fn song_stream_url_reports_a_silent_downgrade() {
         let base = spawn_downgrading_server();
-        let client = ApiClient::new(&base, None, None).expect("构造客户端");
+        let client = NodeApi::new(&base, None, None).expect("构造客户端");
         let song = Song {
             hash: "AAAA".to_string(),
             name: "测试曲".to_string(),

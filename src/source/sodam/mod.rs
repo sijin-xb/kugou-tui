@@ -33,7 +33,7 @@ use std::sync::Mutex;
 use serde::Deserialize;
 
 use crate::api::catalog::StreamUrl;
-use crate::api::client::ApiClient;
+use crate::api::ApiClient;
 use crate::api::model::{Lyric, Song};
 use crate::error::{AppError, Result};
 use crate::logger::{LEVEL_DEBUG, LEVEL_INFO, tlog};

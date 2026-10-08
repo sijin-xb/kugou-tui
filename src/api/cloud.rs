@@ -6,12 +6,12 @@
 //! 把本地队列写进去。写操作需要登录 cookie，并且需要数字 `listid`
 //! （不是公开歌单的 `global_collection_id`）。
 //!
-//! 因此 [`ApiClient::user_playlists`](crate::api::ApiClient::user_playlists) 返回的
+//! 因此 [`NodeApi::user_playlists`](crate::api::node::NodeApi::user_playlists) 返回的
 //! 歌单里只有 [`Playlist::is_writable`] 为真的才能作为同步目标。
 
 use serde_json::Value;
 
-use crate::api::client::ApiClient;
+use crate::api::node::NodeApi;
 use crate::api::data_of;
 use crate::api::model::{Song, pick_i64, pick_string};
 use crate::error::{AppError, Result};
@@ -171,7 +171,7 @@ pub struct QrCheck {
     pub cookie: Option<String>,
 }
 
-impl ApiClient {
+impl NodeApi {
     /// 二维码登录第 1 步：取 key。
     pub async fn login_qr_key(&self) -> Result<String> {
         let root = self.get_json_uncached("/login/qr/key", &[]).await?;
@@ -386,7 +386,7 @@ impl ApiClient {
         // 网易云走的是另一套接口（`/playlist/track/add` 的 `pid` + `ids`），
         // 与酷狗的「歌名|hash|专辑id」完全不通，必须按音源分派。
         if let crate::source::SourceKind::Netease = source {
-            return crate::source::netease::add_tracks_to_playlist(self, list_id, songs).await;
+            return crate::source::netease::add_tracks_to_playlist(&crate::api::ApiClient::Node(self.clone()), list_id, songs).await;
         }
 
         // 服务端按逗号分隔多首、按竖线分隔字段，单次提交太多会被截断
@@ -432,7 +432,7 @@ impl ApiClient {
         }
 
         if let crate::source::SourceKind::Netease = source {
-            return crate::source::netease::remove_tracks_from_playlist(self, list_id, songs).await;
+            return crate::source::netease::remove_tracks_from_playlist(&crate::api::ApiClient::Node(self.clone()), list_id, songs).await;
         }
 
         let file_ids: Vec<i64> = songs.iter().filter_map(|song| song.file_id).collect();
@@ -465,7 +465,7 @@ impl ApiClient {
         list_id: i64,
     ) -> Result<()> {
         if let crate::source::SourceKind::Netease = source {
-            return crate::source::netease::delete_playlist(self, list_id).await;
+            return crate::source::netease::delete_playlist(&crate::api::ApiClient::Node(self.clone()), list_id).await;
         }
         self.get_json_uncached_mutating("/playlist/del", &[("listid", list_id.to_string())])
             .await?;
@@ -482,7 +482,7 @@ impl ApiClient {
         name: &str,
     ) -> Result<Option<i64>> {
         if let crate::source::SourceKind::Netease = source {
-            return crate::source::netease::create_playlist(self, name).await;
+            return crate::source::netease::create_playlist(&crate::api::ApiClient::Node(self.clone()), name).await;
         }
         let root = self
             .get_json_uncached_mutating(
@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn write_result_rejects_non_zero_error_code() {
         let root = json!({"status": 0, "error_code": 30205});
-        let error = ApiClient::check_write_result("/playlist/tracks/add", &root)
+        let error = NodeApi::check_write_result("/playlist/tracks/add", &root)
             .expect_err("30205 必须被当成失败");
         assert!(
             error.user_hint().contains("不是你自己的"),
@@ -569,14 +569,14 @@ mod tests {
     #[test]
     fn write_result_accepts_zero_error_code() {
         let root = json!({"status": 1, "error_code": 0, "data": {}});
-        ApiClient::check_write_result("/playlist/tracks/add", &root).expect("0 表示成功");
+        NodeApi::check_write_result("/playlist/tracks/add", &root).expect("0 表示成功");
     }
 
     /// 没有 `error_code` 字段的响应（部分接口只给 `data`）不该被拦下。
     #[test]
     fn write_result_tolerates_missing_error_code() {
         let root = json!({"data": {"status": 1}});
-        ApiClient::check_write_result("/playlist/tracks/del", &root).expect("缺字段视为成功");
+        NodeApi::check_write_result("/playlist/tracks/del", &root).expect("缺字段视为成功");
     }
 
     #[test]

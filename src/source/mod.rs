@@ -37,7 +37,8 @@ pub mod sodam;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::client::ApiClient;
+use crate::api::ApiClient;
+use crate::api::traits::MusicApi;
 use crate::api::cloud::UserInfo;
 use crate::api::model::{Artist, Lyric, Playlist, RankBoard, Song};
 use crate::error::Result;

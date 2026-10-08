@@ -173,9 +173,23 @@ pub fn detach() {
 /// * `api_base` 指向的不是本机（远程服务不归我们管）；
 /// * 该端口上已经有服务在响应（复用，不重复起）；
 /// * 音源不是酷狗的两套平台（网易云是另一套服务，本模块不管）；
-/// * 配置里关掉了自动拉起。
+/// * 配置里关掉了自动拉起；
+/// * 后端选了 `native`（**接口在进程内，没有服务可起**）。
 pub fn prepare(config: &Config) -> Result<&'static str> {
     let kind = config.active_source_kind();
+
+    // native 后端下酷狗接口是进程内函数调用，不存在「本机接口服务」这件事。
+    // 这一步必须排在最前面：否则下面会去探测 3000/3001 端口，发现没有服务就
+    // 尝试下载安装并拉起 Node——正是 `--api native` 要避免的。
+    if config.api_backend.effective_for(kind) == crate::api::ApiBackend::Native {
+        tlog!(
+            LEVEL_INFO,
+            "[bootstrap] 后端为 native，{} 的接口在进程内实现，跳过本地服务引导",
+            kind.label()
+        );
+        return Ok("后端为 native，接口在进程内，无需本机服务");
+    }
+
     let Some((name, platform)) = instance_of(kind) else {
         // 两种「不托管」的原因不同，话也要分开说：汽水是**本来就没有**本机服务
         // （它直连公网），说成「不托管」会让人以为要去别处准备一个。
@@ -226,7 +240,16 @@ pub fn prepare(config: &Config) -> Result<&'static str> {
 /// 一次 `npm install` 要几十秒，界面会僵住——而依赖目录是各平台共用的，只要启动时
 /// 装过一次，切过去只需要 spawn 一个进程（一到两秒）。真的没装过时，返回的错误会
 /// 告诉用户去跑一次 `--api-start`。
-pub fn ensure_running(kind: SourceKind, api_base: &str, api_dir: Option<&Path>) -> Result<()> {
+pub fn ensure_running(
+    backend: crate::api::ApiBackend,
+    kind: SourceKind,
+    api_base: &str,
+    api_dir: Option<&Path>,
+) -> Result<()> {
+    // native 后端切过去不需要服务（理由同 [`prepare`]）。
+    if backend.effective_for(kind) == crate::api::ApiBackend::Native {
+        return Ok(());
+    }
     let Some((name, platform)) = instance_of(kind) else {
         return Ok(());
     };
@@ -876,5 +899,55 @@ struct LockGuard {
 impl Drop for LockGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::ApiBackend;
+    use crate::config::Config;
+
+    /// native 后端下 `prepare` 必须**在探测端口之前**就返回。
+    ///
+    /// 这条是阶段 1 验收的核心之一：如果顺序反了，3000/3001 上没服务时它会去
+    /// 下载安装并拉起 Node——正是 `--api native` 要杜绝的事。测试用的是
+    /// `Config::default()`（api_base 指向 127.0.0.1:3000），本机此刻没有服务，
+    /// 所以「先探测」的实现在这里会走到下载分支而失败/超时，能真正区分两种实现。
+    #[test]
+    fn native_backend_skips_service_bootstrap() {
+        let config = Config {
+            api_backend: ApiBackend::Native,
+            // 就算顺序写错，也不让它真去下载
+            api_auto_start: false,
+            ..Config::default()
+        };
+
+        let outcome = prepare(&config).expect("native 下 prepare 不该失败");
+        assert!(outcome.contains("native"), "实际：{outcome}");
+    }
+
+    /// `ensure_running` 在 native 下同样什么都不做（切音源时会走这里）。
+    #[test]
+    fn native_backend_skips_ensure_running() {
+        let result = ensure_running(
+            ApiBackend::Native,
+            SourceKind::KugouConcept,
+            "http://127.0.0.1:3001",
+            None,
+        );
+        assert!(result.is_ok(), "native 下不该尝试拉起服务：{result:?}");
+    }
+
+    /// 非酷狗音源在 native 配置下仍按 node 处理：它们没有 native 实现，
+    /// 但也不该被本模块拉起服务（网易云/汽水本来就不由本程序托管）。
+    #[test]
+    fn non_kugou_sources_are_not_managed_even_with_native() {
+        for kind in [SourceKind::Netease, SourceKind::Sodam] {
+            assert!(!manages_service(kind), "{} 不该被托管", kind.label());
+            assert!(
+                ensure_running(ApiBackend::Native, kind, "http://127.0.0.1:3002", None).is_ok()
+            );
+        }
     }
 }
