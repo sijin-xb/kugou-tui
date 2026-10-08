@@ -57,14 +57,16 @@ async function main() {
     const cookie = serverCookies(platform, true);
 
     const cases = [
-      ['search', '/module/search.js', { keywords: '周杰伦', page: 1, pagesize: 30, cookie }],
+      // 入参对齐 kugou-tui 的实际调用：`page_size` 取配置默认以外的 100、
+      // 音质取 flac、hash 取真实一首歌的——参数值会影响签名，随便填对不上。
+      ['search', '/module/search.js', { keywords: '周杰伦', page: 1, pagesize: 100, cookie }],
       ['song_url', '/module/song_url.js', {
-        hash: '6af00fbd4d444a82c005843eef9dc2d4',
-        album_id: 0, album_audio_id: 0, quality: 128, cookie,
+        hash: '0a69169202de95aaf24a9944ccf0730d',
+        album_id: 0, album_audio_id: 0, quality: 'flac', cookie,
       }],
       ['search_lyric', '/module/search_lyric.js', {
         album_audio_id: 0, duration: 243722,
-        hash: '6af00fbd4d444a82c005843eef9dc2d4',
+        hash: '0a69169202de95aaf24a9944ccf0730d',
         keywords: 'Letter - arkady sevidov', man: 'yes', cookie,
       }],
     ];
@@ -81,8 +83,9 @@ async function main() {
       console.log(`\n===== ${platform} / ${name} =====`);
       for (const item of captured) {
         const url = new URL(item.url, base);
-        const entries = [...url.searchParams.entries()]
-          .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+        // 不排序：参数顺序本身就是签名输入（signatureAndroidParams 先 sort(key)
+        // 再拼串），按字母序打印会把真实顺序盖掉，对比时看不出顺序错。
+        const entries = [...url.searchParams.entries()];
         console.log('path:', url.pathname, '| param 个数:', entries.length);
         for (const [k, v] of entries) console.log(`  ${k} = ${v}`);
         console.log('UA:', item.headers['user-agent']);
