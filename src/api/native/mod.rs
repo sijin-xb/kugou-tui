@@ -6,6 +6,12 @@
 //! 平台参数由 [`SourceKind`] 携带：标准版与概念版（lite）的盐值、`appid`、
 //! `clientver` 都不同，两个都要能跑。
 
+// 阶段 2 的底层纯函数：签名 / 设备指纹 / KRC 解密。调用方是阶段 3 起接入的
+// 网络层，在那之前只有各模块自己的单元测试引用它们，非测试构建会报 dead_code。
+// 阶段 3 接完网络后删掉这些 `allow`。
+#[allow(dead_code)]
+pub mod crypto;
+
 use crate::api::cloud::{QrCheck, UserInfo, VipInfo};
 use crate::api::catalog::StreamUrl;
 use crate::api::model::{Artist, Lyric, Playlist, RankBoard, Song};
