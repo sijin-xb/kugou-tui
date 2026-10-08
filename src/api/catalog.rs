@@ -411,208 +411,181 @@ impl NodeApi {
     // 播放直链
     // ------------------------------------------------------------------
 
-    /// 取播放直链。
+    /// 取播放直链。算法见 [`resolve_stream_url`]，两个后端共用。
     ///
     /// 注意：该接口依赖 `dfid`，缺失时酷狗会返回「本次请求需要验证」并给出空 url。
     /// 调用方应保证 [`crate::api::cloud::NodeApi::fetch_device_fingerprint`] 已成功执行。
-    ///
-    /// # 为什么分两步
-    ///
-    /// `free_part=true` 的含义是「返回试听部分」。实测只要带上它，服务端就直接给
-    /// 60 秒试听片段（937 KiB ≈ 60 秒），**即使账号有会员也被降级**——这正是
-    /// 「VIP 歌曲只能听几十秒」的直接原因。
-    ///
-    /// 所以先按完整版请求；只有完整版确实拿不到（未登录 / 会员类型不匹配 /
-    /// 需单独购买）时，才退而求其次要试听片段，并明确标记 [`StreamUrl::is_trial`]，
-    /// 由界面告诉用户这是片段、不要误当成播完了。
     pub async fn song_stream_url(&self, song: &Song, quality: &str) -> Result<StreamUrl> {
-        // 登录用户先调 `/privilege/lite` 问「这账号能听哪几档音质」——不同音质的
-        // hash 不一样（VIP 用户有 flac 的 hash，普通用户没有），用同一个 hash
-        // 试所有音质会一直碰壁。**这是「设了 flac 但没 VIP 就只能听试听片段」的
-        // 真凶**：之前直接拿原 hash 调 `/song/url`，服务端一看这个 hash 没 flac
-        // 权限就给空 url。
-        //
-        // 未登录或 `/privilege/lite` 失败时回退到「原 hash + 用户选的音质」——
-        // 不能因为这个查询挂了就完全走不通。
-        let mut candidates = self.privilege_candidates(song, quality).await;
+        resolve_stream_url(self, song, quality).await
+    }
+}
 
-        // 蝰蛇系列（viper_clear / viper_atmos / viper_tape）是酷狗的**付费加项**，
-        // 需要独立的「蝰蛇 VIP」——普通 VIP / TVIP 账号设了它，上游会直接拒绝
-        // （实测 error_code 31863），表现为「所有歌都播不了」。
-        //
-        // 兜底思路：**降到这个账号实际能用的最高音质**，而不是无条件降到 128。
-        // 用户要的是「能听」，不是「能听但音质最差」——他是 VIP 就该拿到 flac
-        // 而不是 128。所以先从 `/privilege/lite` 给的可用音质里挑一个非蝰蛇的
-        // （那份列表已经是该账号有权限的），实在没有才退到 128。
-        if VIPER_QUALITIES.contains(&quality) {
-            let fallback = candidates
-                .iter()
-                .map(|(_, candidate_quality)| candidate_quality)
-                .find(|candidate_quality| !VIPER_QUALITIES.contains(&candidate_quality.as_str()))
-                .cloned()
-                .unwrap_or_else(|| VIPER_FALLBACK_QUALITY.to_string());
-            candidates.push((song.hash.clone(), fallback));
-        }
+/// 一次取流要用到的两个上游请求。两个后端各自实现：`NodeApi` 打本机服务，
+/// `NativeApi` 直连网关。**取流算法本身只此一份**，见 [`resolve_stream_url`]。
+///
+/// 只抽象到「发哪一个请求」这一层，不抽象参数拼装——两边的拼装规则本来就不同
+/// （native 要签名、要 `x-router` 头），硬凑一个共同签名只会两边都别扭。
+pub(crate) trait StreamSource {
+    /// 问服务端「这个 hash 在登录账号下能听哪几档音质」。
+    async fn privilege_lite(&self, song: &Song) -> Result<Value>;
 
-        let mut last_full = None;
-        for (hash, q) in &candidates {
-            // 单个候选失败（比如服务端对某个组合直接 502）**不能**中断整个流程
-            // ——我们要的是「试出第一个能用的组合」，不是「第一个组合必须成功」。
-            let response = match self.request_song_url_with_hash(song, hash, q, false).await {
-                Ok(response) => response,
-                Err(error) => {
-                    tlog!(
-                        crate::logger::LEVEL_DEBUG,
-                        "/song/url 候选失败（hash={hash} quality={q}）：{}，继续下一个",
-                        error.user_hint()
-                    );
-                    continue;
-                }
-            };
-            // mp4 容器的候选要跳过（与 MoeKoeMusic 同款条件）：同一首歌的
-            // mp4 版是另一条转码链路出的文件，母版与 flac/mp3 不同——播它
-            // 就是「听着和别的客户端不一样」。跳过它试下一档。
-            if actual_audio_format(&response).0.as_deref() == Some("mp4") {
-                tlog!(
-                    crate::logger::LEVEL_DEBUG,
-                    "/song/url 候选是 mp4 容器，跳过试下一档（hash={hash} quality={q}）"
-                );
-                continue;
-            }
-            if let Some(url) = extract_stream_url(&response) {
-                // 拿到直链不等于拿到了**用户要的那一档**：服务端会静默降级
-                // （请求 flac 回 mp3/128 kbps，`status` 仍是 1）。这里顺手核一次，
-                // 让界面能照实说，而不是标着 flac 放 128。
-                let (ext_name, bit_rate) = actual_audio_format(&response);
-                let mut notes = Vec::new();
-                if q != quality && VIPER_QUALITIES.contains(&quality) {
-                    notes.push(format!(
-                        "{quality} 不可用（需要蝰蛇 VIP），已降级到标准 {q}"
-                    ));
-                }
-                if let Some(note) = downgrade_note(quality, ext_name.as_deref(), bit_rate) {
-                    notes.push(note);
-                }
-                return Ok(StreamUrl {
-                    url,
-                    is_trial: false,
-                    reason: (!notes.is_empty()).then(|| notes.join("；")),
-                });
-            }
-            last_full = Some(response);
-        }
+    /// 发一次 `/song/url`。`free_part` 决定是否只要试听片段。
+    async fn song_url(&self, hash: &str, quality: &str, free_part: bool) -> Result<Value>;
+}
 
-        // 完整版拿不到，先记下原因再退到试听片段
-        let reason = last_full.as_ref().and_then(|root| self.fail_reason(root));
+/// 取播放直链的共享实现。
+///
+/// # 为什么分两步
+///
+/// `free_part=true` 的含义是「返回试听部分」。实测只要带上它，服务端就直接给
+/// 60 秒试听片段（937 KiB ≈ 60 秒），**即使账号有会员也被降级**——这正是
+/// 「VIP 歌曲只能听几十秒」的直接原因。
+///
+/// 所以先按完整版请求；只有完整版确实拿不到（未登录 / 会员类型不匹配 /
+/// 需单独购买）时，才退而求其次要试听片段，并明确标记 [`StreamUrl::is_trial`]，
+/// 由界面告诉用户这是片段、不要误当成播完了。
+pub(crate) async fn resolve_stream_url<S: StreamSource>(
+    source: &S,
+    song: &Song,
+    quality: &str,
+) -> Result<StreamUrl> {
+// 登录用户先调 `/privilege/lite` 问「这账号能听哪几档音质」——不同音质的
+    // hash 不一样（VIP 用户有 flac 的 hash，普通用户没有），用同一个 hash
+    // 试所有音质会一直碰壁。**这是「设了 flac 但没 VIP 就只能听试听片段」的
+    // 真凶**：之前直接拿原 hash 调 `/song/url`，服务端一看这个 hash 没 flac
+    // 权限就给空 url。
+    //
+    // 未登录或 `/privilege/lite` 失败时回退到「原 hash + 用户选的音质」——
+    // 不能因为这个查询挂了就完全走不通。
+    let mut candidates = privilege_candidates(source, song, quality).await;
 
-        // 试听兜底：这一路失败也别抛出去了——上面完整版已经试过一轮，能到这里说明
-        // 全都没成，应该给用户一个**完整的原因**而不是最后这次的网络错误。
-        let trial = self
-            .request_song_url_with_hash(song, &song.hash, quality, true)
-            .await
-            .unwrap_or_else(|error| {
-                tlog!(
-                    crate::logger::LEVEL_DEBUG,
-                    "试听兜底请求失败：{}",
-                    error.user_hint()
-                );
-                Value::Null
-            });
-        if let Some(url) = extract_stream_url(&trial) {
-            return Ok(StreamUrl {
-                url,
-                is_trial: true,
-                reason,
-            });
-        }
-
-        // 两次都没有。优先把服务端给的原因透出去，比笼统的「可能需要 VIP」有用得多。
-        for root in last_full.iter().chain(std::iter::once(&trial)) {
-            // KuGouMusicApi 的 `/song/url` 把真正的失败信息放在 `data` 嵌套层里，
-            // 顶层只有元数据——所以读两层。
-            let data = root.get("data").unwrap_or(root);
-            if let Some(message) = pick_string(data, &["error", "error_msg", "msg", "errmsg"]) {
-                let status = pick_i64(data, &["status"]).unwrap_or(0);
-                let reason = self.status_reason(status).unwrap_or(message);
-                return Err(AppError::Api {
-                    path: "/song/url".to_string(),
-                    code: pick_i64(data, &["errcode", "error_code"]).unwrap_or(status),
-                    message: reason,
-                });
-            }
-
-            // `fail_process` 会说明卡在哪一步，实测见过 ["pkg","buy"]（需购买/开通）
-            if let Some(process) = data.get("fail_process").and_then(Value::as_array)
-                && !process.is_empty()
-            {
-                let steps = process
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join("/");
-                return Err(AppError::NotFound(format!(
-                    "《{}》需要开通或购买（{}）",
-                    song.name, steps
-                )));
-            }
-        }
-
-        Err(AppError::NotFound(format!(
-            "《{}》没有可用的播放地址（可能需要 VIP、已下架或版权受限）",
-            song.name
-        )))
+    // 蝰蛇系列（viper_clear / viper_atmos / viper_tape）是酷狗的**付费加项**，
+    // 需要独立的「蝰蛇 VIP」——普通 VIP / TVIP 账号设了它，上游会直接拒绝
+    // （实测 error_code 31863），表现为「所有歌都播不了」。
+    //
+    // 兜底思路：**降到这个账号实际能用的最高音质**，而不是无条件降到 128。
+    // 用户要的是「能听」，不是「能听但音质最差」——他是 VIP 就该拿到 flac
+    // 而不是 128。所以先从 `/privilege/lite` 给的可用音质里挑一个非蝰蛇的
+    // （那份列表已经是该账号有权限的），实在没有才退到 128。
+    if VIPER_QUALITIES.contains(&quality) {
+        let fallback = candidates
+            .iter()
+            .map(|(_, candidate_quality)| candidate_quality)
+            .find(|candidate_quality| !VIPER_QUALITIES.contains(&candidate_quality.as_str()))
+            .cloned()
+            .unwrap_or_else(|| VIPER_FALLBACK_QUALITY.to_string());
+        candidates.push((song.hash.clone(), fallback));
     }
 
-    /// 把这一首歌的**所有** hash 配上用户选的音质，作为兜底候选。
-    ///
-    /// 顺序：主 hash 在前，`audio_info` 里的其它 hash 在后。
-    ///
-    /// # 为什么不能只用 `song.hash`
-    ///
-    /// 搜索接口给的 `FileHash` 常指向**已下架**的版本（酷狗搜索保留历史 hash），
-    /// 而 `audio_info.hash_320` / `hash_128` 等往往还是能播的——这就是用户说的
-    /// 「下架歌曲收藏到歌单里就能听」：歌单接口给的正是 `audio_info` 那一组 hash。
-    ///
-    /// 所以 `/privilege/lite` 查不到、或者服务端根本没有这个接口（旧版
-    /// KuGouMusicApi）时，把整组 hash 挨个试一遍，而不是只抱着失效的那个不放。
-    fn fallback_candidates(song: &Song, quality: &str) -> Vec<(String, String)> {
-        let mut candidates = vec![(song.hash.clone(), quality.to_string())];
-        for hash in song.extra_hashes.values() {
-            if *hash != song.hash {
-                candidates.push((hash.clone(), quality.to_string()));
-            }
-        }
-        candidates
-    }
-
-    /// 把 `/privilege/lite` 的响应转换成「按用户选的音质降级排序」的候选列表。
-    ///
-    /// 没拿到响应或解析不出候选时，回退到 `fallback_candidates`——这一首歌的所有
-    /// hash 挨个试。走老路不一定能拿到，但至少不会因为这个查询失败就整条堵死。
-    async fn privilege_candidates(&self, song: &Song, quality: &str) -> Vec<(String, String)> {
-        let response = match self.request_privilege_lite(song).await {
-            Ok(value) => value,
+    let mut last_full = None;
+    for (hash, q) in &candidates {
+        // 单个候选失败（比如服务端对某个组合直接 502）**不能**中断整个流程
+        // ——我们要的是「试出第一个能用的组合」，不是「第一个组合必须成功」。
+        let response = match source.song_url(hash, q, false).await {
+            Ok(response) => response,
             Err(error) => {
                 tlog!(
                     crate::logger::LEVEL_DEBUG,
-                    "/privilege/lite 失败：{}，按整组 hash 兜底",
+                    "/song/url 候选失败（hash={hash} quality={q}）：{}，继续下一个",
                     error.user_hint()
                 );
-                return Self::fallback_candidates(song, quality);
+                continue;
             }
         };
-        let candidates = parse_quality_candidates(&response, quality, &song.hash);
-        if candidates.is_empty() {
-            // 服务端认这个 hash 但没给任何可用档位——多半是下架歌曲。
-            // 换这一首歌的其它 hash 再试，别只咬着失效的那个。
-            return Self::fallback_candidates(song, quality);
+        // mp4 容器的候选要跳过（与 MoeKoeMusic 同款条件）：同一首歌的
+        // mp4 版是另一条转码链路出的文件，母版与 flac/mp3 不同——播它
+        // 就是「听着和别的客户端不一样」。跳过它试下一档。
+        if actual_audio_format(&response).0.as_deref() == Some("mp4") {
+            tlog!(
+                crate::logger::LEVEL_DEBUG,
+                "/song/url 候选是 mp4 容器，跳过试下一档（hash={hash} quality={q}）"
+            );
+            continue;
         }
-        candidates
-            .into_iter()
-            .map(|candidate| (candidate.hash, candidate.quality))
-            .collect()
+        if let Some(url) = extract_stream_url(&response) {
+            // 拿到直链不等于拿到了**用户要的那一档**：服务端会静默降级
+            // （请求 flac 回 mp3/128 kbps，`status` 仍是 1）。这里顺手核一次，
+            // 让界面能照实说，而不是标着 flac 放 128。
+            let (ext_name, bit_rate) = actual_audio_format(&response);
+            let mut notes = Vec::new();
+            if q != quality && VIPER_QUALITIES.contains(&quality) {
+                notes.push(format!(
+                    "{quality} 不可用（需要蝰蛇 VIP），已降级到标准 {q}"
+                ));
+            }
+            if let Some(note) = downgrade_note(quality, ext_name.as_deref(), bit_rate) {
+                notes.push(note);
+            }
+            return Ok(StreamUrl {
+                url,
+                is_trial: false,
+                reason: (!notes.is_empty()).then(|| notes.join("；")),
+            });
+        }
+        last_full = Some(response);
     }
 
+    // 完整版拿不到，先记下原因再退到试听片段
+    let reason = last_full.as_ref().and_then(fail_reason);
+
+    // 试听兜底：这一路失败也别抛出去了——上面完整版已经试过一轮，能到这里说明
+    // 全都没成，应该给用户一个**完整的原因**而不是最后这次的网络错误。
+    let trial = source.song_url(&song.hash, quality, true)
+        .await
+        .unwrap_or_else(|error| {
+            tlog!(
+                crate::logger::LEVEL_DEBUG,
+                "试听兜底请求失败：{}",
+                error.user_hint()
+            );
+            Value::Null
+        });
+    if let Some(url) = extract_stream_url(&trial) {
+        return Ok(StreamUrl {
+            url,
+            is_trial: true,
+            reason,
+        });
+    }
+
+    // 两次都没有。优先把服务端给的原因透出去，比笼统的「可能需要 VIP」有用得多。
+    for root in last_full.iter().chain(std::iter::once(&trial)) {
+        // KuGouMusicApi 的 `/song/url` 把真正的失败信息放在 `data` 嵌套层里，
+        // 顶层只有元数据——所以读两层。
+        let data = root.get("data").unwrap_or(root);
+        if let Some(message) = pick_string(data, &["error", "error_msg", "msg", "errmsg"]) {
+            let status = pick_i64(data, &["status"]).unwrap_or(0);
+            let reason = status_reason(status).unwrap_or(message);
+            return Err(AppError::Api {
+                path: "/song/url".to_string(),
+                code: pick_i64(data, &["errcode", "error_code"]).unwrap_or(status),
+                message: reason,
+            });
+        }
+
+        // `fail_process` 会说明卡在哪一步，实测见过 ["pkg","buy"]（需购买/开通）
+        if let Some(process) = data.get("fail_process").and_then(Value::as_array)
+            && !process.is_empty()
+        {
+            let steps = process
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("/");
+            return Err(AppError::NotFound(format!(
+                "《{}》需要开通或购买（{}）",
+                song.name, steps
+            )));
+        }
+    }
+
+    Err(AppError::NotFound(format!(
+        "《{}》没有可用的播放地址（可能需要 VIP、已下架或版权受限）",
+        song.name
+    )))
+}
+
+impl NodeApi {
     /// 问服务端「这个 hash 在登录账号下能听哪几档音质」。
     ///
     /// 酷狗为每档音质维护**独立的文件指纹（hash）**——VIP 用户拿到的 flac hash
@@ -646,44 +619,6 @@ impl NodeApi {
 
         let query = vec![("hash", hashes.join(","))];
         self.get_json_uncached("/privilege/lite", &query).await
-    }
-
-    /// 从响应里读出「为什么给不了完整版」。
-    ///
-    /// `fail_process` 是服务端给的步骤数组，实测见过 `["pkg","buy"]`（需开通或购买）。
-    /// 读不到就返回 None，交给调用方用通用文案。
-    fn fail_reason(&self, root: &Value) -> Option<String> {
-        let data = root.get("data").unwrap_or(root);
-        let array = data.get("fail_process").and_then(Value::as_array)?;
-        let steps: Vec<&str> = array.iter().filter_map(Value::as_str).collect();
-        if steps.is_empty() {
-            return None;
-        }
-        Some(match steps.join("/").as_str() {
-            "pkg" => "需要开通会员".to_string(),
-            "pkg/buy" => "需要开通会员或单独购买该专辑".to_string(),
-            other => format!("服务端返回 {other}"),
-        })
-    }
-
-    /// 把服务端 `status` 字段翻译成人话。
-    ///
-    /// KuGouMusicApi 把上游酷狗的状态码转成自己的 `status`，下面是实测过的几个：
-    ///
-    /// * `1` 成功（这一支不会是这条路径返回的——`status == 1` 时已经拿到 url 了）
-    /// * `2` 需要验证（缺 dfid 或 token），界面提示去登录 / 检查设备指纹
-    /// * `3` 该歌曲暂无版权，下架或地区限制
-    /// * 其它  透出服务端原文
-    fn status_reason(&self, status: i64) -> Option<String> {
-        match status {
-            0 => None,
-            2 => Some("需要登录或重新登录后再试".to_string()),
-            // 实测 `3` 不等于「无版权」：同一首歌带 `audio_id` 是 status=1 有直链，
-            // 带 `/privilege/lite` 返回的那个（mixsongid）就是 status=3、空 url。
-            // 所以它是「请求里的文件标识与账号权限对不上」，别再误导成下架。
-            3 => Some("服务端拒绝了这个请求（文件标识与账号权限不匹配）".to_string()),
-            other => Some(format!("服务端返回 {other}")),
-        }
     }
 
     /// 发一次 `/song/url`。`free_part` 决定是否只要试听片段。
@@ -721,7 +656,6 @@ impl NodeApi {
     /// 的那组，不是 `/privilege/lite` 那组），并把结论记回这里。
     async fn request_song_url_with_hash(
         &self,
-        _song: &Song,
         hash: &str,
         quality: &str,
         free_part: bool,
@@ -736,6 +670,109 @@ impl NodeApi {
         }
 
         self.get_json_uncached("/song/url", &query).await
+    }
+}
+
+/// `NodeApi` 的取流实现：两个请求都打本机 KuGouMusicApi。
+impl StreamSource for NodeApi {
+    async fn privilege_lite(&self, song: &Song) -> Result<Value> {
+        self.request_privilege_lite(song).await
+    }
+
+    async fn song_url(&self, hash: &str, quality: &str, free_part: bool) -> Result<Value> {
+        self.request_song_url_with_hash(hash, quality, free_part).await
+    }
+}
+
+/// 把这一首歌的**所有** hash 配上用户选的音质，作为兜底候选。
+///
+/// 顺序：主 hash 在前，`audio_info` 里的其它 hash 在后。
+///
+/// # 为什么不能只用 `song.hash`
+///
+/// 搜索接口给的 `FileHash` 常指向**已下架**的版本（酷狗搜索保留历史 hash），
+/// 而 `audio_info.hash_320` / `hash_128` 等往往还是能播的——这就是用户说的
+/// 「下架歌曲收藏到歌单里就能听」：歌单接口给的正是 `audio_info` 那一组 hash。
+///
+/// 所以 `/privilege/lite` 查不到、或者服务端根本没有这个接口（旧版
+/// KuGouMusicApi）时，把整组 hash 挨个试一遍，而不是只抱着失效的那个不放。
+fn fallback_candidates(song: &Song, quality: &str) -> Vec<(String, String)> {
+    let mut candidates = vec![(song.hash.clone(), quality.to_string())];
+    for hash in song.extra_hashes.values() {
+        if *hash != song.hash {
+            candidates.push((hash.clone(), quality.to_string()));
+        }
+    }
+    candidates
+}
+
+/// 把 `/privilege/lite` 的响应转换成「按用户选的音质降级排序」的候选列表。
+///
+/// 没拿到响应或解析不出候选时，回退到 `fallback_candidates`——这一首歌的所有
+/// hash 挨个试。走老路不一定能拿到，但至少不会因为这个查询失败就整条堵死。
+async fn privilege_candidates<S: StreamSource>(
+    source: &S,
+    song: &Song,
+    quality: &str,
+) -> Vec<(String, String)> {
+    let response = match source.privilege_lite(song).await {
+        Ok(value) => value,
+        Err(error) => {
+            tlog!(
+                crate::logger::LEVEL_DEBUG,
+                "/privilege/lite 失败：{}，按整组 hash 兜底",
+                error.user_hint()
+            );
+            return fallback_candidates(song, quality);
+        }
+    };
+    let candidates = parse_quality_candidates(&response, quality, &song.hash);
+    if candidates.is_empty() {
+        // 服务端认这个 hash 但没给任何可用档位——多半是下架歌曲。
+        // 换这一首歌的其它 hash 再试，别只咬着失效的那个。
+        return fallback_candidates(song, quality);
+    }
+    candidates
+        .into_iter()
+        .map(|candidate| (candidate.hash, candidate.quality))
+        .collect()
+}
+
+/// 从响应里读出「为什么给不了完整版」。
+///
+/// `fail_process` 是服务端给的步骤数组，实测见过 `["pkg","buy"]`（需开通或购买）。
+/// 读不到就返回 None，交给调用方用通用文案。
+fn fail_reason(root: &Value) -> Option<String> {
+    let data = root.get("data").unwrap_or(root);
+    let array = data.get("fail_process").and_then(Value::as_array)?;
+    let steps: Vec<&str> = array.iter().filter_map(Value::as_str).collect();
+    if steps.is_empty() {
+        return None;
+    }
+    Some(match steps.join("/").as_str() {
+        "pkg" => "需要开通会员".to_string(),
+        "pkg/buy" => "需要开通会员或单独购买该专辑".to_string(),
+        other => format!("服务端返回 {other}"),
+    })
+}
+
+/// 把服务端 `status` 字段翻译成人话。
+///
+/// KuGouMusicApi 把上游酷狗的状态码转成自己的 `status`，下面是实测过的几个：
+///
+/// * `1` 成功（这一支不会是这条路径返回的——`status == 1` 时已经拿到 url 了）
+/// * `2` 需要验证（缺 dfid 或 token），界面提示去登录 / 检查设备指纹
+/// * `3` 该歌曲暂无版权，下架或地区限制
+/// * 其它  透出服务端原文
+fn status_reason(status: i64) -> Option<String> {
+    match status {
+        0 => None,
+        2 => Some("需要登录或重新登录后再试".to_string()),
+        // 实测 `3` 不等于「无版权」：同一首歌带 `audio_id` 是 status=1 有直链，
+        // 带 `/privilege/lite` 返回的那个（mixsongid）就是 status=3、空 url。
+        // 所以它是「请求里的文件标识与账号权限对不上」，别再误导成下架。
+        3 => Some("服务端拒绝了这个请求（文件标识与账号权限不匹配）".to_string()),
+        other => Some(format!("服务端返回 {other}")),
     }
 }
 
@@ -811,7 +848,7 @@ struct QualityCandidate {
 /// 2. 第 1 遍一个候选都没拿到时才放开到全部 item。这一路必须留着：
 ///    「搜索给的 hash 已下架、歌在 `audio_info` 的另一个 hash 下」靠的就是它。
 ///
-/// 两遍都空就返回空，由调用方退回 [`NodeApi::fallback_candidates`]。
+/// 两遍都空就返回空，由调用方退回 [`fallback_candidates`]。
 fn parse_quality_candidates(
     response: &Value,
     requested: &str,
@@ -1255,7 +1292,7 @@ mod tests {
         // ---- 降级链逐档 /song/url：看每一档实际给的是什么文件 ----
         for tier in fallback_chain(&quality) {
             let response = match client
-                .request_song_url_with_hash(&song, &hash, tier, false)
+                .request_song_url_with_hash(&hash, tier, false)
                 .await
             {
                 Ok(response) => response,
@@ -1737,7 +1774,7 @@ mod tests {
             source: crate::source::SourceKind::Kugou,
         };
 
-        let candidates = NodeApi::fallback_candidates(&song, "128");
+        let candidates = fallback_candidates(&song, "128");
         // 主 hash 在前，其余两个在后；每个都用用户选的音质
         assert_eq!(candidates.len(), 3);
         assert_eq!(
@@ -1765,7 +1802,7 @@ mod tests {
             extra_hashes: Default::default(),
             source: crate::source::SourceKind::Kugou,
         };
-        let candidates = NodeApi::fallback_candidates(&song, "320");
+        let candidates = fallback_candidates(&song, "320");
         assert_eq!(
             candidates,
             vec![("ONLY_HASH".to_string(), "320".to_string())]
@@ -1815,7 +1852,7 @@ mod tests {
         };
         let _ = &mut song;
         assert_eq!(
-            NodeApi::fallback_candidates(&song, "128")[0],
+            fallback_candidates(&song, "128")[0],
             ("h_128".to_string(), "128".to_string())
         );
     }
