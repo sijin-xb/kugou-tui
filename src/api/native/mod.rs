@@ -12,6 +12,8 @@
 #[allow(dead_code)]
 pub mod crypto;
 #[allow(dead_code)]
+pub mod device;
+#[allow(dead_code)]
 pub mod krc;
 #[allow(dead_code)]
 pub mod sign;

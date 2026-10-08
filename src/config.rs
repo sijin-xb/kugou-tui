@@ -709,7 +709,7 @@ pub fn default_cache_dir() -> PathBuf {
 /// * **可测**——`dirs` 在 Windows 上走的是 Win32 的 Known Folder（`SHGetKnownFolderPath`），
 ///   环境变量（`APPDATA` 等）管不着它，没有这个开关就没法在 Windows 上把
 ///   「配置能活过一次重启」那条测试隔离到临时目录里，只能跳过。
-fn config_root() -> PathBuf {
+pub(crate) fn config_root() -> PathBuf {
     if let Some(dir) = std::env::var_os("KUGOU_TUI_CONFIG_DIR") {
         // 空值当作没设：`KUGOU_TUI_CONFIG_DIR=` 这种写法在 shell 里很常见，
         // 而一个空路径会让配置落到当前目录，比忽略它更难查。
@@ -742,7 +742,7 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 ///
 /// 刻意用 `set_permissions` 而不是依赖 umask：umask 是进程级、由启动环境决定的，
 /// 不能让「凭据文件谁能读」取决于用户从哪个 shell 启动程序。
-fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
+pub(crate) fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

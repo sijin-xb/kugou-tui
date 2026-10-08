@@ -45,6 +45,16 @@ pub fn random_u64() -> u64 {
     })
 }
 
+/// 生成 `[0, 1)` 内的伪随机浮点数，语义同 JavaScript 的 `Math.random()`。
+///
+/// 只给 `api::native::device` 用：上游的设备指纹生成全靠 `Math.random()`，
+/// 要逐字符对齐就得有一个同语义的源。取高 53 位（双精度的精度上限）。
+pub fn random_f64() -> f64 {
+    // 只取高位：xorshift 的高位质量比低位好。
+    let value = random_u64() >> 11;
+    (value as f64) / ((1u64 << 53) as f64)
+}
+
 /// 生成 `[0, bound)` 内的伪随机数。`bound <= 1` 时返回 0。
 ///
 /// 用 Lemire 的乘法取模法代替整数取模，避免低位偏置。
