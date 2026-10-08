@@ -48,9 +48,8 @@ use super::crypto::md5_hex;
 
 /// `util/config.json` 的 `srcappid`。
 ///
-/// 迁移范围内的 26 个接口都不用它（二维码登录的两个走 `encryptType: 'web'`
-/// 且自己带 `srcappid` 参数），留到阶段 5 接登录时用。
-#[allow(dead_code)]
+/// 只有二维码登录的两个接口用它（`module/login_qr_key.js`、
+/// `module/login_qr_check.js`），其余接口不带。
 pub const SRCAPPID: u32 = 2919;
 
 /// 标准版签名盐（`util/helper.js` 内联字面量）。
@@ -63,7 +62,7 @@ const ANDROID_SALT_LITE: &str = "LnT6xpN3khm36zse0QzvmgTZ3waWdRSA";
 const WEB_SALT: &str = "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt";
 
 /// `signParams` 盐。**与平台无关**。
-#[allow(dead_code)]
+#[allow(dead_code)] // 仅 [`sign_params`] 用，而迁移范围内没有接口走那条路
 const SIGN_PARAMS_SALT: &str = "R6snCXJgbCaj9WFRJKefTMIFp0ey6Gza";
 
 /// `signKey` 标准版盐。
@@ -263,8 +262,9 @@ pub fn sign_key(
 ///
 /// `appid` / `clientver` 为 `None` 时落到当前平台的值。
 ///
-/// 阶段 5 的云端写接口（`/playlist/del` 等）要用它。
-#[allow(dead_code)]
+/// 上游有两处用它：`module/top_playlist.js` 的 body `key`，以及
+/// `module/artist_audios.js` 的 body `key`。它与 `encryptKey` 那条路的
+/// [`sign_key`] **不是同一个算法**，别混。
 pub fn sign_params_key(
     kind: SourceKind,
     data: &str,
@@ -522,7 +522,13 @@ mod tests {
     /// `signKey` 的 `userid || 0` 与 `appid || useAppid` 兜底。
     #[test]
     fn sign_key_falls_back_to_platform_appid() {
-        let explicit = sign_key(SourceKind::Kugou, FIXED_HASH, FIXED_MID, Some(0), Some(1005));
+        let explicit = sign_key(
+            SourceKind::Kugou,
+            FIXED_HASH,
+            FIXED_MID,
+            Some(0),
+            Some(1005),
+        );
         let implicit = sign_key(SourceKind::Kugou, FIXED_HASH, FIXED_MID, None, None);
         assert_eq!(explicit, implicit);
     }

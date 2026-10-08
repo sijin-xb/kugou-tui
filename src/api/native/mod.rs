@@ -9,24 +9,30 @@
 //! `NodeApi` 的一个优势：`module/song_url.js` 里那些 `isLite` 分支依赖
 //! `process.env.platform`，客户端根本看不到，而这里可以直接按平台取对的那一支。
 
-// 尚未接入网络的底层纯函数。`sign`/`device`/`krc`/`crypto` 都已被用上，不再需要
-// 模块级 allow；`crypto` 里个别函数（裸 RSA）等阶段 5 的登录接口。
+// 底层纯函数模块。`sign`/`device`/`krc`/`crypto` 都已被网络层用上，不需要
+// 模块级 allow。
 pub mod crypto;
 pub mod device;
 pub mod krc;
 pub mod sign;
 pub mod transport;
 
-use crate::api::catalog::{StreamSource, StreamUrl, resolve_stream_url};
+use crate::api::catalog::{
+    StreamSource, StreamUrl, collect_all_pages, collect_artists, collect_playlists,
+    resolve_stream_url,
+};
 use crate::api::cloud::{QrCheck, QrStatus, UserInfo, VipInfo, VipKind};
-use crate::api::data_of;
-use crate::api::model::{Artist, Lyric, Playlist, RankBoard, Song, extract_songs, pick_i64, pick_string};
+use crate::api::model::{
+    Artist, Lyric, Playlist, RankBoard, Song, extract_songs, pick_i64, pick_string,
+    rank_board_from_json,
+};
 use crate::api::native::device::random_string;
 use crate::api::native::transport::{
-    EncryptType, Endpoint, GATEWAY_BASE, LOGIN_BASE, LYRICS_BASE, Transport, USER_SERVICE_BASE,
-    VIP_BASE,
+    EncryptType, Endpoint, GATEWAY_BASE, LOGIN_BASE, LYRICS_BASE, OPENAPI_BASE, Transport,
+    USER_SERVICE_BASE, VIP_BASE,
 };
 use crate::api::traits::MusicApi;
+use crate::api::{data_of, extract_list};
 use crate::error::{AppError, Result};
 use crate::source::SourceKind;
 use crate::util::random_f64;
@@ -77,11 +83,7 @@ fn unimplemented(name: &str) -> AppError {
 /// 上游 `module/search.js` 的请求规格（路由 `/search`）。
 ///
 /// `type` 白名单里只有 `song` 走 `/v3`；本项目只搜单曲，固定这一支。
-pub(crate) fn search_endpoint(
-    keywords: &str,
-    page: u32,
-    page_size: u32,
-) -> Endpoint<'static> {
+pub(crate) fn search_endpoint(keywords: &str, page: u32, page_size: u32) -> Endpoint<'static> {
     Endpoint::get(GATEWAY_BASE, "/v3/search/song")
         .header("x-router", "complexsearch.kugou.com")
         .param("albumhide", "0")
@@ -98,10 +100,7 @@ pub(crate) fn search_endpoint(
 /// `NodeApi` 那条路是**把 `hash` 交给 Node 服务、由服务去建 `resource` 数组**；
 /// native 直连网关，得自己建。`resource` 数组进的是 POST body，而 android 签名
 /// 覆盖 body 字符串，所以它的**字节形态**必须与上游一致。
-pub(crate) fn privilege_lite_endpoint(
-    kind: SourceKind,
-    song: &Song,
-) -> Result<Endpoint<'static>> {
+pub(crate) fn privilege_lite_endpoint(kind: SourceKind, song: &Song) -> Result<Endpoint<'static>> {
     // 逗号分隔可一次问多个 hash：主 hash 在前，audio_info 里那些在后。
     let mut seen = std::collections::HashSet::new();
     let mut hashes = vec![song.hash.clone()];
@@ -211,10 +210,7 @@ pub(crate) fn song_url_endpoint(
 /// 由模块自己按平台写进 `dataMap`。注意 `module/search_lyric.js` 里的
 /// `notSign: true` 是**死参数**（`util/request.js:126` 读的是 `notSignature`），
 /// 所以照常带 android 签名。
-pub(crate) fn search_lyric_endpoint(
-    kind: SourceKind,
-    song: &Song,
-) -> Endpoint<'static> {
+pub(crate) fn search_lyric_endpoint(kind: SourceKind, song: &Song) -> Endpoint<'static> {
     Endpoint::get(LYRICS_BASE, "/v1/search")
         .clear_defaults()
         .param("album_audio_id", "0")
@@ -407,7 +403,10 @@ pub(crate) fn login_qr_key_endpoint(kind: SourceKind) -> Endpoint<'static> {
         .param("plat", "4")
         .param(
             "qrcode_txt",
-            format!("https://h5.kugou.com/apps/loginQRCode/html/index.html?appid={}&", crate::api::native::sign::appid(kind)),
+            format!(
+                "https://h5.kugou.com/apps/loginQRCode/html/index.html?appid={}&",
+                crate::api::native::sign::appid(kind)
+            ),
         )
         .param("srcappid", crate::api::native::sign::SRCAPPID.to_string())
 }
@@ -467,6 +466,256 @@ pub(crate) fn user_detail_endpoint(
 /// 会员信息的请求规格（上游 `module/user_vip_detail.js`，路由 `/user/vip/detail`）。
 pub(crate) fn user_vip_detail_endpoint() -> Endpoint<'static> {
     Endpoint::get(VIP_BASE, "/v1/get_union_vip").param("busi_type", "concept")
+}
+
+// ----------------------------------------------------------------------
+// 目录类接口（上游 module/{top_playlist,playlist_track_all,
+// playlist_track_all_new,user_playlist,artist_lists,artist_audios,
+// rank_list,rank_audio,youth_month_vip_record}.js）
+// ----------------------------------------------------------------------
+
+/// 广场歌单的请求规格（上游 `module/top_playlist.js`，路由 `/top/playlist`）。
+///
+/// 这个模块**没有 `params`**：入参全在 body，`key` 也在 body 里。`key` 用的是
+/// `signParamsKey(dateTime.toString())`，与 `encryptKey` 那条路（`signKey`）是
+/// 两套算法，别混。`clienttime` 在 body 里是**字符串**（`.toFixed(0)`），
+/// 而默认参数里的 `clienttime` 是数字，两者在这里都取同一个秒值。
+pub(crate) fn plaza_playlists_endpoint(
+    kind: SourceKind,
+    category_id: i64,
+    page: u32,
+    page_size: u32,
+    clienttime: &str,
+    mid: &str,
+    userid: Option<&str>,
+) -> Result<Endpoint<'static>> {
+    // `special_recommend` 的键序即上游对象字面量的插入序，它会进 android 签名的
+    // body 字符串，顺序错了签名就不对。
+    let special_recommend = serde_json::json!({
+        "withtag": "1",
+        "withsong": "0",
+        "sort": 1,
+        "ugc": 1,
+        "is_selected": 0,
+        "withrecommend": 1,
+        "area_code": 1,
+        "categoryid": category_id.to_string(),
+    });
+
+    let body = serde_json::json!({
+        "appid": sign::appid(kind),
+        "mid": mid,
+        "clientver": sign::clientver(kind),
+        "platform": "android",
+        "clienttime": clienttime,
+        "userid": userid.unwrap_or("0"),
+        "module_id": 1,
+        "page": page.to_string(),
+        "pagesize": page_size.to_string(),
+        "key": sign::sign_params_key(kind, clienttime, None, None),
+        "special_recommend": special_recommend,
+        "req_multi": 1,
+        "retrun_min": 5,
+        "return_special_falg": 1,
+    });
+
+    Ok(Endpoint::post(GATEWAY_BASE, "/v2/special_recommend")
+        .header("x-router", "specialrec.service.kugou.com")
+        .header("Content-Type", "application/json")
+        .body(serialize_body(body, "广场歌单")?)
+        .cache_identity(format!(
+            "category_id={category_id}&page={page}&pagesize={page_size}"
+        )))
+}
+
+/// 公开歌单一页的请求规格（上游 `module/playlist_track_all.js`，路由 `/playlist/track/all`）。
+///
+/// `begin_idx` 是**数字**（`(Number(page) - 1) * pagesize`），`pagesize` 是**字符串**——
+/// 上游从 query 拿到的一律是字符串，`Number()` 只用在 `page` 上。这个区别会进签名。
+pub(crate) fn playlist_tracks_endpoint(
+    global_id: &str,
+    page: u32,
+    page_size: u32,
+) -> Endpoint<'static> {
+    Endpoint::get(GATEWAY_BASE, "/pubsongs/v2/get_other_list_file_nofilt")
+        .param("area_code", "1")
+        .param(
+            "begin_idx",
+            (page.saturating_sub(1) as u64 * u64::from(page_size)).to_string(),
+        )
+        .param("plat", "1")
+        .param("type", "1")
+        .param("mode", "1")
+        .param("personal_switch", "1")
+        .param("extend_fields", "abtags,hot_cmt,popularization")
+        .param("pagesize", page_size.to_string())
+        .param("global_collection_id", global_id)
+}
+
+/// 当前用户歌单的请求规格（上游 `module/user_playlist.js`，路由 `/user/playlist`）。
+///
+/// `userid` 在 `params` 里是 `Number(userid)`，在 body 里是原样的字符串；
+/// `total_ver: 979` 与 `type: 2` 是上游写死的。
+pub(crate) fn user_playlists_endpoint(
+    page: u32,
+    page_size: u32,
+    userid: Option<&str>,
+    token: Option<&str>,
+) -> Result<Endpoint<'static>> {
+    let userid = userid.unwrap_or("0");
+    let token = token.unwrap_or("");
+
+    let body = serde_json::json!({
+        "userid": userid,
+        "token": token,
+        "total_ver": 979,
+        "type": 2,
+        "page": page.to_string(),
+        "pagesize": page_size.to_string(),
+    });
+
+    Ok(Endpoint::post(GATEWAY_BASE, "/v7/get_all_list")
+        .header("x-router", "cloudlist.service.kugou.com")
+        .header("Content-Type", "application/json")
+        .param("plat", "1")
+        .param("userid", userid)
+        .param("token", token)
+        .body(serialize_body(body, "用户歌单")?)
+        .cache_identity(format!("page={page}&pagesize={page_size}")))
+}
+
+/// 用户歌单一页的请求规格（上游 `module/playlist_track_all_new.js`，路由 `/playlist/track/all/new`）。
+///
+/// 这个模块**没有 `params`**，入参全在 body。`token` 缺失时上游写 `'0'`
+/// （不是空串），`userid` 同理——这个差异会进签名。
+pub(crate) fn user_playlist_tracks_endpoint(
+    list_id: i64,
+    page: u32,
+    page_size: u32,
+    userid: Option<&str>,
+    token: Option<&str>,
+) -> Result<Endpoint<'static>> {
+    let body = serde_json::json!({
+        "listid": list_id.to_string(),
+        "userid": userid.unwrap_or("0"),
+        "area_code": 1,
+        "show_relate_goods": 0,
+        "pagesize": page_size.to_string(),
+        "allplatform": 1,
+        "show_cover": 1,
+        "type": 0,
+        "token": token.unwrap_or("0"),
+        "page": page.to_string(),
+    });
+
+    Ok(Endpoint::post(GATEWAY_BASE, "/v4/get_list_all_file")
+        .header("x-router", "cloudlist.service.kugou.com")
+        .header("Content-Type", "application/json")
+        .body(serialize_body(body, "用户歌单歌曲")?)
+        .cache_identity(format!("listid={list_id}&page={page}&pagesize={page_size}")))
+}
+
+/// 歌手列表的请求规格（上游 `module/artist_lists.js`，路由 `/artist/lists`）。
+///
+/// `musician` 与 `hotsize` 走 `Number()` 是数字，`sextype` 与 `type` 直接取
+/// query 里那串**字符串**——`"0"` 是 truthy，所以 `params?.type || 0` 不会
+/// 退化成数字 `0`。写错不报错，只是签名不对。
+pub(crate) fn artist_list_endpoint(kind: i64, hot_size: u32) -> Endpoint<'static> {
+    Endpoint::get(GATEWAY_BASE, "/ocean/v6/singer/list")
+        .param("musician", "0")
+        .param("sextype", "0")
+        .param("showtype", "2")
+        .param("type", kind.to_string())
+        .param("hotsize", hot_size.to_string())
+}
+
+/// 歌手单曲的请求规格（上游 `module/artist_audios.js`，路由 `/artist/audios`）。
+///
+/// 入参全在 body，`clienttime` 在这里是**数字**（`Math.floor(new Date().getTime()/1000)`），
+/// 与广场那个字符串不同。`sort` 只有 `'hot'` 是 1，其余一律 2。
+pub(crate) fn artist_tracks_endpoint(
+    kind: SourceKind,
+    artist_id: i64,
+    sort: &str,
+    page: u32,
+    page_size: u32,
+    clienttime: &str,
+    mid: &str,
+) -> Result<Endpoint<'static>> {
+    // `signParamsKey(clienttime)`：上游传的是数字，模板串里会转成十进制文本。
+    let key = sign::sign_params_key(kind, clienttime, None, None);
+    let clienttime_number = clienttime.parse::<i64>().unwrap_or_default();
+
+    let body = serde_json::json!({
+        "appid": sign::appid(kind),
+        "clientver": sign::clientver(kind),
+        "mid": mid,
+        "clienttime": clienttime_number,
+        "key": key,
+        "author_id": artist_id.to_string(),
+        "pagesize": page_size.to_string(),
+        "page": page.to_string(),
+        "sort": if sort == "hot" { 1 } else { 2 },
+        "area_code": "all",
+    });
+
+    Ok(Endpoint::post(OPENAPI_BASE, "/kmr/v1/audio_group/author")
+        .header("x-router", "openapi.kugou.com")
+        .header("kg-tid", "220")
+        .header("Content-Type", "application/json")
+        .body(serialize_body(body, "歌手单曲")?)
+        .cache_identity(format!(
+            "id={artist_id}&sort={sort}&page={page}&pagesize={page_size}"
+        )))
+}
+
+/// 排行榜列表的请求规格（上游 `module/rank_list.js`，路由 `/rank/list`）。
+pub(crate) fn rank_boards_endpoint() -> Endpoint<'static> {
+    Endpoint::get(GATEWAY_BASE, "/ocean/v6/rank/list")
+        .param("plat", "2")
+        .param("withsong", "0")
+        .param("parentid", "0")
+}
+
+/// 排行榜歌曲的请求规格（上游 `module/rank_audio.js`，路由 `/rank/audio`）。
+///
+/// 入参全在 body，`rank_id` 是**字符串**，`rank_cid` 是数字 `0`。
+pub(crate) fn rank_tracks_endpoint(
+    rank_id: i64,
+    page: u32,
+    page_size: u32,
+) -> Result<Endpoint<'static>> {
+    let body = serde_json::json!({
+        "show_portrait_mv": 1,
+        "show_type_total": 1,
+        "filter_original_remarks": 1,
+        "area_code": 1,
+        "pagesize": page_size.to_string(),
+        "rank_cid": 0,
+        "type": 1,
+        "page": page.to_string(),
+        "rank_id": rank_id.to_string(),
+    });
+
+    Ok(Endpoint::post(GATEWAY_BASE, "/openapi/kmr/v2/rank/audio")
+        .header("kg-tid", "369")
+        .header("Content-Type", "application/json")
+        .body(serialize_body(body, "排行榜歌曲")?)
+        .cache_identity(format!("rankid={rank_id}&page={page}&pagesize={page_size}")))
+}
+
+/// 本月已领取的会员天数（上游 `module/youth_month_vip_record.js`，
+/// 路由 `/youth/month/vip/record`）。
+pub(crate) fn claimed_vip_days_endpoint() -> Endpoint<'static> {
+    Endpoint::get(GATEWAY_BASE, "/youth/v1/activity/get_month_vip_record")
+        .param("latest_limit", "100")
+}
+
+/// `serde_json::to_string` 的错误信息要带上接口名——签名覆盖 body，序列化一旦
+/// 变了就全线 403，报错里能看出是哪个接口才有得查。
+fn serialize_body(body: Value, what: &str) -> Result<String> {
+    serde_json::to_string(&body)
+        .map_err(|error| AppError::Other(format!("序列化{what}请求体失败：{error}")))
 }
 
 /// 二维码内容（上游 `module/login_qr_create.js`，路由 `/login/qr/create`）。
@@ -541,6 +790,50 @@ pub(crate) fn parse_user_vip_detail(root: &Value) -> VipInfo {
     info
 }
 
+/// `NativeApi` 的歌手与榜单单页实现。
+///
+/// 这两个方法**不在 `MusicApi` 里**：它们只被 `*_all` 的翻页闭包调用，与
+/// `NodeApi` 的 `artist_tracks` / `rank_tracks` 一样属于分页实现细节。
+impl NativeApi {
+    /// 歌手单曲一页。`sort`: `hot` 热门 / `new` 最新。
+    pub(crate) async fn artist_tracks(
+        &self,
+        artist_id: i64,
+        sort: &str,
+        page: u32,
+        page_size: u32,
+    ) -> Result<Vec<Song>> {
+        let cookies = self.transport.cookie_map();
+        let clienttime = (crate::util::now_unix_millis() / 1000).to_string();
+        let endpoint = artist_tracks_endpoint(
+            self.kind(),
+            artist_id,
+            sort,
+            page,
+            page_size,
+            &clienttime,
+            cookies
+                .get("KUGOU_API_MID")
+                .map(String::as_str)
+                .unwrap_or_default(),
+        )?;
+        let root = self.transport.get_json(&endpoint, true).await?;
+        Ok(extract_songs(data_of(&root)))
+    }
+
+    /// 排行榜歌曲一页。
+    pub(crate) async fn rank_tracks(
+        &self,
+        rank_id: i64,
+        page: u32,
+        page_size: u32,
+    ) -> Result<Vec<Song>> {
+        let endpoint = rank_tracks_endpoint(rank_id, page, page_size)?;
+        let root = self.transport.get_json(&endpoint, true).await?;
+        Ok(extract_songs(data_of(&root)))
+    }
+}
+
 /// `NativeApi` 的歌词实现。
 ///
 /// 算法在 [`crate::api::lyric::fetch_lyric_via`]，与 `NodeApi` **共用同一份**；
@@ -608,59 +901,134 @@ impl MusicApi for NativeApi {
 
     async fn plaza_playlists(
         &self,
-        _category_id: i64,
-        _page: u32,
-        _page_size: u32,
+        category_id: i64,
+        page: u32,
+        page_size: u32,
     ) -> Result<Vec<Playlist>> {
-        Err(unimplemented("plaza_playlists"))
+        let cookies = self.transport.cookie_map();
+        let clienttime = (crate::util::now_unix_millis() / 1000).to_string();
+        let endpoint = plaza_playlists_endpoint(
+            self.kind(),
+            category_id,
+            page,
+            page_size,
+            &clienttime,
+            cookies
+                .get("KUGOU_API_MID")
+                .map(String::as_str)
+                .unwrap_or_default(),
+            cookies.get("userid").map(String::as_str),
+        )?;
+        let root = self.transport.get_json(&endpoint, true).await?;
+        Ok(collect_playlists(&root, false))
     }
 
     async fn playlist_tracks(
         &self,
-        _global_id: &str,
-        _page: u32,
-        _page_size: u32,
-        _fresh: bool,
+        global_id: &str,
+        page: u32,
+        page_size: u32,
+        fresh: bool,
     ) -> Result<Vec<Song>> {
-        Err(unimplemented("playlist_tracks"))
+        let endpoint = playlist_tracks_endpoint(global_id, page, page_size);
+        let root = self.transport.get_json(&endpoint, !fresh).await?;
+        Ok(extract_songs(data_of(&root)))
     }
 
     async fn user_playlists(&self) -> Result<Vec<Playlist>> {
-        Err(unimplemented("user_playlists"))
+        let cookies = self.transport.cookie_map();
+        let endpoint = user_playlists_endpoint(
+            1,
+            100,
+            cookies.get("userid").map(String::as_str),
+            cookies.get("token").map(String::as_str),
+        )?;
+        // `NodeApi` 走 `get_json_uncached`，这里对齐。
+        let root = self.transport.get_json(&endpoint, false).await?;
+        Ok(collect_playlists(&root, true))
     }
 
     async fn user_playlist_tracks(
         &self,
-        _list_id: i64,
-        _page: u32,
-        _page_size: u32,
-        _fresh: bool,
+        list_id: i64,
+        page: u32,
+        page_size: u32,
+        fresh: bool,
     ) -> Result<Vec<Song>> {
-        Err(unimplemented("user_playlist_tracks"))
+        let cookies = self.transport.cookie_map();
+        let endpoint = user_playlist_tracks_endpoint(
+            list_id,
+            page,
+            page_size,
+            cookies.get("userid").map(String::as_str),
+            cookies.get("token").map(String::as_str),
+        )?;
+        let root = self.transport.get_json(&endpoint, !fresh).await?;
+        Ok(extract_songs(data_of(&root)))
     }
 
-    async fn artist_list(&self, _kind: i64, _hot_size: u32) -> Result<Vec<Artist>> {
-        Err(unimplemented("artist_list"))
+    async fn artist_list(&self, kind: i64, hot_size: u32) -> Result<Vec<Artist>> {
+        let endpoint = artist_list_endpoint(kind, hot_size);
+        let root = self.transport.get_json(&endpoint, true).await?;
+        Ok(collect_artists(&root))
     }
 
     async fn rank_boards(&self) -> Result<Vec<RankBoard>> {
-        Err(unimplemented("rank_boards"))
+        let endpoint = rank_boards_endpoint();
+        let root = self.transport.get_json(&endpoint, true).await?;
+        Ok(extract_list(
+            &root,
+            &["info", "list", "rank_list"],
+            rank_board_from_json,
+        ))
     }
 
-    async fn playlist_tracks_all(&self, _global_id: &str, _fresh: bool) -> Result<Vec<Song>> {
-        Err(unimplemented("playlist_tracks_all"))
+    async fn playlist_tracks_all(&self, global_id: &str, fresh: bool) -> Result<Vec<Song>> {
+        let client = self.clone();
+        let global_id = global_id.to_string();
+        collect_all_pages(client, move |client, page| {
+            let global_id = global_id.clone();
+            async move {
+                client
+                    .playlist_tracks(&global_id, page, crate::api::catalog::PAGE_LIMIT, fresh)
+                    .await
+            }
+        })
+        .await
     }
 
-    async fn user_playlist_tracks_all(&self, _list_id: i64, _fresh: bool) -> Result<Vec<Song>> {
-        Err(unimplemented("user_playlist_tracks_all"))
+    async fn user_playlist_tracks_all(&self, list_id: i64, fresh: bool) -> Result<Vec<Song>> {
+        let client = self.clone();
+        collect_all_pages(client, move |client, page| async move {
+            client
+                .user_playlist_tracks(list_id, page, crate::api::catalog::PAGE_LIMIT, fresh)
+                .await
+        })
+        .await
     }
 
-    async fn artist_tracks_all(&self, _artist_id: i64, _sort: &str) -> Result<Vec<Song>> {
-        Err(unimplemented("artist_tracks_all"))
+    async fn artist_tracks_all(&self, artist_id: i64, sort: &str) -> Result<Vec<Song>> {
+        let client = self.clone();
+        let sort = sort.to_string();
+        collect_all_pages(client, move |client, page| {
+            let sort = sort.clone();
+            async move {
+                client
+                    .artist_tracks(artist_id, &sort, page, crate::api::catalog::PAGE_LIMIT)
+                    .await
+            }
+        })
+        .await
     }
 
-    async fn rank_tracks_all(&self, _rank_id: i64) -> Result<Vec<Song>> {
-        Err(unimplemented("rank_tracks_all"))
+    async fn rank_tracks_all(&self, rank_id: i64) -> Result<Vec<Song>> {
+        let client = self.clone();
+        collect_all_pages(client, move |client, page| async move {
+            client
+                .rank_tracks(rank_id, page, crate::api::catalog::PAGE_LIMIT)
+                .await
+        })
+        .await
     }
 
     async fn fetch_lyric(&self, song: &Song) -> Result<Lyric> {
@@ -709,7 +1077,20 @@ impl MusicApi for NativeApi {
     }
 
     async fn claimed_vip_days(&self) -> Result<Vec<String>> {
-        Err(unimplemented("claimed_vip_days"))
+        let endpoint = claimed_vip_days_endpoint();
+        // `NodeApi` 这条路走 `get_json_uncached`，这里对齐。
+        let root = self.transport.get_json(&endpoint, false).await?;
+        let list = data_of(&root)
+            .get("list")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+
+        Ok(list
+            .iter()
+            .filter(|entry| pick_i64(entry, &["receive_vip"]) == Some(1))
+            .filter_map(|entry| pick_string(entry, &["day"]))
+            .collect())
     }
 
     /// 上游 `module/register_dev.js`（路由 `/register/dev`）。
@@ -777,7 +1158,7 @@ impl MusicApi for NativeApi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::native::transport::Method;
+    use crate::api::native::transport::{Method, Prepared};
     use std::collections::BTreeMap;
 
     /// 与 `transport` 的 KAT 用同一组固定输入，方便两边互相对照。
@@ -798,24 +1179,59 @@ mod tests {
     }
 
     fn prepared_url(kind: SourceKind, endpoint: &Endpoint<'_>) -> String {
+        prepared(kind, endpoint).url
+    }
+
+    fn prepared(kind: SourceKind, endpoint: &Endpoint<'_>) -> Prepared {
         crate::api::native::transport::build_prepared(
             kind,
             &kat_cookie(KAT_DFID),
             KAT_CLIENTTIME,
             endpoint,
         )
-        .url
+    }
+
+    fn prepared_body(kind: SourceKind, endpoint: &Endpoint<'_>) -> Option<String> {
+        prepared(kind, endpoint).body
+    }
+
+    /// 头集合，按名字排序。
+    ///
+    /// 头的顺序不参与签名、也不影响请求语义（同名头之外 HTTP 不规定顺序），
+    /// 上游 KAT 记的本来就是个字典，所以这里排序后比对集合本身。
+    fn prepared_headers(kind: SourceKind, endpoint: &Endpoint<'_>) -> Vec<(String, String)> {
+        let mut headers = prepared(kind, endpoint).headers;
+        headers.sort();
+        headers
+    }
+
+    /// URL 里参数的**出现顺序**。上游签名先把参数按 key 排序再拼串，但 URL 本身
+    /// 的顺序来自 `module/*.js` 的对象插入序，两端不同说明默认参数与模块参数的
+    /// 合并（`Object.assign` 的「改值不改位」）走偏了。
+    fn prepared_param_order(kind: SourceKind, endpoint: &Endpoint<'_>) -> Vec<String> {
+        let url = prepared_url(kind, endpoint);
+        let query = url.split_once('?').map(|(_, query)| query).unwrap_or("");
+        query
+            .split('&')
+            .filter_map(|pair| pair.split_once('=').map(|(name, _)| name.to_string()))
+            .collect()
     }
 
     /// 阶段 1 的出口条件：尚未接入的方法必须明确报错，不能静默返回空。
+    ///
+    /// 目录类与登录类接口在阶段 5c 已全部接入，剩下的占位是阶段 5d 的云歌单
+    /// 写接口，这里用其中一个当样本。
     #[tokio::test]
     async fn placeholder_reports_not_implemented() {
         let api = NativeApi::new(SourceKind::KugouConcept, None, None).unwrap();
-        let error = api.plaza_playlists(0, 1, 30).await.unwrap_err();
+        let error = api
+            .create_playlist(SourceKind::KugouConcept, "x")
+            .await
+            .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("尚未实现"), "实际：{message}");
         assert!(
-            message.contains("plaza_playlists"),
+            message.contains("create_playlist"),
             "要指出是哪个方法：{message}"
         );
     }
@@ -870,7 +1286,13 @@ mod tests {
         assert_eq!(
             prepared_url(
                 SourceKind::Kugou,
-                &song_url_endpoint(SourceKind::Kugou, KAT_DFID.to_string(), "6af00fbd4d444a82c005843eef9dc2d4", "128", false),
+                &song_url_endpoint(
+                    SourceKind::Kugou,
+                    KAT_DFID.to_string(),
+                    "6af00fbd4d444a82c005843eef9dc2d4",
+                    "128",
+                    false
+                ),
             ),
             "https://gateway.kugou.com/v5/url?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=11430&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&album_id=0&area_code=1&hash=6af00fbd4d444a82c005843eef9dc2d4&ssa_flag=is_fromtrack&version=11430&page_id=151369488&quality=128&album_audio_id=0&behavior=play&pid=2&cmd=26&pidversion=3001&IsFreePart=0&ppage_id=463467626,350369493,788954147&cdnBackup=1&module=&key=1e5533fbcad17c9aa8935349a8b7c1d3&signature=8128fd5afa89324ac65a4c7b77b270e9"
         );
@@ -882,7 +1304,13 @@ mod tests {
         assert_eq!(
             prepared_url(
                 SourceKind::KugouConcept,
-                &song_url_endpoint(SourceKind::KugouConcept, KAT_DFID.to_string(), "6af00fbd4d444a82c005843eef9dc2d4", "128", false),
+                &song_url_endpoint(
+                    SourceKind::KugouConcept,
+                    KAT_DFID.to_string(),
+                    "6af00fbd4d444a82c005843eef9dc2d4",
+                    "128",
+                    false
+                ),
             ),
             "https://gateway.kugou.com/v5/url?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11430&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&album_id=0&area_code=1&hash=6af00fbd4d444a82c005843eef9dc2d4&ssa_flag=is_fromtrack&version=11430&page_id=967177915&quality=128&album_audio_id=0&behavior=play&pid=411&cmd=26&pidversion=3001&IsFreePart=0&ppage_id=356753938&cdnBackup=1&module=&key=7d03ca1bba0d0fa1f5c8d55cdd957b8d&signature=64a711097ebb42883b47892ecec00214"
         );
@@ -893,11 +1321,23 @@ mod tests {
     fn free_part_flips_is_free_part() {
         let full = prepared_url(
             SourceKind::Kugou,
-            &song_url_endpoint(SourceKind::Kugou, KAT_DFID.to_string(), "6af00fbd4d444a82c005843eef9dc2d4", "128", false),
+            &song_url_endpoint(
+                SourceKind::Kugou,
+                KAT_DFID.to_string(),
+                "6af00fbd4d444a82c005843eef9dc2d4",
+                "128",
+                false,
+            ),
         );
         let trial = prepared_url(
             SourceKind::Kugou,
-            &song_url_endpoint(SourceKind::Kugou, KAT_DFID.to_string(), "6af00fbd4d444a82c005843eef9dc2d4", "128", true),
+            &song_url_endpoint(
+                SourceKind::Kugou,
+                KAT_DFID.to_string(),
+                "6af00fbd4d444a82c005843eef9dc2d4",
+                "128",
+                true,
+            ),
         );
         assert!(full.contains("&IsFreePart=0&"), "{full}");
         assert!(trial.contains("&IsFreePart=1&"), "{trial}");
@@ -909,12 +1349,21 @@ mod tests {
     fn empty_quality_falls_back_to_128() {
         let url = prepared_url(
             SourceKind::Kugou,
-            &song_url_endpoint(SourceKind::Kugou, KAT_DFID.to_string(), "6AF00FBD4D444A82C005843EEF9DC2D4", "", false),
+            &song_url_endpoint(
+                SourceKind::Kugou,
+                KAT_DFID.to_string(),
+                "6AF00FBD4D444A82C005843EEF9DC2D4",
+                "",
+                false,
+            ),
         );
         assert!(url.contains("&quality=128&"), "{url}");
         // 上游 `(params?.hash || '').toLowerCase()`：大写 hash 必须被压成小写，
         // 否则服务端查不到文件。
-        assert!(url.contains("&hash=6af00fbd4d444a82c005843eef9dc2d4&"), "{url}");
+        assert!(
+            url.contains("&hash=6af00fbd4d444a82c005843eef9dc2d4&"),
+            "{url}"
+        );
     }
 
     /// 阶段 3 出口：`/privilege/lite` 的 POST body 与上游逐字节一致。
@@ -937,7 +1386,9 @@ mod tests {
         let endpoint = privilege_lite_endpoint(SourceKind::Kugou, &song).unwrap();
         assert_eq!(
             endpoint.data.as_deref(),
-            Some(r#"{"appid":1005,"area_code":1,"behavior":"play","clientver":20489,"need_hash_offset":1,"relate":1,"support_verify":1,"resource":[{"type":"audio","page_id":0,"hash":"6af00fbd4d444a82c005843eef9dc2d4","album_id":""},{"type":"audio","page_id":0,"hash":"11111111111111111111111111111111","album_id":0}],"qualities":["128","320","flac","high","viper_atmos","viper_tape","viper_clear","super","multitrack"]}"#)
+            Some(
+                r#"{"appid":1005,"area_code":1,"behavior":"play","clientver":20489,"need_hash_offset":1,"relate":1,"support_verify":1,"resource":[{"type":"audio","page_id":0,"hash":"6af00fbd4d444a82c005843eef9dc2d4","album_id":""},{"type":"audio","page_id":0,"hash":"11111111111111111111111111111111","album_id":0}],"qualities":["128","320","flac","high","viper_atmos","viper_tape","viper_clear","super","multitrack"]}"#
+            )
         );
         assert_eq!(endpoint.method, crate::api::native::transport::Method::Post);
         assert_eq!(
@@ -971,8 +1422,14 @@ mod tests {
             name: "测试".to_string(),
             hash: "6af00fbd4d444a82c005843eef9dc2d4".to_string(),
             extra_hashes: [
-                ("hash_320".to_string(), "6af00fbd4d444a82c005843eef9dc2d4".to_string()),
-                ("hash_128".to_string(), "22222222222222222222222222222222".to_string()),
+                (
+                    "hash_320".to_string(),
+                    "6af00fbd4d444a82c005843eef9dc2d4".to_string(),
+                ),
+                (
+                    "hash_128".to_string(),
+                    "22222222222222222222222222222222".to_string(),
+                ),
             ]
             .into_iter()
             .collect(),
@@ -1004,7 +1461,10 @@ mod tests {
     #[test]
     fn search_lyric_endpoint_matches_kat() {
         assert_eq!(
-            prepared_url(SourceKind::Kugou, &search_lyric_endpoint(SourceKind::Kugou, &kat_song())),
+            prepared_url(
+                SourceKind::Kugou,
+                &search_lyric_endpoint(SourceKind::Kugou, &kat_song())
+            ),
             "https://lyrics.kugou.com/v1/search?album_audio_id=0&appid=1005&clientver=20489&duration=243722&hash=6af00fbd4d444a82c005843eef9dc2d4&keyword=Letter+-+arkady+sevidov&lrctxt=1&man=yes&signature=b90333d489a1aae225eb18ac61718d35"
         );
     }
@@ -1054,7 +1514,10 @@ mod tests {
 
         let decoded = root["decodeContent"].as_str().unwrap();
         assert_eq!(decoded, probe["decodeContent"].as_str().unwrap());
-        assert!(decoded.contains("<0,354,0>纯"), "逐字时间戳要保留：{decoded}");
+        assert!(
+            decoded.contains("<0,354,0>纯"),
+            "逐字时间戳要保留：{decoded}"
+        );
     }
 
     /// `contenttype != 0` 走 base64 而不是 KRC——少了这个分支会解出乱码。
@@ -1066,7 +1529,10 @@ mod tests {
             "content": "aGVsbG8gd29ybGQ=",
         });
         inject_decoded_lyric(&mut root);
-        assert_eq!(root["decodeContent"], Value::String("hello world".to_string()));
+        assert_eq!(
+            root["decodeContent"],
+            Value::String("hello world".to_string())
+        );
     }
 
     /// 解不开的 KRC 折成**空串**而不是报错：上游 `decodeLyrics` 也是
@@ -1123,10 +1589,7 @@ mod tests {
         assert_eq!(line.time_ms, 29264);
         assert_eq!(line.words.len(), 6, "六个字各有一个逐字区间");
         let starts: Vec<u64> = line.words.iter().map(|w| w.start_ms).collect();
-        assert_eq!(
-            starts,
-            vec![29264, 29654, 30046, 30494, 31416, 31790]
-        );
+        assert_eq!(starts, vec![29264, 29654, 30046, 30494, 31416, 31790]);
         let ends: Vec<u64> = line.words.iter().map(|w| w.end_ms).collect();
         assert_eq!(ends, vec![29654, 30046, 30494, 31416, 31790, 32294]);
 
@@ -1172,8 +1635,14 @@ mod tests {
     /// 键序就是插入序，而这段 JSON 是要被 AES 加密并签名的。
     #[test]
     fn register_dev_data_map_matches_upstream() {
-        assert_eq!(register_dev_data_map(KAT_GUID).to_string(), KAT_REGISTER_PLAIN);
-        assert_eq!(register_dev_data_map(KAT_GUID).as_object().unwrap().len(), 31);
+        assert_eq!(
+            register_dev_data_map(KAT_GUID).to_string(),
+            KAT_REGISTER_PLAIN
+        );
+        assert_eq!(
+            register_dev_data_map(KAT_GUID).as_object().unwrap().len(),
+            31
+        );
     }
 
     /// 阶段 5a 出口：`/register/dev` 的出站 URL 与上游逐字节一致（标准版）。
@@ -1190,7 +1659,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             prepared_url(SourceKind::Kugou, &endpoint),
-            format!("https://userservice.kugou.com/risk/v2/r_register_dev?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&part=1&platid=1&p={KAT_REGISTER_P_STANDARD}&signature=9560aafc5263cea5b6c4133dd5180016")
+            format!(
+                "https://userservice.kugou.com/risk/v2/r_register_dev?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&part=1&platid=1&p={KAT_REGISTER_P_STANDARD}&signature=9560aafc5263cea5b6c4133dd5180016"
+            )
         );
     }
 
@@ -1208,7 +1679,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             prepared_url(SourceKind::KugouConcept, &endpoint),
-            format!("https://userservice.kugou.com/risk/v2/r_register_dev?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&part=1&platid=1&p={KAT_REGISTER_P_LITE}&signature=20acedab6f254572eff1b5151f4cd0a1")
+            format!(
+                "https://userservice.kugou.com/risk/v2/r_register_dev?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&part=1&platid=1&p={KAT_REGISTER_P_LITE}&signature=20acedab6f254572eff1b5151f4cd0a1"
+            )
         );
     }
 
@@ -1296,14 +1769,20 @@ mod tests {
     #[test]
     fn login_qr_key_endpoint_matches_kat() {
         let standard = prepared_url(SourceKind::Kugou, &login_qr_key_endpoint(SourceKind::Kugou));
-        assert!(standard.starts_with("https://login-user.kugou.com/v2/qrcode?"), "{standard}");
+        assert!(
+            standard.starts_with("https://login-user.kugou.com/v2/qrcode?"),
+            "{standard}"
+        );
         assert!(standard.contains("appid=1001&"), "{standard}");
         assert!(standard.contains("srcappid=2919&"), "{standard}");
         assert!(
             standard.contains("qrcode_txt=https:%2F%2Fh5.kugou.com%2Fapps%2FloginQRCode%2Fhtml%2Findex.html%3Fappid%3D1005%26"),
             "{standard}"
         );
-        assert!(standard.ends_with("signature=809add981f2890a0ba0f768e5ad3dc2e"), "{standard}");
+        assert!(
+            standard.ends_with("signature=809add981f2890a0ba0f768e5ad3dc2e"),
+            "{standard}"
+        );
 
         let lite = prepared_url(
             SourceKind::KugouConcept,
@@ -1311,7 +1790,10 @@ mod tests {
         );
         assert!(lite.contains("appid=1001&"), "{lite}");
         assert!(lite.contains("%3Fappid%3D3116%26"), "{lite}");
-        assert!(lite.ends_with("signature=30d693c55315a86f337c9d1b21fb0384"), "{lite}");
+        assert!(
+            lite.ends_with("signature=30d693c55315a86f337c9d1b21fb0384"),
+            "{lite}"
+        );
     }
 
     /// `/login/qr/check`：这里才是平台 appid（与上一个接口的 1001 不同）。
@@ -1328,15 +1810,24 @@ mod tests {
         assert!(standard.contains("plat=4&"), "{standard}");
         assert!(standard.contains("appid=1005&"), "{standard}");
         assert!(standard.contains("srcappid=2919&"), "{standard}");
-        assert!(standard.contains(&format!("qrcode={KAT_QR_KEY}&")), "{standard}");
-        assert!(standard.ends_with("signature=e22b586d8f1406c8d2f8db8cd1fffb99"), "{standard}");
+        assert!(
+            standard.contains(&format!("qrcode={KAT_QR_KEY}&")),
+            "{standard}"
+        );
+        assert!(
+            standard.ends_with("signature=e22b586d8f1406c8d2f8db8cd1fffb99"),
+            "{standard}"
+        );
 
         let lite = prepared_url(
             SourceKind::KugouConcept,
             &login_qr_check_endpoint(SourceKind::KugouConcept, KAT_QR_KEY),
         );
         assert!(lite.contains("appid=3116&"), "{lite}");
-        assert!(lite.ends_with("signature=485f49b591d41e2a85660bfd66e10b4e"), "{lite}");
+        assert!(
+            lite.ends_with("signature=485f49b591d41e2a85660bfd66e10b4e"),
+            "{lite}"
+        );
     }
 
     /// 参数顺序也进签名，必须逐位对齐上游。
@@ -1406,9 +1897,15 @@ mod tests {
         )
         .unwrap();
         let url = prepared_url(SourceKind::Kugou, &standard);
-        assert!(url.starts_with("https://gateway.kugou.com/v3/get_my_info?"), "{url}");
+        assert!(
+            url.starts_with("https://gateway.kugou.com/v3/get_my_info?"),
+            "{url}"
+        );
         assert!(url.contains("plat=1&"), "{url}");
-        assert!(url.ends_with("signature=fabdd1361171f08041b8d14d1534762d"), "{url}");
+        assert!(
+            url.ends_with("signature=fabdd1361171f08041b8d14d1534762d"),
+            "{url}"
+        );
         assert_eq!(standard.method, Method::Post);
         assert_eq!(standard.headers[0], ("x-router", "usercenter.kugou.com"));
 
@@ -1433,14 +1930,22 @@ mod tests {
         )
         .unwrap();
         let url = prepared_url(SourceKind::KugouConcept, &lite);
-        assert!(url.ends_with("signature=6129a60675eca869e470623d32657131"), "{url}");
+        assert!(
+            url.ends_with("signature=6129a60675eca869e470623d32657131"),
+            "{url}"
+        );
     }
 
     /// `p` 必须是 256 字符大写 hex——上游 `.toUpperCase()` 很容易漏。
     #[test]
     fn user_detail_p_is_uppercase_hex() {
-        let endpoint = user_detail_endpoint(SourceKind::Kugou, "TOKENFIXTURE", Some("10001"), KAT_CLIENTTIME)
-            .unwrap();
+        let endpoint = user_detail_endpoint(
+            SourceKind::Kugou,
+            "TOKENFIXTURE",
+            Some("10001"),
+            KAT_CLIENTTIME,
+        )
+        .unwrap();
         let body: Value = serde_json::from_str(endpoint.data.as_deref().unwrap()).unwrap();
         let p = body["p"].as_str().unwrap();
         assert_eq!(p.len(), 256);
@@ -1457,10 +1962,16 @@ mod tests {
             "{standard}"
         );
         assert!(standard.contains("busi_type=concept&"), "{standard}");
-        assert!(standard.ends_with("signature=96cf2266d36f85b67a59246d5f0424db"), "{standard}");
+        assert!(
+            standard.ends_with("signature=96cf2266d36f85b67a59246d5f0424db"),
+            "{standard}"
+        );
 
         let lite = prepared_url(SourceKind::KugouConcept, &user_vip_detail_endpoint());
-        assert!(lite.ends_with("signature=9db667847a40506f67f9834e90f75e58"), "{lite}");
+        assert!(
+            lite.ends_with("signature=9db667847a40506f67f9834e90f75e58"),
+            "{lite}"
+        );
     }
 
     /// `login_qr_create` 不联网：只把 key 拼进 H5 地址。
@@ -1576,5 +2087,1162 @@ mod tests {
     fn vip_detail_defaults_to_none() {
         let root = serde_json::json!({ "data": { "is_vip": 0, "busi_vip": [] } });
         assert_eq!(parse_user_vip_detail(&root).kind, VipKind::None);
+    }
+
+    /// 出站 URL、头与请求体逐字节对齐上游 `plazaPlaylists` 基准。
+    ///
+    /// 签名覆盖参数序 + 头 + body，任一处不同服务端都只回 403 或空列表，
+    /// 不会指出是哪里错了，所以这里必须锁死。KAT 的假 axios 记录的是**传入
+    /// config 的头**，真实 axios 会在有对象 body 时补 `Content-Type`，所以带
+    /// body 的接口期望里多这一条。
+    #[test]
+    fn plaza_playlists_endpoint_matches_kat() {
+        let standard = plaza_playlists_endpoint(
+            SourceKind::Kugou,
+            0,
+            1,
+            30,
+            KAT_CLIENTTIME,
+            KAT_MID,
+            Some("10001"),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://gateway.kugou.com/v2/special_recommend?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=860fd964c1370164484c07ae6964e0ba"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::Kugou, &standard).as_deref(),
+            Some(
+                r#"{"appid":1005,"mid":"231699103997194646178265604655475531917","clientver":20489,"platform":"android","clienttime":"1700000000","userid":"10001","module_id":1,"page":"1","pagesize":"30","key":"a1f65b6a8fe7e191521406ce8661ae02","special_recommend":{"withtag":"1","withsong":"0","sort":1,"ugc":1,"is_selected":0,"withrecommend":1,"area_code":1,"categoryid":"0"},"req_multi":1,"retrun_min":5,"return_special_falg":1}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            vec![
+                (
+                    r#"Content-Type"#.to_string(),
+                    r#"application/json"#.to_string()
+                ),
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                ),
+                (
+                    r#"x-router"#.to_string(),
+                    r#"specialrec.service.kugou.com"#.to_string()
+                )
+            ]
+        );
+
+        let lite = plaza_playlists_endpoint(
+            SourceKind::KugouConcept,
+            0,
+            1,
+            30,
+            KAT_CLIENTTIME,
+            KAT_MID,
+            Some("10001"),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://gateway.kugou.com/v2/special_recommend?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=0e68cc8bf544dd74d5c0e9489e60f071"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::KugouConcept, &lite).as_deref(),
+            Some(
+                r#"{"appid":3116,"mid":"231699103997194646178265604655475531917","clientver":11440,"platform":"android","clienttime":"1700000000","userid":"10001","module_id":1,"page":"1","pagesize":"30","key":"bad0ee207bf429bd91402b77fc8f7a5b","special_recommend":{"withtag":"1","withsong":"0","sort":1,"ugc":1,"is_selected":0,"withrecommend":1,"area_code":1,"categoryid":"0"},"req_multi":1,"retrun_min":5,"return_special_falg":1}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::KugouConcept, &lite),
+            vec![
+                (
+                    r#"Content-Type"#.to_string(),
+                    r#"application/json"#.to_string()
+                ),
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                ),
+                (
+                    r#"x-router"#.to_string(),
+                    r#"specialrec.service.kugou.com"#.to_string()
+                )
+            ]
+        );
+    }
+
+    /// 出站 URL、头与请求体逐字节对齐上游 `playlistTracks` 基准。
+    ///
+    /// 签名覆盖参数序 + 头 + body，任一处不同服务端都只回 403 或空列表，
+    /// 不会指出是哪里错了，所以这里必须锁死。KAT 的假 axios 记录的是**传入
+    /// config 的头**，真实 axios 会在有对象 body 时补 `Content-Type`，所以带
+    /// body 的接口期望里多这一条。
+    #[test]
+    fn playlist_tracks_endpoint_matches_kat() {
+        let standard = playlist_tracks_endpoint("GLOBALCOLLECTIONIDFIXTURE", 1, 30);
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://gateway.kugou.com/pubsongs/v2/get_other_list_file_nofilt?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&area_code=1&begin_idx=0&plat=1&type=1&mode=1&personal_switch=1&extend_fields=abtags,hot_cmt,popularization&pagesize=30&global_collection_id=GLOBALCOLLECTIONIDFIXTURE&signature=e47c5e6f6b9f3d50b603c4a9d6275e5e"#
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            vec![
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                )
+            ]
+        );
+
+        let lite = playlist_tracks_endpoint("GLOBALCOLLECTIONIDFIXTURE", 1, 30);
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://gateway.kugou.com/pubsongs/v2/get_other_list_file_nofilt?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&area_code=1&begin_idx=0&plat=1&type=1&mode=1&personal_switch=1&extend_fields=abtags,hot_cmt,popularization&pagesize=30&global_collection_id=GLOBALCOLLECTIONIDFIXTURE&signature=2fa3f9928e4bb06605367d2ebb9ee6db"#
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::KugouConcept, &lite),
+            vec![
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                )
+            ]
+        );
+    }
+
+    /// 出站 URL、头与请求体逐字节对齐上游 `userPlaylists` 基准。
+    ///
+    /// 签名覆盖参数序 + 头 + body，任一处不同服务端都只回 403 或空列表，
+    /// 不会指出是哪里错了，所以这里必须锁死。KAT 的假 axios 记录的是**传入
+    /// config 的头**，真实 axios 会在有对象 body 时补 `Content-Type`，所以带
+    /// body 的接口期望里多这一条。
+    #[test]
+    fn user_playlists_endpoint_matches_kat() {
+        let standard =
+            user_playlists_endpoint(1, 100, Some("10001"), Some("TOKENFIXTURE")).unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://gateway.kugou.com/v7/get_all_list?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&plat=1&signature=05ec6eed672d0f2c76a67978be96819d"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::Kugou, &standard).as_deref(),
+            Some(
+                r#"{"userid":"10001","token":"TOKENFIXTURE","total_ver":979,"type":2,"page":"1","pagesize":"100"}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            vec![
+                (
+                    r#"Content-Type"#.to_string(),
+                    r#"application/json"#.to_string()
+                ),
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                ),
+                (
+                    r#"x-router"#.to_string(),
+                    r#"cloudlist.service.kugou.com"#.to_string()
+                )
+            ]
+        );
+
+        let lite = user_playlists_endpoint(1, 100, Some("10001"), Some("TOKENFIXTURE")).unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://gateway.kugou.com/v7/get_all_list?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&plat=1&signature=5514fb47f5d9b892c1608eac498852ff"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::KugouConcept, &lite).as_deref(),
+            Some(
+                r#"{"userid":"10001","token":"TOKENFIXTURE","total_ver":979,"type":2,"page":"1","pagesize":"100"}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::KugouConcept, &lite),
+            vec![
+                (
+                    r#"Content-Type"#.to_string(),
+                    r#"application/json"#.to_string()
+                ),
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                ),
+                (
+                    r#"x-router"#.to_string(),
+                    r#"cloudlist.service.kugou.com"#.to_string()
+                )
+            ]
+        );
+    }
+
+    /// 出站 URL、头与请求体逐字节对齐上游 `userPlaylistTracks` 基准。
+    ///
+    /// 签名覆盖参数序 + 头 + body，任一处不同服务端都只回 403 或空列表，
+    /// 不会指出是哪里错了，所以这里必须锁死。KAT 的假 axios 记录的是**传入
+    /// config 的头**，真实 axios 会在有对象 body 时补 `Content-Type`，所以带
+    /// body 的接口期望里多这一条。
+    #[test]
+    fn user_playlist_tracks_endpoint_matches_kat() {
+        let standard =
+            user_playlist_tracks_endpoint(1234567890, 1, 30, Some("10001"), Some("TOKENFIXTURE"))
+                .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://gateway.kugou.com/v4/get_list_all_file?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=ee8b01f6d910704b0f579537bec90e2b"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::Kugou, &standard).as_deref(),
+            Some(
+                r#"{"listid":"1234567890","userid":"10001","area_code":1,"show_relate_goods":0,"pagesize":"30","allplatform":1,"show_cover":1,"type":0,"token":"TOKENFIXTURE","page":"1"}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            vec![
+                (
+                    r#"Content-Type"#.to_string(),
+                    r#"application/json"#.to_string()
+                ),
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                ),
+                (
+                    r#"x-router"#.to_string(),
+                    r#"cloudlist.service.kugou.com"#.to_string()
+                )
+            ]
+        );
+
+        let lite =
+            user_playlist_tracks_endpoint(1234567890, 1, 30, Some("10001"), Some("TOKENFIXTURE"))
+                .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://gateway.kugou.com/v4/get_list_all_file?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=a868a3147e7efdb5288e3349deb6073a"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::KugouConcept, &lite).as_deref(),
+            Some(
+                r#"{"listid":"1234567890","userid":"10001","area_code":1,"show_relate_goods":0,"pagesize":"30","allplatform":1,"show_cover":1,"type":0,"token":"TOKENFIXTURE","page":"1"}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::KugouConcept, &lite),
+            vec![
+                (
+                    r#"Content-Type"#.to_string(),
+                    r#"application/json"#.to_string()
+                ),
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                ),
+                (
+                    r#"x-router"#.to_string(),
+                    r#"cloudlist.service.kugou.com"#.to_string()
+                )
+            ]
+        );
+    }
+
+    /// 出站 URL、头与请求体逐字节对齐上游 `artistLists` 基准。
+    ///
+    /// 签名覆盖参数序 + 头 + body，任一处不同服务端都只回 403 或空列表，
+    /// 不会指出是哪里错了，所以这里必须锁死。KAT 的假 axios 记录的是**传入
+    /// config 的头**，真实 axios 会在有对象 body 时补 `Content-Type`，所以带
+    /// body 的接口期望里多这一条。
+    #[test]
+    fn artist_list_endpoint_matches_kat() {
+        let standard = artist_list_endpoint(0, 30);
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://gateway.kugou.com/ocean/v6/singer/list?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&musician=0&sextype=0&showtype=2&type=0&hotsize=30&signature=49ee6a9cda61f133bc2441438751b15d"#
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            vec![
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                )
+            ]
+        );
+
+        let lite = artist_list_endpoint(0, 30);
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://gateway.kugou.com/ocean/v6/singer/list?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&musician=0&sextype=0&showtype=2&type=0&hotsize=30&signature=9ef5266682408856f9e50e9d9b0d0fa3"#
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::KugouConcept, &lite),
+            vec![
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                )
+            ]
+        );
+    }
+
+    /// 出站 URL、头与请求体逐字节对齐上游 `artistAudios` 基准。
+    ///
+    /// 签名覆盖参数序 + 头 + body，任一处不同服务端都只回 403 或空列表，
+    /// 不会指出是哪里错了，所以这里必须锁死。KAT 的假 axios 记录的是**传入
+    /// config 的头**，真实 axios 会在有对象 body 时补 `Content-Type`，所以带
+    /// body 的接口期望里多这一条。
+    #[test]
+    fn artist_tracks_hot_endpoint_matches_kat() {
+        let standard = artist_tracks_endpoint(
+            SourceKind::Kugou,
+            12345,
+            "hot",
+            1,
+            30,
+            KAT_CLIENTTIME,
+            KAT_MID,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://openapi.kugou.com/kmr/v1/audio_group/author?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=2064074c7c2a6fa6b62946b7f1d4f763"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::Kugou, &standard).as_deref(),
+            Some(
+                r#"{"appid":1005,"clientver":20489,"mid":"231699103997194646178265604655475531917","clienttime":1700000000,"key":"a1f65b6a8fe7e191521406ce8661ae02","author_id":"12345","pagesize":"30","page":"1","sort":1,"area_code":"all"}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            vec![
+                (
+                    r#"Content-Type"#.to_string(),
+                    r#"application/json"#.to_string()
+                ),
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (r#"kg-tid"#.to_string(), r#"220"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                ),
+                (
+                    r#"x-router"#.to_string(),
+                    r#"openapi.kugou.com"#.to_string()
+                )
+            ]
+        );
+
+        let lite = artist_tracks_endpoint(
+            SourceKind::KugouConcept,
+            12345,
+            "hot",
+            1,
+            30,
+            KAT_CLIENTTIME,
+            KAT_MID,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://openapi.kugou.com/kmr/v1/audio_group/author?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=e0fabb79f8b70de52feee585c8e4c0e2"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::KugouConcept, &lite).as_deref(),
+            Some(
+                r#"{"appid":3116,"clientver":11440,"mid":"231699103997194646178265604655475531917","clienttime":1700000000,"key":"bad0ee207bf429bd91402b77fc8f7a5b","author_id":"12345","pagesize":"30","page":"1","sort":1,"area_code":"all"}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::KugouConcept, &lite),
+            vec![
+                (
+                    r#"Content-Type"#.to_string(),
+                    r#"application/json"#.to_string()
+                ),
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (r#"kg-tid"#.to_string(), r#"220"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                ),
+                (
+                    r#"x-router"#.to_string(),
+                    r#"openapi.kugou.com"#.to_string()
+                )
+            ]
+        );
+    }
+
+    /// 出站 URL、头与请求体逐字节对齐上游 `artistAudiosNew` 基准。
+    ///
+    /// 签名覆盖参数序 + 头 + body，任一处不同服务端都只回 403 或空列表，
+    /// 不会指出是哪里错了，所以这里必须锁死。KAT 的假 axios 记录的是**传入
+    /// config 的头**，真实 axios 会在有对象 body 时补 `Content-Type`，所以带
+    /// body 的接口期望里多这一条。
+    #[test]
+    fn artist_tracks_new_endpoint_matches_kat() {
+        let standard = artist_tracks_endpoint(
+            SourceKind::Kugou,
+            12345,
+            "new",
+            1,
+            30,
+            KAT_CLIENTTIME,
+            KAT_MID,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://openapi.kugou.com/kmr/v1/audio_group/author?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=d9492e376d233efe66f29dc943287346"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::Kugou, &standard).as_deref(),
+            Some(
+                r#"{"appid":1005,"clientver":20489,"mid":"231699103997194646178265604655475531917","clienttime":1700000000,"key":"a1f65b6a8fe7e191521406ce8661ae02","author_id":"12345","pagesize":"30","page":"1","sort":2,"area_code":"all"}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            vec![
+                (
+                    r#"Content-Type"#.to_string(),
+                    r#"application/json"#.to_string()
+                ),
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (r#"kg-tid"#.to_string(), r#"220"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                ),
+                (
+                    r#"x-router"#.to_string(),
+                    r#"openapi.kugou.com"#.to_string()
+                )
+            ]
+        );
+
+        let lite = artist_tracks_endpoint(
+            SourceKind::KugouConcept,
+            12345,
+            "new",
+            1,
+            30,
+            KAT_CLIENTTIME,
+            KAT_MID,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://openapi.kugou.com/kmr/v1/audio_group/author?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=d586eb6a704382777e808ac7be79c206"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::KugouConcept, &lite).as_deref(),
+            Some(
+                r#"{"appid":3116,"clientver":11440,"mid":"231699103997194646178265604655475531917","clienttime":1700000000,"key":"bad0ee207bf429bd91402b77fc8f7a5b","author_id":"12345","pagesize":"30","page":"1","sort":2,"area_code":"all"}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::KugouConcept, &lite),
+            vec![
+                (
+                    r#"Content-Type"#.to_string(),
+                    r#"application/json"#.to_string()
+                ),
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (r#"kg-tid"#.to_string(), r#"220"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                ),
+                (
+                    r#"x-router"#.to_string(),
+                    r#"openapi.kugou.com"#.to_string()
+                )
+            ]
+        );
+    }
+
+    /// 出站 URL、头与请求体逐字节对齐上游 `rankList` 基准。
+    ///
+    /// 签名覆盖参数序 + 头 + body，任一处不同服务端都只回 403 或空列表，
+    /// 不会指出是哪里错了，所以这里必须锁死。KAT 的假 axios 记录的是**传入
+    /// config 的头**，真实 axios 会在有对象 body 时补 `Content-Type`，所以带
+    /// body 的接口期望里多这一条。
+    #[test]
+    fn rank_boards_endpoint_matches_kat() {
+        let standard = rank_boards_endpoint();
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://gateway.kugou.com/ocean/v6/rank/list?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&plat=2&withsong=0&parentid=0&signature=05c71c49ddcafb388aa2d4ec0a2c0716"#
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            vec![
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                )
+            ]
+        );
+
+        let lite = rank_boards_endpoint();
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://gateway.kugou.com/ocean/v6/rank/list?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&plat=2&withsong=0&parentid=0&signature=7b121b79176d37755580b9a5b69073b8"#
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::KugouConcept, &lite),
+            vec![
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                )
+            ]
+        );
+    }
+
+    /// 出站 URL、头与请求体逐字节对齐上游 `rankAudio` 基准。
+    ///
+    /// 签名覆盖参数序 + 头 + body，任一处不同服务端都只回 403 或空列表，
+    /// 不会指出是哪里错了，所以这里必须锁死。KAT 的假 axios 记录的是**传入
+    /// config 的头**，真实 axios 会在有对象 body 时补 `Content-Type`，所以带
+    /// body 的接口期望里多这一条。
+    #[test]
+    fn rank_tracks_endpoint_matches_kat() {
+        let standard = rank_tracks_endpoint(8888, 1, 30).unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://gateway.kugou.com/openapi/kmr/v2/rank/audio?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=a415b5e78eb7563835f316cb53563770"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::Kugou, &standard).as_deref(),
+            Some(
+                r#"{"show_portrait_mv":1,"show_type_total":1,"filter_original_remarks":1,"area_code":1,"pagesize":"30","rank_cid":0,"type":1,"page":"1","rank_id":"8888"}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            vec![
+                (
+                    r#"Content-Type"#.to_string(),
+                    r#"application/json"#.to_string()
+                ),
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (r#"kg-tid"#.to_string(), r#"369"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                )
+            ]
+        );
+
+        let lite = rank_tracks_endpoint(8888, 1, 30).unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://gateway.kugou.com/openapi/kmr/v2/rank/audio?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=c0a5e015554824c08e305df9412cf210"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::KugouConcept, &lite).as_deref(),
+            Some(
+                r#"{"show_portrait_mv":1,"show_type_total":1,"filter_original_remarks":1,"area_code":1,"pagesize":"30","rank_cid":0,"type":1,"page":"1","rank_id":"8888"}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::KugouConcept, &lite),
+            vec![
+                (
+                    r#"Content-Type"#.to_string(),
+                    r#"application/json"#.to_string()
+                ),
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (r#"kg-tid"#.to_string(), r#"369"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                )
+            ]
+        );
+    }
+
+    /// 出站 URL、头与请求体逐字节对齐上游 `monthVipRecord` 基准。
+    ///
+    /// 签名覆盖参数序 + 头 + body，任一处不同服务端都只回 403 或空列表，
+    /// 不会指出是哪里错了，所以这里必须锁死。KAT 的假 axios 记录的是**传入
+    /// config 的头**，真实 axios 会在有对象 body 时补 `Content-Type`，所以带
+    /// body 的接口期望里多这一条。
+    #[test]
+    fn claimed_vip_days_endpoint_matches_kat() {
+        let standard = claimed_vip_days_endpoint();
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://gateway.kugou.com/youth/v1/activity/get_month_vip_record?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&latest_limit=100&signature=d071f1ad28132b119a0b7bb1683116cd"#
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            vec![
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                )
+            ]
+        );
+
+        let lite = claimed_vip_days_endpoint();
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://gateway.kugou.com/youth/v1/activity/get_month_vip_record?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&latest_limit=100&signature=69088ac11eb2642419a9993b18f54576"#
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::KugouConcept, &lite),
+            vec![
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                )
+            ]
+        );
+    }
+
+    /// 九个目录类接口的参数顺序必须与上游逐位一致。
+    ///
+    /// 上游签名先把参数按 key 排序再拼串，但**URL 本身的顺序**来自
+    /// `module/*.js` 的对象插入序——两端 URL 不同就说明默认参数与模块参数的
+    /// 合并方式（`Object.assign` 的「改值不改位」）走偏了，签名也会跟着错。
+    #[test]
+    fn cloud_endpoints_keep_kat_param_order() {
+        let cases: Vec<(&str, Vec<&str>, Endpoint<'static>)> = vec![
+            (
+                "plaza_playlists",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "signature",
+                ],
+                plaza_playlists_endpoint(
+                    SourceKind::KugouConcept,
+                    0,
+                    1,
+                    30,
+                    KAT_CLIENTTIME,
+                    KAT_MID,
+                    Some("10001"),
+                )
+                .unwrap(),
+            ),
+            (
+                "playlist_tracks",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "area_code",
+                    "begin_idx",
+                    "plat",
+                    "type",
+                    "mode",
+                    "personal_switch",
+                    "extend_fields",
+                    "pagesize",
+                    "global_collection_id",
+                    "signature",
+                ],
+                playlist_tracks_endpoint("GLOBALCOLLECTIONIDFIXTURE", 1, 30),
+            ),
+            (
+                "user_playlists",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "plat",
+                    "signature",
+                ],
+                user_playlists_endpoint(1, 100, Some("10001"), Some("TOKENFIXTURE")).unwrap(),
+            ),
+            (
+                "user_playlist_tracks",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "signature",
+                ],
+                user_playlist_tracks_endpoint(
+                    1234567890,
+                    1,
+                    30,
+                    Some("10001"),
+                    Some("TOKENFIXTURE"),
+                )
+                .unwrap(),
+            ),
+            (
+                "artist_list",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "musician",
+                    "sextype",
+                    "showtype",
+                    "type",
+                    "hotsize",
+                    "signature",
+                ],
+                artist_list_endpoint(0, 30),
+            ),
+            (
+                "artist_tracks_hot",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "signature",
+                ],
+                artist_tracks_endpoint(
+                    SourceKind::KugouConcept,
+                    12345,
+                    "hot",
+                    1,
+                    30,
+                    KAT_CLIENTTIME,
+                    KAT_MID,
+                )
+                .unwrap(),
+            ),
+            (
+                "artist_tracks_new",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "signature",
+                ],
+                artist_tracks_endpoint(
+                    SourceKind::KugouConcept,
+                    12345,
+                    "new",
+                    1,
+                    30,
+                    KAT_CLIENTTIME,
+                    KAT_MID,
+                )
+                .unwrap(),
+            ),
+            (
+                "rank_boards",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "plat",
+                    "withsong",
+                    "parentid",
+                    "signature",
+                ],
+                rank_boards_endpoint(),
+            ),
+            (
+                "rank_tracks",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "signature",
+                ],
+                rank_tracks_endpoint(8888, 1, 30).unwrap(),
+            ),
+            (
+                "claimed_vip_days",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "latest_limit",
+                    "signature",
+                ],
+                claimed_vip_days_endpoint(),
+            ),
+        ];
+
+        for (name, expected, endpoint) in cases {
+            assert_eq!(
+                prepared_param_order(SourceKind::KugouConcept, &endpoint),
+                expected,
+                "{name} 的参数顺序与上游不一致"
+            );
+        }
     }
 }

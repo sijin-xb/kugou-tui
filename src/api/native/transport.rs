@@ -35,10 +35,10 @@ use crate::util::now_unix_millis;
 pub const GATEWAY_BASE: &str = "https://gateway.kugou.com";
 
 /// 歌词接口的独立域名（`module/lyric.js`、`module/search_lyric.js` 自带 `baseURL`）。
-///
-/// 阶段 4 接歌词时用。
-#[allow(dead_code)]
 pub const LYRICS_BASE: &str = "https://lyrics.kugou.com";
+
+/// 开放平台的独立域名（`module/artist_audios.js` 自带 `baseURL`）。
+pub const OPENAPI_BASE: &str = "https://openapi.kugou.com";
 
 /// 设备注册接口的独立域名（`module/register_dev.js` 自带 `baseURL`）。
 pub const USER_SERVICE_BASE: &str = "https://userservice.kugou.com";
@@ -70,13 +70,18 @@ const POOL_MAX_IDLE: usize = 4;
 
 /// 上游 `options.encryptType`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Web/Register 留给阶段 5 的登录与设备注册
 pub enum EncryptType {
     /// 默认。`signatureAndroidParams`，区分标准版 / 概念版。
     Android,
     /// `signatureWebParams`。登录接口用。
     Web,
     /// `signatureRegisterParams`。设备注册用。
+    ///
+    /// 迁移范围内的模块没有一处在 `options.encryptType` 里写 `'register'`
+    /// （`module/register_dev.js` 用的也是 `'android'`），所以这个分支在当前
+    /// 代码里构造不出来。保留它是为了让 `request.js` 的三路分派与上游一一对应，
+    /// 而不是少一条；`sign.rs` 的 known-answer 测试直接覆盖了算法本身。
+    #[allow(dead_code)]
     Register,
 }
 
@@ -100,7 +105,6 @@ pub struct Endpoint<'a> {
     /// `clearDefaultParams`：为真时**不**注入 `defaultParams`。
     ///
     /// 迁移范围内只有 `module/search_lyric.js` 用它，属阶段 4。
-    #[allow(dead_code)]
     pub clear_default_params: bool,
     /// 请求体（已序列化）。参与 android 签名。
     pub data: Option<String>,
@@ -115,6 +119,22 @@ pub struct Endpoint<'a> {
     /// **没登录时 dfid 是每次调用新生成的 24 字符随机串**，不是 `-`，也不是空。
     /// 这个值同时进参数与请求头，所以只能在组装前替换。
     pub dfid_override: Option<String>,
+    /// 显式指定本地缓存的键，覆盖默认的「按 [`Endpoint::params`] 拼」。
+    ///
+    /// 上游 apicache 的键是客户端发给 Node 服务的那条 URL（`util/apicache.js:892`
+    /// 的 `req.hostname + req.originalUrl`），也就是 `module/*.js` **收到的入参**。
+    /// GET 路由这些入参恰好就是 `params`，默认行为即等价。
+    ///
+    /// 但 POST 路由（`/v2/special_recommend`、`/v4/get_list_all_file`、
+    /// `/kmr/v1/audio_group/author` 等）把入参全塞进 body，`params` 里只剩
+    /// `dfid/mid/uuid/appid/clientver/clienttime` 这些默认参数——按默认方式拼键，
+    /// **所有歌单、所有歌手、所有榜单都会撞成同一个键**，命中后返回上一次的结果，
+    /// 而且不会报任何错。所以这些构造函数必须显式给出身份串。
+    ///
+    /// 身份串要与入参一一对应，且**不含 `clienttime`、`key`** 这类每次调用都变的
+    /// 字段：带上它们就永远命中不了，出站请求条数会比 Node 版多（阶段 3 出口要求
+    /// 两端条数一致）。
+    pub cache_identity: Option<String>,
 }
 
 impl<'a> Endpoint<'a> {
@@ -130,6 +150,7 @@ impl<'a> Endpoint<'a> {
             encrypt_key: false,
             encrypt_type: EncryptType::Android,
             dfid_override: None,
+            cache_identity: None,
         }
     }
 
@@ -165,7 +186,6 @@ impl<'a> Endpoint<'a> {
         self
     }
 
-    #[allow(dead_code)] // 阶段 5 的登录与设备注册用
     pub fn encrypt_type(mut self, encrypt_type: EncryptType) -> Self {
         self.encrypt_type = encrypt_type;
         self
@@ -176,11 +196,19 @@ impl<'a> Endpoint<'a> {
         self.dfid_override = Some(dfid.into());
         self
     }
+
+    /// 显式指定本地缓存键。见 [`Endpoint::cache_identity`]。
+    pub fn cache_identity(mut self, identity: impl Into<String>) -> Self {
+        self.cache_identity = Some(identity.into());
+        self
+    }
 }
 
 /// 一次已经组装好的请求。
 ///
-/// 只把 `url` 放出来给 KAT 测试逐字节断言组装结果，其余字段是本模块内部形态。
+/// 把 KAT 测试要逐字节断言的三个字段放出来（`url`、`headers`、`body`）——
+/// 签名覆盖参数序、头与请求体，三者任一不同服务端都不认且不给提示，所以测试
+/// 必须能看到它们；`method` 与 `cache_key` 是本模块内部形态。
 #[derive(Debug)]
 pub(crate) struct Prepared {
     pub(crate) url: String,
@@ -195,8 +223,8 @@ pub(crate) struct Prepared {
     /// 用组装完成的网关 URL 当键会永远命中不了：`clienttime` 精确到秒，
     /// 两次相同调用必然是不同的 URL。所以这里只取模块自带参数。
     cache_key: String,
-    headers: Vec<(String, String)>,
-    body: Option<String>,
+    pub(crate) headers: Vec<(String, String)>,
+    pub(crate) body: Option<String>,
 }
 
 /// 按 URL 缓存响应体，对齐上游 `server.js:318` 的 apicache。
@@ -324,12 +352,14 @@ impl Transport {
 
     /// 取一次 JSON。`cached` 为假时绕开本地缓存。
     pub async fn get_json(&self, endpoint: &Endpoint<'_>, cached: bool) -> Result<Value> {
-        self.with_retry(|| self.get_json_once(endpoint, cached)).await
+        self.with_retry(|| self.get_json_once(endpoint, cached))
+            .await
     }
 
     /// 取一次原始文本（歌词接口在 `decode=true` 下偶尔直接吐 LRC 纯文本）。
     pub async fn get_text(&self, endpoint: &Endpoint<'_>, cached: bool) -> Result<String> {
-        self.with_retry(|| self.get_text_once(endpoint, cached)).await
+        self.with_retry(|| self.get_text_once(endpoint, cached))
+            .await
     }
 
     /// **写接口**：与 [`Self::get_json`] 相同但不重试，理由见
@@ -397,7 +427,10 @@ impl Transport {
         let (status, body) = self.send(&prepared).await?;
         let value = interpret_json(endpoint.path, status, &body)?;
 
-        if cached && status == 200 && let Ok(mut cache) = self.cache.lock() {
+        if cached
+            && status == 200
+            && let Ok(mut cache) = self.cache.lock()
+        {
             cache.put(prepared.cache_key.clone(), value.clone());
         }
         Ok(value)
@@ -604,15 +637,23 @@ pub(crate) fn build_prepared(
         format!("{}{}?{query}", endpoint.base, endpoint.path)
     };
 
-    Prepared {
-        url,
-        method: endpoint.method,
-        cache_key: format!(
+    // 缓存键对应上游 apicache 的 `req.originalUrl`：GET 路由的入参就是 `params`，
+    // POST 路由的入参在 body 里，只能由构造函数显式给出身份串（见
+    // [`Endpoint::cache_identity`]）。
+    let cache_key = match &endpoint.cache_identity {
+        Some(identity) => format!("{}{}?{}", endpoint.base, endpoint.path, identity),
+        None => format!(
             "{}{}?{}",
             endpoint.base,
             endpoint.path,
             build_query(&endpoint.params)
         ),
+    };
+
+    Prepared {
+        url,
+        method: endpoint.method,
+        cache_key,
         headers,
         body: endpoint.data.clone(),
     }
@@ -880,7 +921,9 @@ mod tests {
             &song_url_endpoint(SourceKind::Kugou, false),
         );
         assert!(
-            prepared.url.ends_with("&signature=332535f1dff6b07ffa64a75960e33ebc"),
+            prepared
+                .url
+                .ends_with("&signature=332535f1dff6b07ffa64a75960e33ebc"),
             "实际：{}",
             prepared.url
         );
@@ -933,15 +976,24 @@ mod tests {
         assert_eq!(
             prepared.headers,
             vec![
-                ("User-Agent".to_string(), "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi".to_string()),
-                ("x-router".to_string(), "complexsearch.kugou.com".to_string()),
+                (
+                    "User-Agent".to_string(),
+                    "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi".to_string()
+                ),
+                (
+                    "x-router".to_string(),
+                    "complexsearch.kugou.com".to_string()
+                ),
                 ("dfid".to_string(), "1234567890abcdef12345678".to_string()),
                 ("clienttime".to_string(), KAT_CLIENTTIME.to_string()),
                 ("mid".to_string(), KAT_MID.to_string()),
                 ("kg-rc".to_string(), "1".to_string()),
                 ("kg-thash".to_string(), "5d816a0".to_string()),
                 ("kg-rec".to_string(), "1".to_string()),
-                ("kg-rf".to_string(), "B9EDA08A64250DEFFBCADDEE00F8F25F".to_string()),
+                (
+                    "kg-rf".to_string(),
+                    "B9EDA08A64250DEFFBCADDEE00F8F25F".to_string()
+                ),
             ]
         );
     }
@@ -992,7 +1044,10 @@ mod tests {
     fn space_is_plus_and_plus_is_escaped() {
         assert_eq!(encode_axios("a b"), "a+b");
         assert_eq!(encode_axios("a+b"), "a%2Bb");
-        assert_eq!(encode_axios("Letter - arkady sevidov"), "Letter+-+arkady+sevidov");
+        assert_eq!(
+            encode_axios("Letter - arkady sevidov"),
+            "Letter+-+arkady+sevidov"
+        );
     }
 
     /// 逗号不编码，`ppage_id` 才能与上游一致。
@@ -1024,7 +1079,10 @@ mod tests {
 
         let body = r#"{"error_code":152,"error_msg":"need login"}"#;
         let error = interpret_json("/x", 200, body).unwrap_err();
-        assert!(matches!(error, AppError::Api { code: 152, .. }), "实际：{error:?}");
+        assert!(
+            matches!(error, AppError::Api { code: 152, .. }),
+            "实际：{error:?}"
+        );
     }
 
     /// 业务错误码优先于 HTTP 状态码——与 `HttpClient` 的判据一致。
@@ -1032,7 +1090,10 @@ mod tests {
     fn business_code_wins_over_http_status() {
         let body = r#"{"error_code":152,"error_msg":"need login"}"#;
         let error = interpret_json("/x", 502, body).unwrap_err();
-        assert!(matches!(error, AppError::Api { code: 152, .. }), "实际：{error:?}");
+        assert!(
+            matches!(error, AppError::Api { code: 152, .. }),
+            "实际：{error:?}"
+        );
     }
 
     /// `status: 2`（需要验证）是**成功路径**：`song_stream_url` 要靠它给用户
