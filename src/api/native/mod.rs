@@ -13,6 +13,8 @@
 pub mod crypto;
 #[allow(dead_code)]
 pub mod krc;
+#[allow(dead_code)]
+pub mod sign;
 
 use crate::api::cloud::{QrCheck, UserInfo, VipInfo};
 use crate::api::catalog::StreamUrl;
