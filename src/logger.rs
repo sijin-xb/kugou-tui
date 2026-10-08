@@ -86,6 +86,11 @@ pub fn mem_trace_enabled() -> bool {
 }
 
 /// 写入一行日志。
+///
+/// 所有日志都从这里出去，所以**凭据脱敏也放在这里**：调用点会打印出站 URL、
+/// 请求头、响应体片段，这些地方天然带着 `token`、`userid`、`dfid`。逐个调用点
+/// 去记得脱敏，早晚会漏一个（阶段 4 就漏了，真实 token 进了日志）；收口到一处
+/// 才守得住。见 [`redact`]。
 pub fn write(level: &str, message: &str) {
     if level == LEVEL_DEBUG && !debug_enabled() {
         return;
@@ -96,7 +101,170 @@ pub fn write(level: &str, message: &str) {
     let Ok(mut file) = sink.lock() else {
         return;
     };
-    let _ = writeln!(file, "{} [{}] {}", timestamp_now(), level, message);
+    let _ = writeln!(file, "{} [{}] {}", timestamp_now(), level, redact(message));
+}
+
+/// 日志里必须遮掉值的键名（比较时忽略大小写）。
+///
+/// 只列「值的泄露会造成账号或设备被冒用」的键：
+///
+/// * `token` / `userid` —— 账号凭据本身。
+/// * `dfid` / `mid` —— 设备指纹。不是账号密码，但足以让服务端把请求认成
+///   同一台设备；上游按 24 小时轮换，属于不该长期留在磁盘上的东西。
+/// * `KUGOU_API_*` —— 设备指纹在 cookie 里的另几个名字。
+///
+/// **不遮** `accesskey`、`signature`、`hash`：前两者是单次请求的凭证（用过即废，
+/// 且签名值本身是「请求参数算出来的」，留着才能对账），后者是公开的歌曲标识。
+const SENSITIVE_KEYS: &[&str] = &[
+    "token",
+    "userid",
+    "dfid",
+    "mid",
+    "KUGOU_API_MID",
+    "KUGOU_API_GUID",
+    "KUGOU_API_DEV",
+];
+
+const REDACTED: &str = "<redacted>";
+
+/// 把消息里敏感键的值换成 `<redacted>`，**保留键名与参数顺序**。
+///
+/// 保留键名和顺序是有意的：阶段 3/4 的「与 Node 版出站逐项对比」正是靠日志里
+/// 的参数名与顺序做的，值被遮掉不影响那种对比，而 URL 形态仍然可读。
+///
+/// 要认的形状有三种，都是本仓库真实打出来的：
+///
+/// * query 串：`...&token=abc&userid=123`
+/// * JSON：`{"token":"abc"}`
+/// * Rust 的 `{:?}` 元组列表：`[("dfid", "abc")]`（出站日志就是这么打请求头的）
+pub fn redact(message: &str) -> String {
+    let mut out = message.to_string();
+    for key in SENSITIVE_KEYS {
+        out = redact_key(&out, key);
+    }
+    out
+}
+
+/// 遮掉 `key` 的所有出现处。逐处重扫：改短之后下标会变，不能缓存。
+fn redact_key(message: &str, key: &str) -> String {
+    let mut out = message.to_string();
+    let mut from = 0;
+    while let Some(offset) = find_key(&out[from..], key) {
+        let after = from + offset + key.len();
+        let Some(value) = locate_value(&out[after..]) else {
+            // 认不出值在哪（例如键名出现在散文里），跳过这一处继续找。
+            from = after;
+            continue;
+        };
+        let (start, end, quoted) = value;
+        // 带引号时只换掉引号里面的内容，引号本身留着——日志读起来仍是完整的 JSON。
+        let (range, replacement) = if quoted {
+            (after + start + 1..after + end - 1, REDACTED)
+        } else {
+            (after + start..after + end, REDACTED)
+        };
+        out.replace_range(range.clone(), replacement);
+        from = range.start + replacement.len();
+    }
+    out
+}
+
+/// 在 `haystack` 里找 `key`（忽略 ASCII 大小写），要求两侧都不是标识符字符。
+///
+/// 忽略大小写是因为同一个键在不同形状里大小写不同：URL 里是 `mid=`，cookie 里是
+/// `KUGOU_API_MID`，JSON 里可能写成 `"MID"`。
+///
+/// 两侧的边界检查是为了不误伤 `access_token` 里的 `token`、`userid_list` 里的
+/// `userid`——遮掉这些会让人看不懂日志，而它们本来就不是凭据。
+fn find_key(haystack: &str, key: &str) -> Option<usize> {
+    let bytes = haystack.as_bytes();
+    let key = key.as_bytes();
+    if key.is_empty() || bytes.len() < key.len() {
+        return None;
+    }
+    for start in 0..=bytes.len() - key.len() {
+        if !bytes[start..start + key.len()].eq_ignore_ascii_case(key) {
+            continue;
+        }
+        let end = start + key.len();
+        let before_ok = start == 0 || !is_ident_byte(bytes[start - 1]);
+        let after_ok = end >= bytes.len() || !is_ident_byte(bytes[end]);
+        if before_ok && after_ok {
+            return Some(start);
+        }
+    }
+    None
+}
+
+fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// 从键名之后定位值，返回 `(起点, 终点, 是否带引号)`，偏移都相对 `rest`。
+///
+/// 要认的形状有三种，都是本仓库真实打出来的：
+///
+/// * query 串：`token=abc&userid=123` —— 分隔符是 `=`
+/// * JSON：`"token":"abc"`、`"userid":10001` —— 分隔符是 `:`
+/// * Rust 的 `{:?}` 元组列表：`[("dfid", "abc")]` —— 分隔符是 `,`
+///
+/// 键名后面紧跟的那个引号是**键自己的收尾引号**，先跳掉；再跳分隔符与空白；
+/// 若此时是引号，那就是值的起始引号。没见到任何分隔符（键名出现在散文里）时
+/// 返回 `None`，不遮。
+fn locate_value(rest: &str) -> Option<(usize, usize, bool)> {
+    let bytes = rest.as_bytes();
+    let mut index = 0;
+
+    // 键自己的收尾引号。
+    if matches!(bytes.first(), Some(b'"') | Some(b'\'')) {
+        index += 1;
+    }
+
+    let mut saw_separator = false;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'=' | b':' | b',' => {
+                saw_separator = true;
+                index += 1;
+            }
+            b' ' | b'\t' => index += 1,
+            _ => break,
+        }
+    }
+    if !saw_separator {
+        return None;
+    }
+
+    let start = index;
+    if matches!(bytes.get(start), Some(b'"') | Some(b'\'')) {
+        let quote = bytes[start];
+        let mut end = start + 1;
+        while end < bytes.len() {
+            if bytes[end] == b'\\' {
+                end += 2;
+                continue;
+            }
+            if bytes[end] == quote {
+                return Some((start, end + 1, true));
+            }
+            end += 1;
+        }
+        // 引号没闭合：把剩下的都当值，宁可多遮。
+        return Some((start, bytes.len(), true));
+    }
+
+    let mut end = start;
+    while end < bytes.len() {
+        if matches!(
+            bytes[end],
+            b'&' | b' ' | b'\t' | b'"' | b'\'' | b')' | b']' | b'}' | b',' | b';' | b'\n' | b'/'
+                | b'?'
+        ) {
+            break;
+        }
+        end += 1;
+    }
+    Some((start, end, false))
 }
 
 /// 把进程的 stderr 接到日志文件上。
@@ -230,7 +398,7 @@ pub(crate) use tlog;
 
 #[cfg(test)]
 mod tests {
-    use super::civil_from_unix;
+    use super::{civil_from_unix, redact};
 
     #[test]
     fn converts_epoch_to_calendar_date() {
@@ -239,5 +407,92 @@ mod tests {
         assert_eq!(civil_from_unix(1_789_875_855), (2026, 9, 20, 3, 44, 15));
         // 闰日
         assert_eq!(civil_from_unix(1_709_164_800), (2024, 2, 29, 0, 0, 0));
+    }
+
+    /// 出站日志的真实形状：URL 里 token 与 userid 都在 query 上。
+    /// 键名与顺序必须留着——阶段 3/4 的逐项对比就是靠它们做的。
+    #[test]
+    fn redacts_credentials_in_a_query_string() {
+        let line = "native 出站 GET https://lyrics.kugou.com/download?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1791453130&token=TOKENFIXTURE&userid=10001&ver=1&client=android&id=274944371&accesskey=0123456789ABCDEF0123456789ABCDEF&fmt=krc&charset=utf8&signature=d54747fed21dbff8fcc2f6acae4698c7";
+        let out = redact(line);
+
+        assert!(!out.contains("TOKENFIXTURE"));
+        assert!(!out.contains("10001"));
+        assert!(!out.contains("1234567890abcdef12345678"));
+        assert!(!out.contains("231699103997194646178265604655475531917"));
+
+        // 参数名、顺序、以及非敏感值都原样保留。
+        assert!(out.contains("&token=<redacted>&"));
+        assert!(out.contains("&userid=<redacted>&"));
+        assert!(out.contains("?dfid=<redacted>&"));
+        assert!(out.contains("&mid=<redacted>&"));
+        assert!(out.contains("appid=3116"));
+        assert!(out.contains("accesskey=0123456789ABCDEF0123456789ABCDEF"));
+        assert!(out.contains("signature=d54747fed21dbff8fcc2f6acae4698c7"));
+        assert!(out.contains("uuid=-"));
+    }
+
+    /// 出站日志打请求头用的是 Rust 的 `{:?}`：`[("dfid", "abc")]`。
+    #[test]
+    fn redacts_credentials_in_a_debug_header_list() {
+        let line = r#"headers=[("User-Agent", "Android15-1070"), ("dfid", "1234567890abcdef12345678"), ("clienttime", "1791453130"), ("mid", "231699103997194646178265604655475531917"), ("kg-rc", "1")]"#;
+        let out = redact(line);
+
+        assert!(!out.contains("1234567890abcdef12345678"));
+        assert!(!out.contains("231699103997194646178265604655475531917"));
+        assert!(out.contains(r#"("dfid", "<redacted>")"#));
+        assert!(out.contains(r#"("mid", "<redacted>")"#));
+        assert!(out.contains(r#"("User-Agent", "Android15-1070")"#));
+        assert!(out.contains(r#"("clienttime", "1791453130")"#));
+    }
+
+    #[test]
+    fn redacts_credentials_in_json() {
+        let line = r#"{"token":"abc123","userid":10001,"dfid":"1234567890abcdef12345678","hash":"0a6916"}"#;
+        let out = redact(line);
+
+        assert!(!out.contains("abc123"));
+        assert!(!out.contains("10001"));
+        assert!(!out.contains("1234567890abcdef12345678"));
+        assert!(out.contains(r#""token":"<redacted>""#));
+        // 值原本没带引号（是数字），替换后也不带引号——日志是给人看的，不是给解析器。
+        assert!(out.contains(r#""userid":<redacted>"#));
+        assert!(out.contains(r#""hash":"0a6916""#));
+    }
+
+    /// cookie 串里设备指纹是另几个名字，大小写也不一样。
+    #[test]
+    fn redacts_device_fingerprint_cookie_names() {
+        let line = "cookie: token=abc; userid=123; KUGOU_API_MID=231699103997194646178265604655475531917; KUGOU_API_GUID=abc-def; KUGOU_API_DEV=ABCDEFGHIJ";
+        let out = redact(line);
+
+        assert!(!out.contains("231699103997194646178265604655475531917"));
+        assert!(!out.contains("abc-def"));
+        assert!(!out.contains("ABCDEFGHIJ"));
+        assert!(out.contains("KUGOU_API_MID=<redacted>"));
+    }
+
+    /// 键名出现在散文或别的标识符里时不能误伤——否则日志会变得看不懂，
+    /// 而 `access_token`、`userid_list` 本来就不是凭据。
+    #[test]
+    fn leaves_lookalike_keys_alone() {
+        let line = "access_token 不该被遮，userid_list 同理；token 只作为单词出现时也没有值可遮";
+        assert_eq!(redact(line), line);
+    }
+
+    /// 空值也要遮成 `<redacted>`，不能因为「没值」就留下 `token=`。
+    #[test]
+    fn redacts_empty_values() {
+        assert_eq!(redact("token=&userid=5"), "token=<redacted>&userid=<redacted>");
+    }
+
+    /// 一次日志里同一个键出现多次（URL 一份、请求头一份）要全部遮掉。
+    #[test]
+    fn redacts_every_occurrence() {
+        let line = "url?token=aaa&mid=bbb headers=[(\"token\", \"aaa\"), (\"mid\", \"bbb\")]";
+        let out = redact(line);
+        assert!(!out.contains("aaa"));
+        assert!(!out.contains("bbb"));
+        assert_eq!(out.matches("<redacted>").count(), 4);
     }
 }

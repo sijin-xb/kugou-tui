@@ -10,8 +10,10 @@ pub type Result<T> = std::result::Result<T, AppError>;
 #[derive(Debug, Error)]
 pub enum AppError {
     /// 传输层失败：DNS 解析、连接被拒、TLS 握手、超时。
+    ///
+    /// 转换走下面的手写 `From`，不是 `#[from]`：那条路径会先把 URL 抹掉。
     #[error("网络请求失败：{0}")]
-    Http(#[from] reqwest::Error),
+    Http(reqwest::Error),
 
     /// KuGouMusicApi 返回了非 2xx 状态码。
     #[error("接口 {path} 返回状态码 {status}")]
@@ -72,6 +74,19 @@ pub enum AppError {
     #[error("{0}")]
     /// 其它内部错误（任务调度失败之类），保留上下文便于定位。
     Other(String),
+}
+
+/// `reqwest::Error` 的 `Display` 会附上出错的 URL，而我们的 URL 里带着
+/// `token`、`userid`、`dfid`——这些是账号凭据，不该因为一次网络抖动就落进日志。
+///
+/// 所以这里手写转换，先把 URL 摘掉（`without_url` 正是 reqwest 为
+/// 「query 里有 API key」这种场景提供的），再交给 `AppError::Http`。
+/// 诊断信息保留错误种类（连接失败/超时/解码失败），只丢 URL——URL 的归属
+/// 在调用方已经知道，而 `path` 另有字段承载。
+impl From<reqwest::Error> for AppError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Http(error.without_url())
+    }
 }
 
 impl AppError {
@@ -320,5 +335,39 @@ mod tests {
         assert!(!AppError::Config("坏了".to_string()).is_transient());
         assert!(!AppError::Io(std::io::Error::other("磁盘")).is_transient());
         assert!(!AppError::NotFound("《X》没有可用的播放地址".to_string()).is_transient());
+    }
+
+    /// `reqwest::Error` 的 `Display` 会附上出错的完整 URL（`for url (…)`），
+    /// 而我们的 URL 上挂着 `token`、`userid`、`dfid`。一次网络抖动就会把账号凭据
+    /// 写进日志——阶段 4 的汇报里真实 token 就是这么漏出去的。
+    ///
+    /// 这里用一个**真实但必然失败**的请求来验证转换确实把 URL 摘掉了：先绑一个
+    /// 端口再关掉它，连过去必定 connection refused。不 mock，因为要验的正是
+    /// reqwest 自己那条 Display 路径。
+    #[tokio::test]
+    async fn http_error_drops_the_url_before_it_can_leak_credentials() {
+        // 绑到 0 拿到一个当前空闲的端口，随即释放——之后连过去会被拒。
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+            listener.local_addr().expect("读本地地址").port()
+        };
+
+        let secret = "TOKENFIXTURE";
+        let url = format!("http://127.0.0.1:{port}/download?token={secret}&userid=10001");
+        let error = reqwest::get(&url).await.expect_err("端口已关闭，应当连不上");
+
+        // 前提：reqwest 原样保留 URL（否则这条测试就恒真了，证明不了什么）。
+        assert!(
+            error.to_string().contains(secret),
+            "reqwest 本该把 URL 带进 Display，测试前提不成立：{error}"
+        );
+
+        let converted = AppError::from(error);
+        let text = converted.to_string();
+        assert!(!text.contains(secret), "token 不该进错误文案：{text}");
+        assert!(!text.contains("10001"), "userid 不该进错误文案：{text}");
+        assert!(!text.contains(&port.to_string()), "URL 整体都该被摘掉：{text}");
+        // 错误种类要留着——诊断「是连不上还是超时」全靠它。
+        assert!(converted.is_transient(), "连接被拒属于瞬时故障：{text}");
     }
 }
