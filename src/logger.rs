@@ -156,15 +156,11 @@ fn redact_key(message: &str, key: &str) -> String {
             from = after;
             continue;
         };
-        let (start, end, quoted) = value;
-        // 带引号时只换掉引号里面的内容，引号本身留着——日志读起来仍是完整的 JSON。
-        let (range, replacement) = if quoted {
-            (after + start + 1..after + end - 1, REDACTED)
-        } else {
-            (after + start..after + end, REDACTED)
-        };
-        out.replace_range(range.clone(), replacement);
-        from = range.start + replacement.len();
+        let (start, end) = value;
+        // 引号本身留着——日志读起来仍是完整的 JSON。
+        let range = after + start..after + end;
+        out.replace_range(range.clone(), REDACTED);
+        from = range.start + REDACTED.len();
     }
     out
 }
@@ -200,23 +196,27 @@ fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// 从键名之后定位值，返回 `(起点, 终点, 是否带引号)`，偏移都相对 `rest`。
+/// 从键名之后定位**值的可替换区间**，返回 `(起点, 终点)`，偏移都相对 `rest`。
 ///
-/// 要认的形状有三种，都是本仓库真实打出来的：
+/// 要认的形状有四种，都是本仓库真实打出来的：
 ///
 /// * query 串：`token=abc&userid=123` —— 分隔符是 `=`
 /// * JSON：`"token":"abc"`、`"userid":10001` —— 分隔符是 `:`
 /// * Rust 的 `{:?}` 元组列表：`[("dfid", "abc")]` —— 分隔符是 `,`
+/// * 被 `{:?}` 转义过的 JSON：`body=Some("{\"userid\":10001}")` ——
+///   键与值的引号前面都多一个反斜杠
 ///
-/// 键名后面紧跟的那个引号是**键自己的收尾引号**，先跳掉；再跳分隔符与空白；
-/// 若此时是引号，那就是值的起始引号。没见到任何分隔符（键名出现在散文里）时
-/// 返回 `None`，不遮。
-fn locate_value(rest: &str) -> Option<(usize, usize, bool)> {
+/// 带引号的值只返回引号**里面**那一段（转义的反斜杠留在外面），所以替换后
+/// 日志仍是结构完整的 JSON；裸值返回整段。键名出现在散文里、后面见不到任何
+/// 分隔符时返回 `None`，不遮。
+fn locate_value(rest: &str) -> Option<(usize, usize)> {
     let bytes = rest.as_bytes();
     let mut index = 0;
 
-    // 键自己的收尾引号。
-    if matches!(bytes.first(), Some(b'"') | Some(b'\'')) {
+    // 键自己的收尾引号，可能是 `"`，也可能是 Debug 转义后的 `\"`。
+    if is_escaped_quote(bytes, index) {
+        index += 2;
+    } else if is_quote(bytes.get(index)) {
         index += 1;
     }
 
@@ -235,36 +235,71 @@ fn locate_value(rest: &str) -> Option<(usize, usize, bool)> {
         return None;
     }
 
-    let start = index;
-    if matches!(bytes.get(start), Some(b'"') | Some(b'\'')) {
-        let quote = bytes[start];
-        let mut end = start + 1;
-        while end < bytes.len() {
-            if bytes[end] == b'\\' {
-                end += 2;
-                continue;
-            }
-            if bytes[end] == quote {
-                return Some((start, end + 1, true));
-            }
+    // 值的起始引号，同样可能是转义后的 `\"`。
+    let escaped = is_escaped_quote(bytes, index);
+    if escaped {
+        index += 1;
+    }
+    if !is_quote(bytes.get(index)) {
+        let start = index;
+        let mut end = start;
+        while end < bytes.len() && !is_value_terminator(bytes[end]) {
             end += 1;
         }
-        // 引号没闭合：把剩下的都当值，宁可多遮。
-        return Some((start, bytes.len(), true));
+        return Some((start, end));
     }
 
+    let quote = bytes[index];
+    let start = index + 1;
     let mut end = start;
     while end < bytes.len() {
-        if matches!(
-            bytes[end],
-            b'&' | b' ' | b'\t' | b'"' | b'\'' | b')' | b']' | b'}' | b',' | b';' | b'\n' | b'/'
-                | b'?'
-        ) {
-            break;
+        if escaped {
+            // 转义形态下，收尾引号前面必定有一个反斜杠，它不属于内容。
+            if bytes[end] == b'\\' && bytes.get(end + 1) == Some(&quote) {
+                return Some((start, end));
+            }
+            end += 1;
+            continue;
+        }
+        if bytes[end] == b'\\' {
+            end += 2;
+            continue;
+        }
+        if bytes[end] == quote {
+            return Some((start, end));
         }
         end += 1;
     }
-    Some((start, end, false))
+    // 引号没闭合：把剩下的都当值，宁可多遮。
+    Some((start, bytes.len()))
+}
+
+fn is_quote(byte: Option<&u8>) -> bool {
+    matches!(byte, Some(b'"') | Some(b'\''))
+}
+
+/// `\` 紧跟一个引号——Debug 格式化把 JSON 的引号写成了 `\"`。
+fn is_escaped_quote(bytes: &[u8], index: usize) -> bool {
+    bytes.get(index) == Some(&b'\\') && is_quote(bytes.get(index + 1))
+}
+
+/// 裸值的结束字符，与旧实现的集合一致。
+fn is_value_terminator(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'&' | b' '
+            | b'\t'
+            | b'"'
+            | b'\''
+            | b')'
+            | b']'
+            | b'}'
+            | b','
+            | b';'
+            | b'\n'
+            | b'/'
+            | b'?'
+    )
 }
 
 /// 把进程的 stderr 接到日志文件上。
@@ -458,6 +493,36 @@ mod tests {
         // 值原本没带引号（是数字），替换后也不带引号——日志是给人看的，不是给解析器。
         assert!(out.contains(r#""userid":<redacted>"#));
         assert!(out.contains(r#""hash":"0a6916""#));
+    }
+
+    /// 出站日志的 `body` 是 `{:?}` 打出来的 `Option<String>`，里面那层 JSON 的
+    /// 引号全被转义成 `\"`。这正是 5b 阶段真实漏过一次的形状：`userid` 的
+    /// 数字值就这么留在了日志里，而普通 JSON 的用例测不出来。
+    #[test]
+    fn redacts_credentials_in_a_debug_escaped_json_body() {
+        let line = r#"body=Some("{\"visit_time\":1791457093,\"usertype\":1,\"p\":\"C2D2\",\"userid\":10001}")"#;
+        let out = redact(line);
+
+        assert!(!out.contains("10001"), "userid 仍在日志里：{out}");
+        // 转义引号留在原位，只有值被换掉。
+        assert!(out.contains(r#"\"userid\":<redacted>"#), "{out}");
+        // 不敏感的字段一个都不能动。
+        assert!(out.contains(r#"\"visit_time\":1791457093"#));
+        assert!(out.contains(r#"\"p\":\"C2D2\""#));
+    }
+
+    /// 转义形态下的字符串值（带引号）也要遮，且不能把外层引号一起吃掉。
+    #[test]
+    fn redacts_escaped_json_string_values() {
+        let line = r#"body=Some("{\"token\":\"abc123def\",\"mid\":\"23169910399719464617\"}")"#;
+        let out = redact(line);
+
+        assert!(!out.contains("abc123def"));
+        assert!(!out.contains("23169910399719464617"));
+        assert!(out.contains(r#"\"token\":\"<redacted>\""#), "{out}");
+        assert!(out.contains(r#"\"mid\":\"<redacted>\""#), "{out}");
+        // 结尾的 `}")` 没被吞掉。
+        assert!(out.ends_with(r#"}")"#), "{out}");
     }
 
     /// cookie 串里设备指纹是另几个名字，大小写也不一样。
