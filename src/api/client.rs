@@ -50,16 +50,16 @@ const USER_AGENT_VALUE: &str = concat!("kugou-tui/", env!("CARGO_PKG_VERSION"));
 ///   再多只是让用户对着加载指示干等。
 /// * **间隔 300ms → 900ms**（×3 递增）。指数退避，但不加抖动：这是单用户的本地
 ///   客户端，不存在「一群客户端同时重试」的问题。
-struct RetryPolicy;
+pub(crate) struct RetryPolicy;
 
 impl RetryPolicy {
     /// 总尝试次数，含首次。
-    const MAX_ATTEMPTS: u32 = 3;
+    pub(crate) const MAX_ATTEMPTS: u32 = 3;
     /// 第 1 次重试前等 300ms，第 2 次前等 900ms。
     const BASE_DELAY_MS: u64 = 300;
 
     /// 第 `attempt` 次尝试失败之后该等多久（`attempt` 从 1 开始）。
-    fn delay_after(attempt: u32) -> Duration {
+    pub(crate) fn delay_after(attempt: u32) -> Duration {
         let factor = 3u64.saturating_pow(attempt.saturating_sub(1));
         Duration::from_millis(Self::BASE_DELAY_MS.saturating_mul(factor))
     }
@@ -290,7 +290,7 @@ impl HttpClient {
 ///
 /// 只用来给人看：`<!doctype html>` 一眼就知道端口上跑的是网页服务，空字符串说明
 /// 服务端什么都没返回。**按字符截而不是按字节**——响应体可能是中文。
-fn body_preview(body: &str) -> String {
+pub(crate) fn body_preview(body: &str) -> String {
     const MAX_CHARS: usize = 120;
 
     let mut out = String::new();

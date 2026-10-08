@@ -18,6 +18,9 @@ pub mod device;
 pub mod krc;
 #[allow(dead_code)]
 pub mod sign;
+// 传输层由下一个提交接入 NativeApi，在那之前只有自己的单元测试引用它。
+#[allow(dead_code)]
+pub mod transport;
 
 use crate::api::cloud::{QrCheck, UserInfo, VipInfo};
 use crate::api::catalog::StreamUrl;
