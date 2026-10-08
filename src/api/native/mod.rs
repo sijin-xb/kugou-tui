@@ -711,6 +711,198 @@ pub(crate) fn claimed_vip_days_endpoint() -> Endpoint<'static> {
         .param("latest_limit", "100")
 }
 
+// ----------------------------------------------------------------------
+// 云歌单写接口（上游 module/{playlist_add,playlist_del,
+// playlist_tracks_add,playlist_tracks_del}.js）
+// ----------------------------------------------------------------------
+
+/// 单次提交的歌数上限，与 `NodeApi` 一致：服务端按逗号分隔多首，
+/// 一次提交太多会被截断。
+const WRITE_BATCH_SIZE: usize = 20;
+
+/// 上游 `params?.userid || params?.cookie?.userid || 0` 的取值形态。
+///
+/// 注意 JS 里字符串 `"0"` 是 **truthy**，所以只有空串/缺省才落到数字 `0`；
+/// 这个 `"0"` 与 `0` 的差别会原样进 JSON、进而进签名与 RSA 明文，写错不报错。
+fn userid_value(userid: Option<&str>) -> Value {
+    match userid {
+        Some(value) if !value.is_empty() => Value::String(value.to_string()),
+        _ => Value::from(0),
+    }
+}
+
+/// 新建歌单的请求规格（上游 `module/playlist_add.js`，路由 `/playlist/add`）。
+///
+/// `url` 自带 `cloudlist.service` 前缀，**没有 `x-router`**。`type` 取 query 里
+/// 那串字符串 `"0"`（Express 给的全是字符串），因此上游
+/// `if (params.type === 0)` 这个严格比较**不成立**，`is_pri` 保持字面量 `0`；
+/// 同理 `params.type === 0 ? {...} : {}` 让这里**没有额外 params**。
+/// 若把 `type` 写成数字 `0`，会同时多出一组 params 并改变签名。
+pub(crate) fn playlist_add_endpoint(
+    name: &str,
+    userid: Option<&str>,
+    token: Option<&str>,
+) -> Result<Endpoint<'static>> {
+    // 未传的 `list_create_userid` / `list_create_listid` 在 JS 里是 `undefined`，
+    // `JSON.stringify` 会把它们整个丢掉——所以这里**不出现**这两个键。
+    let body = serde_json::json!({
+        "userid": userid_value(userid),
+        "token": token.unwrap_or(""),
+        "total_ver": 0,
+        "name": name,
+        "type": "0",
+        "source": 1,
+        "is_pri": 0,
+        "list_create_gid": "",
+        "from_shupinmv": 0,
+    });
+
+    Ok(
+        Endpoint::post(GATEWAY_BASE, "/cloudlist.service/v5/add_list")
+            .header("Content-Type", "application/json")
+            .body(serialize_body(body, "新建歌单")?),
+    )
+}
+
+/// 从歌单移除歌曲的请求规格（上游 `module/playlist_tracks_del.js`，
+/// 路由 `/playlist/tracks/del`）。
+///
+/// 入参全在 body，**没有额外 params**。`listid` 是字符串，`fileid` 是数字。
+pub(crate) fn playlist_tracks_del_endpoint(
+    list_id: i64,
+    file_ids: &[i64],
+    userid: Option<&str>,
+    token: Option<&str>,
+) -> Result<Endpoint<'static>> {
+    let entries: Vec<Value> = file_ids
+        .iter()
+        .map(|file_id| serde_json::json!({ "fileid": file_id }))
+        .collect();
+
+    let body = serde_json::json!({
+        "listid": list_id.to_string(),
+        "userid": userid_value(userid),
+        "data": entries,
+        "type": 0,
+        "token": token.unwrap_or(""),
+        "list_ver": 0,
+    });
+
+    Ok(Endpoint::post(GATEWAY_BASE, "/v4/delete_songs")
+        .header("x-router", "cloudlist.service.kugou.com")
+        .header("Content-Type", "application/json")
+        .body(serialize_body(body, "歌单移除歌曲")?))
+}
+
+/// 上游 `module/playlist_tracks_add.js` 里 `data` 的单个条目。
+///
+/// 上游拿到的是 `歌名|hash|专辑id|album_audio_id` 拼成的串，再 `split('|')`
+/// 还原成对象；`album_id` / `mixsongid` 走 `Number(d[i] || 0)`。空串走 `|| 0`
+/// 得数字 `0`——写成字符串会改变 body 与签名。
+fn track_resource_entry(entry: &str) -> Value {
+    let fields: Vec<&str> = entry.split('|').collect();
+    let numeric = |index: usize| -> i64 {
+        fields
+            .get(index)
+            .filter(|value| !value.is_empty())
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0)
+    };
+
+    serde_json::json!({
+        "number": 1,
+        "name": fields.first().copied().unwrap_or(""),
+        "hash": fields.get(1).copied().unwrap_or(""),
+        "size": 0,
+        "sort": 0,
+        "timelen": 0,
+        "bitrate": 0,
+        "album_id": numeric(2),
+        "mixsongid": numeric(3),
+    })
+}
+
+/// 往歌单加歌的请求规格（上游 `module/playlist_tracks_add.js`，
+/// 路由 `/playlist/tracks/add`）。
+///
+/// `url` 自带 `cloudlist.service` 前缀，**没有 `x-router`**。`params` 只有
+/// `last_time` 与 `last_area`。条目串沿用 `NodeApi` 的 `encode_track_entry`
+/// 生成，再按上游规则拆回对象，保证两端提交的内容完全一致。
+pub(crate) fn playlist_tracks_add_endpoint(
+    list_id: i64,
+    payload: &str,
+    userid: Option<&str>,
+    token: Option<&str>,
+    clienttime: &str,
+) -> Result<Endpoint<'static>> {
+    // 上游 `(params.data || '').split(',')`：空串会得到 `['']` 一个条目，
+    // 这里保持一致（调用方已在空列表时提前返回）。
+    let entries: Vec<Value> = payload.split(',').map(track_resource_entry).collect();
+
+    let body = serde_json::json!({
+        "userid": userid_value(userid),
+        "token": token.unwrap_or(""),
+        "listid": list_id.to_string(),
+        "list_ver": 0,
+        "type": 0,
+        "slow_upload": 1,
+        "scene": "false;null",
+        "data": entries,
+    });
+
+    Ok(
+        Endpoint::post(GATEWAY_BASE, "/cloudlist.service/v6/add_song")
+            .header("Content-Type", "application/json")
+            .param("last_time", clienttime)
+            .param("last_area", "gztx")
+            .body(serialize_body(body, "歌单添加歌曲")?),
+    )
+}
+
+/// 删除歌单的请求规格（上游 `module/playlist_del.js`，路由 `/playlist/del`）。
+///
+/// 与其余三个写接口不同：body 是 AES-128-CBC 密文的 base64，`p` 是 PKCS#1 v1.5
+/// 加密后的大写 hex，`params` 还带一个 `signParamsKey(clienttime)` 的 `key`。
+/// 密钥与 RSA 填充由调用方注入，便于用固定输入做 KAT。
+pub(crate) fn playlist_del_endpoint(
+    kind: SourceKind,
+    list_id: i64,
+    userid: Option<&str>,
+    token: Option<&str>,
+    clienttime: &str,
+    aes_key: &str,
+    rsa_fill: &[u8],
+) -> Result<Endpoint<'static>> {
+    // `dataMap = {listid: Number(params.listid), total_ver: 0, type: 1}`：
+    // `listid` 是**数字**，与其余接口的字符串形态不同。
+    let plain = serde_json::to_string(&serde_json::json!({
+        "listid": list_id,
+        "total_ver": 0,
+        "type": 1,
+    }))
+    .map_err(|error| AppError::Other(format!("序列化待删歌单失败：{error}")))?;
+    let (encrypt_key, iv) = crate::api::native::crypto::playlist_key_material(aes_key);
+    let body = crate::api::native::crypto::aes_cbc_encrypt(&encrypt_key, &iv, plain.as_bytes())?;
+
+    let rsa_input = serde_json::to_string(&serde_json::json!({
+        "aes": aes_key,
+        "uid": userid_value(userid),
+        "token": token.unwrap_or(""),
+    }))
+    .map_err(|error| AppError::Other(format!("序列化 RSA 明文失败：{error}")))?;
+    let p = crate::api::native::crypto::pkcs1_v15_encrypt(kind, rsa_input.as_bytes(), rsa_fill)?
+        .to_uppercase();
+
+    Ok(Endpoint::post(GATEWAY_BASE, "/v2/delete_list")
+        .header("x-router", "cloudlist.service.kugou.com")
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .param("key", sign::sign_params_key(kind, clienttime, None, None))
+        .param("last_area", "gztx")
+        .param("last_time", clienttime)
+        .param("p", p)
+        .body(body))
+}
+
 /// `serde_json::to_string` 的错误信息要带上接口名——签名覆盖 body，序列化一旦
 /// 变了就全线 403，报错里能看出是哪个接口才有得查。
 fn serialize_body(body: Value, what: &str) -> Result<String> {
@@ -1128,30 +1320,112 @@ impl MusicApi for NativeApi {
             .ok_or_else(|| AppError::NotFound("`/register/dev` 未返回 dfid".to_string()))
     }
 
+    /// 上游 `module/playlist_tracks_add.js`（路由 `/playlist/tracks/add`）。
+    ///
+    /// 分批大小与 `NodeApi` 一致（服务端按逗号分隔多首，单次太多会被截断），
+    /// 逐批提交、逐批校验，任一批失败即返回错误（写接口不重试）。
     async fn add_tracks_to_playlist(
         &self,
         _source: SourceKind,
-        _list_id: i64,
-        _songs: &[Song],
+        list_id: i64,
+        songs: &[Song],
     ) -> Result<usize> {
-        Err(unimplemented("add_tracks_to_playlist"))
+        if songs.is_empty() {
+            return Ok(0);
+        }
+
+        let cookies = self.transport.cookie_map();
+        let userid = cookies.get("userid").map(String::as_str);
+        let token = cookies.get("token").map(String::as_str);
+        let mut written = 0usize;
+
+        for chunk in songs.chunks(WRITE_BATCH_SIZE) {
+            let payload = chunk
+                .iter()
+                .map(crate::api::cloud::encode_track_entry)
+                .collect::<Vec<_>>()
+                .join(",");
+            let clienttime = (crate::util::now_unix_millis() / 1000).to_string();
+
+            let endpoint =
+                playlist_tracks_add_endpoint(list_id, &payload, userid, token, &clienttime)?;
+            let root = self.transport.get_json_mutating(&endpoint, false).await?;
+            crate::api::node::NodeApi::check_write_result("/playlist/tracks/add", &root)?;
+
+            written += chunk.len();
+        }
+
+        Ok(written)
     }
 
+    /// 上游 `module/playlist_tracks_del.js`（路由 `/playlist/tracks/del`）。
+    ///
+    /// 只处理有 `file_id` 的歌——`fileid` 是歌单条目的标识，搜索结果里的歌没有它，
+    /// 传 hash 会静默删不掉。与 `NodeApi` 一致：没有可删的条目时返回 `0`。
     async fn remove_tracks_from_playlist(
         &self,
         _source: SourceKind,
-        _list_id: i64,
-        _songs: &[Song],
+        list_id: i64,
+        songs: &[Song],
     ) -> Result<usize> {
-        Err(unimplemented("remove_tracks_from_playlist"))
+        let file_ids: Vec<i64> = songs.iter().filter_map(|song| song.file_id).collect();
+        if file_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let cookies = self.transport.cookie_map();
+        let endpoint = playlist_tracks_del_endpoint(
+            list_id,
+            &file_ids,
+            cookies.get("userid").map(String::as_str),
+            cookies.get("token").map(String::as_str),
+        )?;
+        let root = self.transport.get_json_mutating(&endpoint, false).await?;
+        crate::api::node::NodeApi::check_write_result("/playlist/tracks/del", &root)?;
+
+        Ok(file_ids.len())
     }
 
-    async fn delete_playlist(&self, _source: SourceKind, _list_id: i64) -> Result<()> {
-        Err(unimplemented("delete_playlist"))
+    /// 上游 `module/playlist_del.js`（路由 `/playlist/del`）。
+    ///
+    /// 与 `NodeApi` 一致：**不校验 `error_code`**（这个接口成功时根本不返回它），
+    /// 但解密失败必须报错——否则「删掉了」会是假的。
+    async fn delete_playlist(&self, _source: SourceKind, list_id: i64) -> Result<()> {
+        let cookies = self.transport.cookie_map();
+        let clienttime = (crate::util::now_unix_millis() / 1000).to_string();
+        let aes_key = random_string(6, &mut random_f64).to_lowercase();
+        let rsa_fill = crate::api::native::crypto::random_fill();
+
+        let endpoint = playlist_del_endpoint(
+            self.kind(),
+            list_id,
+            cookies.get("userid").map(String::as_str),
+            cookies.get("token").map(String::as_str),
+            &clienttime,
+            &aes_key,
+            &rsa_fill,
+        )?;
+        let (_status, body) = self.transport.post_bytes(&endpoint).await?;
+
+        // 上游把响应体当 arraybuffer 收，再 `toString('base64')` 后走
+        // `playlistAesDecrypt`；这里拿到的已是原始字节，直接解密即可。
+        let (encrypt_key, iv) = crate::api::native::crypto::playlist_key_material(&aes_key);
+        crate::api::native::crypto::aes_cbc_decrypt(&encrypt_key, &iv, &body)?;
+        Ok(())
     }
 
-    async fn create_playlist(&self, _source: SourceKind, _name: &str) -> Result<Option<i64>> {
-        Err(unimplemented("create_playlist"))
+    /// 上游 `module/playlist_add.js`（路由 `/playlist/add`）。
+    async fn create_playlist(&self, _source: SourceKind, name: &str) -> Result<Option<i64>> {
+        let cookies = self.transport.cookie_map();
+        let endpoint = playlist_add_endpoint(
+            name,
+            cookies.get("userid").map(String::as_str),
+            cookies.get("token").map(String::as_str),
+        )?;
+        let root = self.transport.get_json_mutating(&endpoint, false).await?;
+        crate::api::node::NodeApi::check_write_result("/playlist/add", &root)?;
+
+        Ok(pick_i64(data_of(&root), &["listid", "list_id", "id"]))
     }
 }
 
@@ -1219,19 +1493,16 @@ mod tests {
 
     /// 阶段 1 的出口条件：尚未接入的方法必须明确报错，不能静默返回空。
     ///
-    /// 目录类与登录类接口在阶段 5c 已全部接入，剩下的占位是阶段 5d 的云歌单
-    /// 写接口，这里用其中一个当样本。
+    /// 目录类、登录类与云歌单写接口都已接入，剩下的占位是会员领取类，这里用
+    /// 其中一个当样本。
     #[tokio::test]
     async fn placeholder_reports_not_implemented() {
         let api = NativeApi::new(SourceKind::KugouConcept, None, None).unwrap();
-        let error = api
-            .create_playlist(SourceKind::KugouConcept, "x")
-            .await
-            .unwrap_err();
+        let error = api.claim_day_vip("2026-10-08").await.unwrap_err();
         let message = error.to_string();
         assert!(message.contains("尚未实现"), "实际：{message}");
         assert!(
-            message.contains("create_playlist"),
+            message.contains("claim_day_vip"),
             "要指出是哪个方法：{message}"
         );
     }
@@ -3244,5 +3515,328 @@ mod tests {
                 "{name} 的参数顺序与上游不一致"
             );
         }
+    }
+
+    /// 写接口的公共头（不含 axios 自己补的 `accept`/`content-length`/`host` 等）。
+    fn write_headers(content_type: &str, x_router: Option<&str>) -> Vec<(String, String)> {
+        let mut headers = vec![
+            ("Content-Type".to_string(), content_type.to_string()),
+            (
+                "User-Agent".to_string(),
+                "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi".to_string(),
+            ),
+            ("clienttime".to_string(), KAT_CLIENTTIME.to_string()),
+            ("dfid".to_string(), KAT_DFID.to_string()),
+            ("kg-rc".to_string(), "1".to_string()),
+            ("kg-rec".to_string(), "1".to_string()),
+            (
+                "kg-rf".to_string(),
+                "B9EDA08A64250DEFFBCADDEE00F8F25F".to_string(),
+            ),
+            ("kg-thash".to_string(), "5d816a0".to_string()),
+            ("mid".to_string(), KAT_MID.to_string()),
+        ];
+        if let Some(router) = x_router {
+            headers.push(("x-router".to_string(), router.to_string()));
+        }
+        headers.sort();
+        headers
+    }
+
+    /// `/playlist/add`：`url` 自带服务名前缀、**没有 `x-router`**，`type` 是字符串
+    /// `"0"` 所以 `params.type === 0` 不成立（`is_pri` 保持字面量 0、也没有额外 params）。
+    #[test]
+    fn playlist_add_endpoint_matches_kat() {
+        let standard =
+            playlist_add_endpoint("KATFIXTURE临时歌单", Some("10001"), Some("TOKENFIXTURE"))
+                .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://gateway.kugou.com/cloudlist.service/v5/add_list?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=702cbc34f583b49433be804aa93e1ca1"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::Kugou, &standard).as_deref(),
+            Some(
+                r#"{"userid":"10001","token":"TOKENFIXTURE","total_ver":0,"name":"KATFIXTURE临时歌单","type":"0","source":1,"is_pri":0,"list_create_gid":"","from_shupinmv":0}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            write_headers("application/json", None)
+        );
+
+        let lite = playlist_add_endpoint("KATFIXTURE临时歌单", Some("10001"), Some("TOKENFIXTURE"))
+            .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://gateway.kugou.com/cloudlist.service/v5/add_list?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=97786700579016edc87b047e8882e41b"#
+        );
+    }
+
+    /// `/playlist/tracks/add`：`params` 只有 `last_time`/`last_area`，条目由
+    /// `encode_track_entry` 生成的串拆回对象（`album_id`/`mixsongid` 是数字）。
+    #[test]
+    fn playlist_tracks_add_endpoint_matches_kat() {
+        let payload = "晴天|6af00fbd4d444a82c005843eef9dc2d4|1234567|8901234";
+        let standard = playlist_tracks_add_endpoint(
+            1234567890,
+            payload,
+            Some("10001"),
+            Some("TOKENFIXTURE"),
+            KAT_CLIENTTIME,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://gateway.kugou.com/cloudlist.service/v6/add_song?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&last_time=1700000000&last_area=gztx&signature=f1d71241e07abf1f5e0ab27a5f5cfbcf"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::Kugou, &standard).as_deref(),
+            Some(
+                r#"{"userid":"10001","token":"TOKENFIXTURE","listid":"1234567890","list_ver":0,"type":0,"slow_upload":1,"scene":"false;null","data":[{"number":1,"name":"晴天","hash":"6af00fbd4d444a82c005843eef9dc2d4","size":0,"sort":0,"timelen":0,"bitrate":0,"album_id":1234567,"mixsongid":8901234}]}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            write_headers("application/json", None)
+        );
+
+        let lite = playlist_tracks_add_endpoint(
+            1234567890,
+            payload,
+            Some("10001"),
+            Some("TOKENFIXTURE"),
+            KAT_CLIENTTIME,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://gateway.kugou.com/cloudlist.service/v6/add_song?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&last_time=1700000000&last_area=gztx&signature=98903612e61889b8467aeee46af8cc04"#
+        );
+    }
+
+    /// `/playlist/tracks/del`：入参全在 body，`fileid` 是数字、`listid` 是字符串。
+    #[test]
+    fn playlist_tracks_del_endpoint_matches_kat() {
+        let standard = playlist_tracks_del_endpoint(
+            1234567890,
+            &[111111, 222222],
+            Some("10001"),
+            Some("TOKENFIXTURE"),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://gateway.kugou.com/v4/delete_songs?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=6f3595773802fb5f2d9a61efcf1b9528"#
+        );
+        assert_eq!(
+            prepared_body(SourceKind::Kugou, &standard).as_deref(),
+            Some(
+                r#"{"listid":"1234567890","userid":"10001","data":[{"fileid":111111},{"fileid":222222}],"type":0,"token":"TOKENFIXTURE","list_ver":0}"#
+            )
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            write_headers("application/json", Some("cloudlist.service.kugou.com"))
+        );
+
+        let lite = playlist_tracks_del_endpoint(
+            1234567890,
+            &[111111, 222222],
+            Some("10001"),
+            Some("TOKENFIXTURE"),
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://gateway.kugou.com/v4/delete_songs?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&signature=64c5f16b6fd4e2a471498e70e513abe1"#
+        );
+    }
+
+    /// `/playlist/del`：body 是 AES-128-CBC 密文的 base64、`p` 是 PKCS#1 v1.5 的
+    /// 大写 hex，`params` 里还有一个 `signParamsKey(clienttime)` 的 `key`。
+    ///
+    /// 这里的 `p` 与 `/register/dev` 的 `KAT_REGISTER_P_STANDARD` 逐字节相同——两次
+    /// 独立录制的 RSA 明文与填充恰好一致，等于互证 `rsaEncrypt2` ≡ `pkcs1_v15_encrypt`；
+    /// lite 因为公钥不同而不同，另录在 `KAT_REGISTER_P_LITE`。
+    #[test]
+    fn playlist_del_endpoint_matches_kat() {
+        let standard = playlist_del_endpoint(
+            SourceKind::Kugou,
+            1234567890,
+            Some("10001"),
+            Some("TOKENFIXTURE"),
+            KAT_CLIENTTIME,
+            KAT_AES_KEY,
+            &KAT_RSA_FILL,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            format!(
+                r#"https://gateway.kugou.com/v2/delete_list?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&key=a1f65b6a8fe7e191521406ce8661ae02&last_area=gztx&last_time=1700000000&p={}&signature=d8a8c134f34c4d5f90309e5b4e310bc4"#,
+                KAT_REGISTER_P_STANDARD.to_uppercase()
+            )
+        );
+        assert_eq!(
+            prepared_body(SourceKind::Kugou, &standard).as_deref(),
+            Some("q8ZMTjdbAJWDzYu965aeVTFm6q84iSfX6OIzVo+/XbBgAEBcIC7D/P/AicQ0GVlh")
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            write_headers(
+                "application/x-www-form-urlencoded",
+                Some("cloudlist.service.kugou.com")
+            )
+        );
+
+        let lite = playlist_del_endpoint(
+            SourceKind::KugouConcept,
+            1234567890,
+            Some("10001"),
+            Some("TOKENFIXTURE"),
+            KAT_CLIENTTIME,
+            KAT_AES_KEY,
+            &KAT_RSA_FILL,
+        )
+        .unwrap();
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            format!(
+                r#"https://gateway.kugou.com/v2/delete_list?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&key=bad0ee207bf429bd91402b77fc8f7a5b&last_area=gztx&last_time=1700000000&p={}&signature=734d3d812f3d931bba5de83ee7f8a232"#,
+                KAT_REGISTER_P_LITE.to_uppercase()
+            )
+        );
+        assert_eq!(
+            prepared_body(SourceKind::KugouConcept, &lite).as_deref(),
+            Some("q8ZMTjdbAJWDzYu965aeVTFm6q84iSfX6OIzVo+/XbBgAEBcIC7D/P/AicQ0GVlh")
+        );
+    }
+
+    /// 写接口的参数顺序：`playlist_del` 与 `playlist_tracks_add` 在默认参数之后
+    /// 追加模块参数，`playlist_add`/`playlist_tracks_del` 不加。
+    #[test]
+    fn write_endpoints_keep_kat_param_order() {
+        let cases: Vec<(&str, Vec<&str>, Endpoint<'_>)> = vec![
+            (
+                "playlist_add",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "signature",
+                ],
+                playlist_add_endpoint("x", Some("10001"), Some("TOKENFIXTURE")).unwrap(),
+            ),
+            (
+                "playlist_del",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "key",
+                    "last_area",
+                    "last_time",
+                    "p",
+                    "signature",
+                ],
+                playlist_del_endpoint(
+                    SourceKind::KugouConcept,
+                    1234567890,
+                    Some("10001"),
+                    Some("TOKENFIXTURE"),
+                    KAT_CLIENTTIME,
+                    KAT_AES_KEY,
+                    &KAT_RSA_FILL,
+                )
+                .unwrap(),
+            ),
+            (
+                "playlist_tracks_add",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "last_time",
+                    "last_area",
+                    "signature",
+                ],
+                playlist_tracks_add_endpoint(
+                    1234567890,
+                    "x",
+                    Some("10001"),
+                    Some("TOKENFIXTURE"),
+                    KAT_CLIENTTIME,
+                )
+                .unwrap(),
+            ),
+            (
+                "playlist_tracks_del",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "signature",
+                ],
+                playlist_tracks_del_endpoint(1234567890, &[1], Some("10001"), Some("TOKENFIXTURE"))
+                    .unwrap(),
+            ),
+        ];
+
+        for (name, expected, endpoint) in cases {
+            assert_eq!(
+                prepared_param_order(SourceKind::KugouConcept, &endpoint),
+                expected,
+                "{name} 的参数顺序与上游不一致"
+            );
+        }
+    }
+
+    /// 上游 `params?.userid || params?.cookie?.userid || 0`：字符串 `"0"` 是 truthy，
+    /// 只有空串/缺省才落到数字 `0`。这个差别会进 body 与签名，写错不报错。
+    #[test]
+    fn userid_value_matches_javascript_truthiness() {
+        assert_eq!(userid_value(Some("10001")), Value::String("10001".into()));
+        assert_eq!(userid_value(Some("0")), Value::String("0".into()));
+        assert_eq!(userid_value(Some("")), Value::from(0));
+        assert_eq!(userid_value(None), Value::from(0));
+    }
+
+    /// `/playlist/del` 的响应**没有 `error_code`**，`check_write_result` 会放过它；
+    /// 但解密失败必须报错，否则「删掉了」是假的。这里锁住解密失败这条路径。
+    #[test]
+    fn delete_playlist_fails_when_response_cannot_be_decrypted() {
+        // 用错误的密钥解同一段密文：CryptoJS 语义下不校验填充，但块数不足会报错。
+        let body = crate::api::native::crypto::base64_decode(
+            "q8ZMTjdbAJWDzYu965aeVTFm6q84iSfX6OIzVo+/XbBgAEBcIC7D/P/AicQ0GVlh",
+        )
+        .unwrap();
+        let (key, iv) = crate::api::native::crypto::playlist_key_material("wrong1");
+        let plain = crate::api::native::crypto::aes_cbc_decrypt(&key, &iv, &body).unwrap();
+        // 填充不校验，所以这里不 panic，只是解出垃圾——与上游一致。
+        assert_eq!(plain.len(), body.len());
+
+        // 真正的失败路径：长度不是块大小整数倍。
+        assert!(crate::api::native::crypto::aes_cbc_decrypt(&key, &iv, &body[..7]).is_err());
     }
 }
