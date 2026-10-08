@@ -352,7 +352,7 @@ impl NodeApi {
     ///
     /// 另外这些错误码**没有**附带描述（没有 `error_msg`），所以这里把实测遇到的
     /// 几个翻译成人话，别让用户对着一串数字猜。
-    fn check_write_result(path: &str, root: &Value) -> Result<()> {
+    pub(crate) fn check_write_result(path: &str, root: &Value) -> Result<()> {
         let Some(code) = root.get("error_code").and_then(Value::as_i64) else {
             return Ok(());
         };
@@ -498,7 +498,7 @@ impl NodeApi {
 ///
 /// 歌名里混入 `|` 或 `,` 会破坏分隔结构（用户搜到的歌名完全可能带逗号），
 /// 所以先做替换。
-fn encode_track_entry(song: &Song) -> String {
+pub(crate) fn encode_track_entry(song: &Song) -> String {
     let safe_name = song.name.replace(['|', ','], " ");
     format!(
         "{}|{}|{}|{}",
