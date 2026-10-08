@@ -47,6 +47,10 @@ use crate::source::SourceKind;
 use super::crypto::md5_hex;
 
 /// `util/config.json` 的 `srcappid`。
+///
+/// 迁移范围内的 26 个接口都不用它（二维码登录的两个走 `encryptType: 'web'`
+/// 且自己带 `srcappid` 参数），留到阶段 5 接登录时用。
+#[allow(dead_code)]
 pub const SRCAPPID: u32 = 2919;
 
 /// 标准版签名盐（`util/helper.js` 内联字面量）。
@@ -59,6 +63,7 @@ const ANDROID_SALT_LITE: &str = "LnT6xpN3khm36zse0QzvmgTZ3waWdRSA";
 const WEB_SALT: &str = "NVPh5oo715z5DIWAeQlhMDsWXXQV4hwt";
 
 /// `signParams` 盐。**与平台无关**。
+#[allow(dead_code)]
 const SIGN_PARAMS_SALT: &str = "R6snCXJgbCaj9WFRJKefTMIFp0ey6Gza";
 
 /// `signKey` 标准版盐。
@@ -217,6 +222,7 @@ pub fn signature_register_params(params: &BTreeMap<String, ParamValue>) -> Strin
 /// 拼接格式是 `key` 与 `value` **直接相接、无等号**。
 /// **不区分平台。**（迁移范围内的 26 个接口都没用它，这里一并移植并锁定，
 /// 免得将来接 `user_cloud_url` 之类时再回头翻上游。）
+#[allow(dead_code)]
 pub fn sign_params(params: &BTreeMap<String, ParamValue>, data: &[u8]) -> String {
     let mut pairs: Vec<String> = params
         .iter()
@@ -256,6 +262,9 @@ pub fn sign_key(
 /// 参数密钥签名。对应上游 `signParamsKey(data, appid, clientver)`。
 ///
 /// `appid` / `clientver` 为 `None` 时落到当前平台的值。
+///
+/// 阶段 5 的云端写接口（`/playlist/del` 等）要用它。
+#[allow(dead_code)]
 pub fn sign_params_key(
     kind: SourceKind,
     data: &str,

@@ -110,8 +110,10 @@ impl ApiClient {
     }
 
     /// 构造内嵌后端。`kind` 决定平台盐值与 `appid`。
-    pub fn native(kind: SourceKind, cookie: Option<String>) -> Self {
-        Self::Native(NativeApi::new(kind, cookie))
+    ///
+    /// `proxy` 与 Node 后端同源——native 直连酷狗网关，同样需要走用户配的代理。
+    pub fn native(kind: SourceKind, cookie: Option<String>, proxy: Option<&str>) -> Result<Self> {
+        Ok(Self::Native(NativeApi::new(kind, cookie, proxy)?))
     }
 
     /// 按配置选后端。**这是全程序构造客户端的唯一入口**。
@@ -126,7 +128,7 @@ impl ApiClient {
         proxy: Option<&str>,
     ) -> Result<Self> {
         match backend.effective_for(kind) {
-            ApiBackend::Native => Ok(Self::native(kind, cookie)),
+            ApiBackend::Native => Self::native(kind, cookie, proxy),
             ApiBackend::Node => Self::new(base, cookie, proxy),
         }
     }
