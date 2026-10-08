@@ -29,6 +29,7 @@ node tools/kat/kat_rsa.js       # PKCS1 v1.5（注入固定填充）、公钥 n/
 node tools/kat/kat_device.js    # randomString / getGuid / calculateMid（注入固定 Math.random）
 node tools/kat/kat_notsign.js   # 截获 song_url / search_lyric 真实 options，复算签名
 node tools/kat/kat_object_order.js  # 对象型参数值的 JSON 键序（preserve_order 的依据）
+node tools/kat/kat_aes.js       # AES-128-CBC+PKCS7 与 /register/dev 的整份请求
 node tools/kat/kat_request.js       # 固定时间与随机，录 request.js 构造出的整份请求
 node tools/kat/probe_outbound.js    # 录真实出站请求：URL / 参数 / 头
 node tools/kat/probe_outbound.js lite   # 只跑 lite 平台
@@ -45,6 +46,7 @@ node tools/kat/probe_outbound.js lite   # 只跑 lite 平台
 | `kat_device.js` | `src/api/native/device.rs` | 替换 `Math.random` 为固定序列，锁定 `randomString`/`getGuid` |
 | `kat_notsign.js` | `src/api/native/sign.rs` | 假 `useAxios` 截获 `module/song_url.js`、`module/search_lyric.js` 真正发出的整份参数 |
 | `kat_object_order.js` | `src/api/native/sign.rs` | 对象型参数值的键序：证明上游用插入序而非字典序 |
+| `kat_aes.js` | `src/api/native/crypto.rs`、`mod.rs` | 钉死 `Math.random`/`Date.now`/`forge.random.getBytes`，录 `playlistAesEncrypt` 的加解密与 `/register/dev` 的整份请求 |
 | `kat_request.js` | `src/api/native/transport.rs`、`mod.rs` | 钉死 `Date.now`/`Math.random`，录 `request.js` 构造出的 URL/参数/头/body，供逐字节断言 |
 | `probe_outbound.js` | `src/api/native/`（网络层） | 本地假 gateway 录真实出站请求，供 native 逐项对齐 |
 
@@ -95,3 +97,14 @@ curl -s "http://127.0.0.1:3001/lyric?id=<lyric_id>&accesskey=<accesskey>&fmt=krc
 - **参数顺序即签名输入**：`signatureAndroidParams` 先 `sort(key)` 再
   `.map(\`${k}=${v}\`)`；`signatureWebParams` 先 `.map(\`${k}=${v}\`)` 再
   `.sort()`（排的是渲染串，不是 key）。两者顺序不同，别写反。
+- **`playlistAesEncrypt` 的密钥与 IV 是十六进制字符本身**：`cryptoMd5(key)`
+  的前 16 与后 16 个字符直接当字节用（`utf8WordArray` 对字符串走
+  `CryptoJS.enc.Utf8.parse`），**不是** hex 解码后的 8 字节。写错不报错，
+  只是密文全错、服务端解不出来。
+- **`kat_aes.js` 的假 axios 必须用模块自己将生成的 key 加密响应**：模块进来
+  第一件事就是 `playlistAesEncrypt(dataMap)` 里的 `randomString(6)`，中间没有
+  其它随机消费，所以先按同一随机序列算出 `moduleKey`，用它加密响应，再把
+  `randomIndex` 复位去调模块。否则模块拿自己的 key 解别人的密文，报的是
+  `RangeError: Invalid typed array length: -65`，而不是「解密失败」。
+- **node 侧复核 AES 要 `setAutoPadding(false)`**：`createCipheriv` 默认自带
+  PKCS#7，会再补一整块，密文与上游对不上而且不报错。
