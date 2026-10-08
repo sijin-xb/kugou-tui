@@ -28,6 +28,9 @@ node tools/kat/kat_gen.js       # 三套签名、signKey/signParamsKey、裸 RSA
 node tools/kat/kat_rsa.js       # PKCS1 v1.5（注入固定填充）、公钥 n/e/bitLength
 node tools/kat/kat_device.js    # randomString / getGuid / calculateMid（注入固定 Math.random）
 node tools/kat/kat_notsign.js   # 截获 song_url / search_lyric 真实 options，复算签名
+node tools/kat/kat_object_order.js  # 对象型参数值的 JSON 键序（preserve_order 的依据）
+node tools/kat/probe_outbound.js    # 录真实出站请求：URL / 参数 / 头
+node tools/kat/probe_outbound.js lite   # 只跑 lite 平台
 ```
 
 各脚本把结果以 JSON 打到 stdout，Rust 侧对应测试的期望值就是从这里抄进去的。
@@ -40,6 +43,13 @@ node tools/kat/kat_notsign.js   # 截获 song_url / search_lyric 真实 options�
 | `kat_rsa.js` | `src/api/native/crypto.rs` | 把 `forge.random.getBytes` 换成 `[0x01..0x10]` 循环，让 PKCS1 填充可复现 |
 | `kat_device.js` | `src/api/native/device.rs` | 替换 `Math.random` 为固定序列，锁定 `randomString`/`getGuid` |
 | `kat_notsign.js` | `src/api/native/sign.rs` | 假 `useAxios` 截获 `module/song_url.js`、`module/search_lyric.js` 真正发出的整份参数 |
+| `kat_object_order.js` | `src/api/native/sign.rs` | 对象型参数值的键序：证明上游用插入序而非字典序 |
+| `probe_outbound.js` | `src/api/native/`（网络层） | 本地假 gateway 录真实出站请求，供 native 逐项对齐 |
+
+`probe_outbound.js` 的注入身份是 `server.js:230-266` 中间件那组 cookie：
+`KUGOU_API_MID = calculateMid(guid)`、`KUGOU_API_GUID`、`KUGOU_API_DEV`、
+`KUGOU_API_MAC`、`KUGOU_API_WEBGL`、`dfid`。`Math.random` 同样被固定，
+否则 `song_url` 内部的 `randomString(24)` 每次不一样，无法比对。
 
 `krc_probe.json` 是 `kat_notsign.js` 之外的一份真实 `/lyric` 响应样本，
 `krc.rs` 的解密 KAT 用的是它的 `content` 字段（逐字歌词、含 `[language:]` 标签）。
