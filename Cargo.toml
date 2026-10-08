@@ -132,6 +132,11 @@ ratatui-image = { version = "11.1.0", default-features = false, features = [
 # `resample.rs` 编译掉。
 rubato = "=0.16.2"
 
+# 内嵌 API（`--api native`）用：上游签名与设备指纹全部基于 MD5，
+# `calculateMid` 还要把 128 位摘要当大整数转十进制。lib 名是 `md5`。
+md-5 = "0.10"
+num-bigint = "0.4"
+
 # ======================================================================
 # 平台相关依赖
 #
