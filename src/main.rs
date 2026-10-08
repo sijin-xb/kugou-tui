@@ -165,10 +165,15 @@ fn main() -> anyhow::Result<()> {
         // native 后端没有「服务」这个东西，`--api-start` 的语义（把服务留在后台
         // 常驻）无从谈起。明确说清而不是打印一句「已就绪」——那会让用户以为
         // 后台真有个进程，下次启动时又找不到。
+        //
+        // 走 stderr 而不是 stdout：这条是「你要的东西不存在」的说明，不是成功
+        // 输出。stdout 上那句「接口服务已就绪：<地址>」是给脚本抓地址用的，
+        // native 下不该往同一个流里塞一句格式类似但没有地址的话。退出码仍是 0
+        // ——这不是错误，只是无事可做。
         if config.api_backend.effective_for(config.active_source_kind())
             == crate::api::ApiBackend::Native
         {
-            println!(
+            eprintln!(
                 "当前后端为 native：{} 的接口在进程内实现，没有需要常驻的本机服务。",
                 config.active_source_kind().label()
             );
