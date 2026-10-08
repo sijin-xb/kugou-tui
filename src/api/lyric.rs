@@ -21,101 +21,132 @@
 use base64::Engine;
 use serde_json::Value;
 
-use crate::api::node::NodeApi;
 use crate::api::data_of;
 use crate::api::model::{Lyric, LyricLine, LyricWord, Song, pick_string};
+use crate::api::node::NodeApi;
 use crate::error::{AppError, Result};
 
-impl NodeApi {
-    /// 取某首歌的歌词。
-    ///
-    /// # 为什么要试多个候选
-    ///
-    /// 同一个 hash 酷狗往往提供多个 KRC 变体：**有的只带罗马音，有的带真正的中文译文**。
-    /// 只取第一个的话，日语歌很容易拿到罗马音版——界面就显示成一串拼音，等于没有翻译。
-    ///
-    /// 所以这里遍历候选，优先采用「[language:] 里有 CJK 译文」的那个；
-    /// 都没有才退回第一个能解析出内容的。
-    pub async fn fetch_lyric(&self, song: &Song) -> Result<Lyric> {
-        let candidates = self.find_lyric_candidates(song).await?;
-        if candidates.is_empty() {
-            return Err(AppError::NotFound(format!("未找到《{}》的歌词", song.name)));
-        }
+/// 取歌词要用的两个上游请求。两个后端各自实现：`NodeApi` 打本机服务，
+/// `NativeApi` 直连 `lyrics.kugou.com`。**取歌词的算法本身只此一份**，
+/// 见 [`fetch_lyric_via`]。
+///
+/// 与 [`crate::api::catalog::StreamSource`] 同样的分层：只抽象到「发哪一个请求」，
+/// 不抽象参数拼装——native 要签名、要 `clearDefaultParams`，硬凑共同签名只会
+/// 两边都别扭。
+#[allow(async_fn_in_trait)] // 与 MusicApi 一致：只用泛型静态分发，不做 dyn
+pub(crate) trait LyricSource {
+    /// 第一步：按 hash 找歌词候选，返回 `/search/lyric` 的原始响应。
+    async fn search_lyric(&self, song: &Song) -> Result<Value>;
 
-        let mut fallback: Option<Lyric> = None;
+    /// 第二步：按候选的 `(id, accesskey)` 取歌词正文。
+    ///
+    /// 返回**原始响应体**（可能是 JSON，也可能是纯文本），由 [`fetch_lyric_via`]
+    /// 统一解释。native 在这一步就把 KRC 解好并写进 `decodeContent`，
+    /// 与 Node 服务端 `module/lyric.js` 的 `decode` 分支等价。
+    async fn lyric_body(&self, lyric_id: &str, access_key: &str) -> Result<String>;
+}
 
-        for (lyric_id, access_key) in candidates {
-            let query = [
-                ("id", lyric_id),
-                ("accesskey", access_key),
+impl LyricSource for NodeApi {
+    async fn search_lyric(&self, song: &Song) -> Result<Value> {
+        self.get_json(
+            "/search/lyric",
+            &[
+                ("hash", song.hash.clone()),
+                (
+                    "keywords",
+                    format!("{} - {}", song.singer_text(), song.name),
+                ),
+                ("duration", song.duration_ms.to_string()),
+                ("man", "yes".to_string()),
+            ],
+        )
+        .await
+    }
+
+    async fn lyric_body(&self, lyric_id: &str, access_key: &str) -> Result<String> {
+        self.get_text(
+            "/lyric",
+            &[
+                ("id", lyric_id.to_string()),
+                ("accesskey", access_key.to_string()),
                 // 必须是 krc：翻译与音译只在 KRC 的 [language:] 标签里，lrc 没有。
                 ("fmt", "krc".to_string()),
                 ("decode", "true".to_string()),
                 ("charset", "utf8".to_string()),
-            ];
+            ],
+        )
+        .await
+    }
+}
 
-            // 该接口在 `decode=true` 下返回 JSON；偶尔直接吐纯文本，两种都接住。
-            let body = match self.get_text("/lyric", &query).await {
-                Ok(body) => body,
-                Err(_) => continue, // 这个候选取不到，试下一个
-            };
-            let text = match serde_json::from_str::<Value>(&body) {
-                Ok(root) => {
-                    if crate::api::model::check_error_code("/lyric", &root).is_err() {
-                        continue;
-                    }
-                    extract_lyric_text(&root)
+/// 取某首歌歌词的共享实现。
+///
+/// # 为什么要试多个候选
+///
+/// 同一个 hash 酷狗往往提供多个 KRC 变体：**有的只带罗马音，有的带真正的中文译文**。
+/// 只取第一个的话，日语歌很容易拿到罗马音版——界面就显示成一串拼音，等于没有翻译。
+///
+/// 所以这里遍历候选，优先采用「[language:] 里有 CJK 译文」的那个；
+/// 都没有才退回第一个能解析出内容的。
+///
+/// # 取不到歌词不是错误路径
+///
+/// 上游 `decodeLyrics` 解不开 KRC 时返回空字符串（不抛异常），空文本解析出空歌词，
+/// 这个候选被跳过，最终走到「歌词为空」。native 的 `krc::decode` 返回 `Err`，
+/// 但调用点在写 `decodeContent` 时把 `Err` 折成空串（见
+/// [`crate::api::native::inject_decoded_lyric`]），所以两端的最终表现一致：
+/// 都是 `AppError::NotFound`，界面只记一条 WARN，不弹错误、不影响播放。
+pub(crate) async fn fetch_lyric_via<S: LyricSource>(source: &S, song: &Song) -> Result<Lyric> {
+    let root = source.search_lyric(song).await?;
+
+    let candidates = crate::api::extract_list(&root, &["candidates"], |value| {
+        let id = pick_string(value, &["id", "lyric_id"])?;
+        let access_key = pick_string(value, &["accesskey", "access_key"])?;
+        Some((id, access_key))
+    });
+    // `man=yes` 才会返回多个版本。上限 6 个：再往后质量通常更差，
+    // 而每多一个候选就多一次请求。
+    let candidates: Vec<(String, String)> = candidates.into_iter().take(6).collect();
+
+    if candidates.is_empty() {
+        return Err(AppError::NotFound(format!("未找到《{}》的歌词", song.name)));
+    }
+
+    let mut fallback: Option<Lyric> = None;
+
+    for (lyric_id, access_key) in candidates {
+        // 该接口在 `decode=true` 下返回 JSON；偶尔直接吐纯文本，两种都接住。
+        let body = match source.lyric_body(&lyric_id, &access_key).await {
+            Ok(body) => body,
+            Err(_) => continue, // 这个候选取不到，试下一个
+        };
+        let text = match serde_json::from_str::<Value>(&body) {
+            Ok(root) => {
+                if crate::api::model::check_error_code("/lyric", &root).is_err() {
+                    continue;
                 }
-                Err(_) => body,
-            };
+                extract_lyric_text(&root)
+            }
+            Err(_) => body,
+        };
 
-            let mut lyric = parse_lrc(&text);
-            if lyric.is_empty() {
-                continue;
-            }
-            attach_translations(&mut lyric, &text);
-
-            // 命中「有 CJK 译文」的候选，直接用它
-            if translation_block_has_cjk(&text) {
-                return Ok(lyric);
-            }
-            // 否则留作兜底（只留第一个，避免覆盖成更差的）
-            if fallback.is_none() {
-                fallback = Some(lyric);
-            }
+        let mut lyric = parse_lrc(&text);
+        if lyric.is_empty() {
+            continue;
         }
+        attach_translations(&mut lyric, &text);
 
-        fallback.ok_or_else(|| AppError::NotFound(format!("《{}》的歌词为空", song.name)))
+        // 命中「有 CJK 译文」的候选，直接用它
+        if translation_block_has_cjk(&text) {
+            return Ok(lyric);
+        }
+        // 否则留作兜底（只留第一个，避免覆盖成更差的）
+        if fallback.is_none() {
+            fallback = Some(lyric);
+        }
     }
 
-    /// 第一步：按 hash 找到歌词候选，拿到若干 `(id, accesskey)`。
-    ///
-    /// `man=yes` 才会返回多个版本。上限 6 个：再往后质量通常更差，
-    /// 而每多一个候选就多一次请求。
-    async fn find_lyric_candidates(&self, song: &Song) -> Result<Vec<(String, String)>> {
-        let root = self
-            .get_json(
-                "/search/lyric",
-                &[
-                    ("hash", song.hash.clone()),
-                    (
-                        "keywords",
-                        format!("{} - {}", song.singer_text(), song.name),
-                    ),
-                    ("duration", song.duration_ms.to_string()),
-                    ("man", "yes".to_string()),
-                ],
-            )
-            .await?;
-
-        let candidates = crate::api::extract_list(&root, &["candidates"], |value| {
-            let id = pick_string(value, &["id", "lyric_id"])?;
-            let access_key = pick_string(value, &["accesskey", "access_key"])?;
-            Some((id, access_key))
-        });
-
-        Ok(candidates.into_iter().take(6).collect())
-    }
+    fallback.ok_or_else(|| AppError::NotFound(format!("《{}》的歌词为空", song.name)))
 }
 
 /// `[language:]` 里是否存在**真正的 CJK 译文**块（而不是只有罗马音）。
@@ -975,4 +1006,74 @@ mod tests {
         };
         assert!(reversed.progress_at(1500).is_finite());
     }
+
+    /// 解不开的候选要被**跳过并继续**，不能把整首歌的歌词判死。
+    ///
+    /// 上游 `decodeLyrics` 解不开时返回空字符串；native 的 `krc::decode` 返回 `Err`，
+    /// 但 `inject_decoded_lyric` 把它折成空串，于是这个候选解析出空歌词、`continue`，
+    /// 后面的候选照样有机会——这正是两端表现一致的地方。
+    ///
+    /// 这里用一个假的 `LyricSource` 直接锁住 `fetch_lyric_via` 的控制流：
+    /// 第一个候选正文解不出内容，第二个候选是好的，结果必须是第二个的歌词。
+    struct FakeLyricSource {
+        bodies: Vec<String>,
+    }
+
+    impl LyricSource for FakeLyricSource {
+        async fn search_lyric(&self, _song: &Song) -> Result<Value> {
+            Ok(json!({
+                "status": 1,
+                "candidates": [
+                    {"id": "bad", "accesskey": "k1"},
+                    {"id": "good", "accesskey": "k2"},
+                ],
+            }))
+        }
+
+        async fn lyric_body(&self, lyric_id: &str, _access_key: &str) -> Result<String> {
+            let index = if lyric_id == "bad" { 0 } else { 1 };
+            Ok(self.bodies[index].clone())
+        }
+    }
+
+    fn fake_song() -> Song {
+        Song {
+            name: "测试曲".to_string(),
+            hash: "deadbeef".to_string(),
+            duration_ms: 1000,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn undecodable_candidate_is_skipped_and_next_one_is_used() {
+        let source = FakeLyricSource {
+            bodies: vec![
+                // 第一个：JSON 合法但解不出歌词（等价于 KRC 解密失败折成空串）
+                json!({"status": 200, "contenttype": 0, "decodeContent": ""}).to_string(),
+                // 第二个：正常歌词
+                json!({"status": 200, "decodeContent": "[0,1000]好歌词\n"}).to_string(),
+            ],
+        };
+
+        let lyric = fetch_lyric_via(&source, &fake_song()).await.unwrap();
+        assert_eq!(lyric.lines.len(), 1);
+        assert_eq!(lyric.lines[0].text, "好歌词");
+    }
+
+    /// 所有候选都解不出内容时，最终是 `NotFound`（不是 panic、不是空歌词对象）——
+    /// 界面据此只记一条 WARN，播放不受影响。
+    #[tokio::test]
+    async fn all_undecodable_candidates_end_as_not_found() {
+        let source = FakeLyricSource {
+            bodies: vec![
+                json!({"status": 200, "decodeContent": ""}).to_string(),
+                json!({"status": 200, "decodeContent": ""}).to_string(),
+            ],
+        };
+
+        let error = fetch_lyric_via(&source, &fake_song()).await.unwrap_err();
+        assert!(error.to_string().contains("歌词为空"), "实际：{error}");
+    }
 }
+

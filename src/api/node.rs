@@ -161,7 +161,7 @@ impl MusicApi for NodeApi {
     }
 
     async fn fetch_lyric(&self, song: &Song) -> Result<Lyric> {
-        NodeApi::fetch_lyric(self, song).await
+        crate::api::lyric::fetch_lyric_via(self, song).await
     }
 
     async fn login_qr_key(&self) -> Result<String> {
