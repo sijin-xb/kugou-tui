@@ -9,12 +9,11 @@
 //! `NodeApi` 的一个优势：`module/song_url.js` 里那些 `isLite` 分支依赖
 //! `process.env.platform`，客户端根本看不到，而这里可以直接按平台取对的那一支。
 
-// 尚未接入网络的底层纯函数。`sign` 与 `device` 已被 `transport` 用上，
-// 不再需要 allow；`crypto`（RSA/AES）与 `krc`（歌词解密）分别等阶段 5、阶段 4。
+// 尚未接入网络的底层纯函数。`sign`/`device`/`krc` 都已被用上，不再需要 allow；
+// `crypto`（RSA/AES）等阶段 5 的设备注册与云端歌单。
 #[allow(dead_code)]
 pub mod crypto;
 pub mod device;
-#[allow(dead_code)]
 pub mod krc;
 pub mod sign;
 pub mod transport;
@@ -24,7 +23,7 @@ use crate::api::cloud::{QrCheck, UserInfo, VipInfo};
 use crate::api::data_of;
 use crate::api::model::{Artist, Lyric, Playlist, RankBoard, Song, extract_songs};
 use crate::api::native::device::random_string;
-use crate::api::native::transport::{Endpoint, GATEWAY_BASE, Transport};
+use crate::api::native::transport::{Endpoint, GATEWAY_BASE, LYRICS_BASE, Transport};
 use crate::api::traits::MusicApi;
 use crate::error::{AppError, Result};
 use crate::source::SourceKind;
@@ -203,6 +202,125 @@ pub(crate) fn song_url_endpoint(
         .encrypt_key()
 }
 
+/// 上游 `module/search_lyric.js` 的请求规格（路由 `/search/lyric`）。
+///
+/// 这个模块带 `clearDefaultParams: true`，所以 `dfid`/`mid`/`uuid`/`appid`/
+/// `clientver`/`clienttime` 全部不进参数（也不进签名）——`appid`/`clientver`
+/// 由模块自己按平台写进 `dataMap`。注意 `module/search_lyric.js` 里的
+/// `notSign: true` 是**死参数**（`util/request.js:126` 读的是 `notSignature`），
+/// 所以照常带 android 签名。
+pub(crate) fn search_lyric_endpoint(
+    kind: SourceKind,
+    song: &Song,
+) -> Endpoint<'static> {
+    Endpoint::get(LYRICS_BASE, "/v1/search")
+        .clear_defaults()
+        .param("album_audio_id", "0")
+        .param("appid", sign::appid(kind).to_string())
+        .param("clientver", sign::clientver(kind).to_string())
+        .param("duration", song.duration_ms.to_string())
+        .param("hash", song.hash.clone())
+        .param("keyword", format!("{} - {}", song.singer_text(), song.name))
+        .param("lrctxt", "1")
+        .param("man", "yes")
+}
+
+/// 上游 `module/lyric.js` 的请求规格（路由 `/lyric`）。
+///
+/// 与 `/search/lyric` 不同，这个模块**没有** `clearDefaultParams`，所以走的是
+/// 标准默认参数（含登录态的 `token`/`userid`），头里也带 `clienttime`。
+pub(crate) fn lyric_endpoint(lyric_id: &str, access_key: &str) -> Endpoint<'static> {
+    Endpoint::get(LYRICS_BASE, "/download")
+        .param("ver", "1")
+        .param("client", "android")
+        .param("id", lyric_id)
+        .param("accesskey", access_key)
+        // 必须是 krc：译文与逐字时间戳只在 KRC 里有。
+        .param("fmt", "krc")
+        .param("charset", "utf8")
+}
+
+/// 把 `/lyric` 响应里的 `content` 就地解成 `decodeContent`。
+///
+/// 等价于上游 `module/lyric.js` 的 `decode` 分支：
+/// ```js
+/// res.body['decodeContent'] = params?.fmt == 'lrc' || Number(res.body?.contenttype) !== 0
+///   ? Buffer.from(content, 'base64').toString()
+///   : decodeLyrics(content);
+/// ```
+/// **`contenttype !== 0` 时是 base64 而不是 KRC**——少了这个分支，那种响应会被
+/// 当成 KRC 解，得到一片乱码而不是报错。
+///
+/// 解密失败时**写空串**而不是返回 `Err`：上游 `decodeLyrics` 解不开就
+/// `return ''`，空文本解析出空歌词、候选被跳过，最终是「未找到歌词」而不是
+/// 一个错误。这里对齐同一语义，两端的用户可见行为才一致。
+///
+/// `decode=false`（本项目不用）时上游会把 `content` 原样留下，这里同理什么都不做。
+pub(crate) fn inject_decoded_lyric(root: &mut Value) {
+    // 与 `lyric::extract_lyric_text` 的 `data_of` 取同一层：有 `data` 对象就写进
+    // `data`，否则写进根。
+    let target = if root.get("data").is_some_and(Value::is_object) {
+        root.get_mut("data")
+    } else {
+        Some(root)
+    };
+    let Some(object) = target.and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(content) = object.get("content").and_then(Value::as_str) else {
+        return;
+    };
+    let content = content.to_string();
+
+    // `Number(undefined) !== 0` 为真 → 缺 contenttype 时走 base64 分支。
+    let contenttype = object
+        .get("contenttype")
+        .and_then(crate::api::model::value_to_i64)
+        .unwrap_or(-1);
+    let decoded = if contenttype != 0 {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(content.trim())
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .unwrap_or_default()
+    } else {
+        crate::api::native::krc::decode(&content).unwrap_or_default()
+    };
+
+    object.insert("decodeContent".to_string(), Value::String(decoded));
+}
+
+/// `NativeApi` 的歌词实现。
+///
+/// 算法在 [`crate::api::lyric::fetch_lyric_via`]，与 `NodeApi` **共用同一份**；
+/// 这里只负责把两个请求按上游规则拼出来，并在下载那步本地解密 KRC
+/// （`NodeApi` 是把 `decode=true` 交给本机 Node 服务去做）。
+impl crate::api::lyric::LyricSource for NativeApi {
+    async fn search_lyric(&self, song: &Song) -> Result<Value> {
+        let endpoint = search_lyric_endpoint(self.kind(), song);
+        // `NodeApi` 这条路走的是 `get_json`（带缓存、不加 timestamp），
+        // 所以这里也传 `cached = true`，两端的请求条数才一致。
+        self.transport.get_json(&endpoint, true).await
+    }
+
+    async fn lyric_body(&self, lyric_id: &str, access_key: &str) -> Result<String> {
+        let endpoint = lyric_endpoint(lyric_id, access_key);
+        let body = self.transport.get_text(&endpoint, true).await?;
+
+        // `/lyric` 在 `decode=true` 下返回 JSON，偶尔直接吐纯文本；两种都接住，
+        // 与 `fetch_lyric_via` 的解释方式保持一致。
+        match serde_json::from_str::<Value>(&body) {
+            Ok(mut root) => {
+                inject_decoded_lyric(&mut root);
+                serde_json::to_string(&root)
+                    .map_err(|error| AppError::Other(format!("序列化歌词响应失败：{error}")))
+            }
+            Err(_) => Ok(body),
+        }
+    }
+}
+
 /// `NativeApi` 的取流实现。
 ///
 /// 算法在 [`resolve_stream_url`]，与 `NodeApi` **共用同一份**；这里只负责把
@@ -295,8 +413,8 @@ impl MusicApi for NativeApi {
         Err(unimplemented("rank_tracks_all"))
     }
 
-    async fn fetch_lyric(&self, _song: &Song) -> Result<Lyric> {
-        Err(unimplemented("fetch_lyric"))
+    async fn fetch_lyric(&self, song: &Song) -> Result<Lyric> {
+        crate::api::lyric::fetch_lyric_via(self, song).await
     }
 
     async fn login_qr_key(&self) -> Result<String> {
@@ -585,5 +703,161 @@ mod tests {
         assert_eq!(first.len(), 24);
         assert_eq!(second.len(), 24);
         assert_ne!(first, second, "两次调用不该拿到同一个 dfid");
+    }
+
+    /// 阶段 4 出口：歌词搜索 URL 与上游逐字节一致。
+    ///
+    /// 这个端点带 `clearDefaultParams`，所以 URL 里**没有** `dfid`/`mid`/`uuid`/
+    /// `clienttime`/`token`/`userid`——`appid`/`clientver` 是模块自己写进 dataMap
+    /// 的。少了这个 `clear_defaults()` 会多出六个参数，签名随之全错。
+    #[test]
+    fn search_lyric_endpoint_matches_kat() {
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &search_lyric_endpoint(SourceKind::Kugou, &kat_song())),
+            "https://lyrics.kugou.com/v1/search?album_audio_id=0&appid=1005&clientver=20489&duration=243722&hash=6af00fbd4d444a82c005843eef9dc2d4&keyword=Letter+-+arkady+sevidov&lrctxt=1&man=yes&signature=b90333d489a1aae225eb18ac61718d35"
+        );
+    }
+
+    /// 概念版歌词搜索：只有 `appid`/`clientver` 与签名变。
+    #[test]
+    fn lite_search_lyric_endpoint_matches_kat() {
+        assert_eq!(
+            prepared_url(
+                SourceKind::KugouConcept,
+                &search_lyric_endpoint(SourceKind::KugouConcept, &kat_song())
+            ),
+            "https://lyrics.kugou.com/v1/search?album_audio_id=0&appid=3116&clientver=11440&duration=243722&hash=6af00fbd4d444a82c005843eef9dc2d4&keyword=Letter+-+arkady+sevidov&lrctxt=1&man=yes&signature=9f42c6d69256fa6e952cf44c547d0cbf"
+        );
+    }
+
+    /// 阶段 4 出口：歌词下载 URL 与上游逐字节一致（含登录态的 `token`/`userid`）。
+    #[test]
+    fn lyric_endpoint_matches_kat() {
+        let endpoint = lyric_endpoint("19525574", "0123456789ABCDEF0123456789ABCDEF");
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &endpoint),
+            "https://lyrics.kugou.com/download?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&ver=1&client=android&id=19525574&accesskey=0123456789ABCDEF0123456789ABCDEF&fmt=krc&charset=utf8&signature=baf87af98752ef7562e9e4756f56cf32"
+        );
+    }
+
+    /// 概念版歌词下载：`appid`/`clientver`/签名变，参数序不变。
+    #[test]
+    fn lite_lyric_endpoint_matches_kat() {
+        let endpoint = lyric_endpoint("19525574", "0123456789ABCDEF0123456789ABCDEF");
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &endpoint),
+            "https://lyrics.kugou.com/download?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&ver=1&client=android&id=19525574&accesskey=0123456789ABCDEF0123456789ABCDEF&fmt=krc&charset=utf8&signature=d3eeb438cbbe61bfd53bcf71999376c5"
+        );
+    }
+
+    /// `contenttype == 0` 走 KRC 解密，解出的明文与上游 `decodeLyrics` 逐字相同。
+    ///
+    /// 样本来自真实 `/lyric` 响应（`tools/kat/krc_probe.json`），已脱敏为
+    /// 「纯音乐，请欣赏」这一句。
+    #[test]
+    fn injects_krc_decoded_content_when_contenttype_is_zero() {
+        let probe: Value = serde_json::from_str(include_str!("../../../tools/kat/krc_probe.json"))
+            .expect("krc_probe.json 应当能解析");
+        let mut root = probe.clone();
+        inject_decoded_lyric(&mut root);
+
+        let decoded = root["decodeContent"].as_str().unwrap();
+        assert_eq!(decoded, probe["decodeContent"].as_str().unwrap());
+        assert!(decoded.contains("<0,354,0>纯"), "逐字时间戳要保留：{decoded}");
+    }
+
+    /// `contenttype != 0` 走 base64 而不是 KRC——少了这个分支会解出乱码。
+    #[test]
+    fn injects_base64_content_when_contenttype_is_not_zero() {
+        let mut root = serde_json::json!({
+            "status": 200,
+            "contenttype": 1,
+            "content": "aGVsbG8gd29ybGQ=",
+        });
+        inject_decoded_lyric(&mut root);
+        assert_eq!(root["decodeContent"], Value::String("hello world".to_string()));
+    }
+
+    /// 解不开的 KRC 折成**空串**而不是报错：上游 `decodeLyrics` 也是
+    /// `catch { return '' }`，两端最终都走到「歌词为空」。
+    #[test]
+    fn undecodable_krc_becomes_an_empty_string() {
+        let mut root = serde_json::json!({
+            "status": 200,
+            "contenttype": 0,
+            "content": "bm90LWEta3JjLXBheWxvYWQ=",
+        });
+        inject_decoded_lyric(&mut root);
+        assert_eq!(root["decodeContent"], Value::String(String::new()));
+    }
+
+    /// 非 JSON 响应（纯文本歌词）不做任何注入——`lyric_body` 会原样透传。
+    #[test]
+    fn plain_text_body_is_passed_through() {
+        // `inject_decoded_lyric` 只处理对象；字符串根节点不该 panic。
+        let mut root = Value::String("[00:01.00]hi".to_string());
+        inject_decoded_lyric(&mut root);
+        assert_eq!(root, Value::String("[00:01.00]hi".to_string()));
+    }
+
+    /// 真实整首歌的 KAT：native 解出的明文必须与 Node 版 `decode=true` 的
+    /// `decodeContent` **逐字节相同**，解析出的逐字时间戳也必须一致。
+    ///
+    /// 样本是真实 `/lyric` 响应（`tools/kat/krc_real_qt.json`，周杰伦《晴天》，
+    /// 68 行、其中 63 行带时间标签）。`decodeContent` 那一栏是**上游 Node 版自己
+    /// 解出来的**，不是本地推导值——所以这条断言同时锁住了「解密算法一致」和
+    /// 「逐字时间戳一致」两件事。
+    ///
+    /// 解密正确但偏移错、或丢了一个字，都会让下面 `故事的小黄花` 的时间戳对不上。
+    #[test]
+    fn real_song_decode_matches_node_byte_for_byte() {
+        let probe: Value =
+            serde_json::from_str(include_str!("../../../tools/kat/krc_real_qt.json"))
+                .expect("krc_real_qt.json 应当能解析");
+        let expected = probe["decodeContent"].as_str().unwrap();
+
+        let mut root = probe.clone();
+        inject_decoded_lyric(&mut root);
+        let decoded = root["decodeContent"].as_str().unwrap();
+        assert_eq!(decoded, expected, "native 解密结果与 Node 版不一致");
+
+        let lyric = crate::api::lyric::parse_lrc(decoded);
+        assert_eq!(lyric.lines.len(), 63, "定时行数");
+
+        let line = lyric
+            .lines
+            .iter()
+            .find(|l| l.text == "故事的小黄花")
+            .expect("应当有「故事的小黄花」这一行");
+        assert_eq!(line.time_ms, 29264);
+        assert_eq!(line.words.len(), 6, "六个字各有一个逐字区间");
+        let starts: Vec<u64> = line.words.iter().map(|w| w.start_ms).collect();
+        assert_eq!(
+            starts,
+            vec![29264, 29654, 30046, 30494, 31416, 31790]
+        );
+        let ends: Vec<u64> = line.words.iter().map(|w| w.end_ms).collect();
+        assert_eq!(ends, vec![29654, 30046, 30494, 31416, 31790, 32294]);
+
+        // 首行是 `[0,2250]<0,160,0>晴天…`，19 个字全部带逐字区间。
+        let first = &lyric.lines[0];
+        assert_eq!(first.time_ms, 0);
+        assert_eq!(first.text, "晴天 - 周杰伦 (Jay Chou)");
+        assert_eq!(first.words.len(), 19);
+        assert_eq!(first.words[0].start_ms, 0);
+        assert_eq!(first.words[0].end_ms, 160);
+    }
+
+    /// 与上游 KAT 同一首歌：`singer_text() - name` 要拼出 `Letter - arkady sevidov`。
+    fn kat_song() -> Song {        Song {
+            name: "arkady sevidov".to_string(),
+            hash: "6af00fbd4d444a82c005843eef9dc2d4".to_string(),
+            duration_ms: 243722,
+            singers: vec![crate::api::model::Singer {
+                name: "Letter".to_string(),
+                id: 0,
+            }],
+            ..Default::default()
+        }
     }
 }

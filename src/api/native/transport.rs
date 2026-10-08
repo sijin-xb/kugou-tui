@@ -141,7 +141,6 @@ impl<'a> Endpoint<'a> {
         self
     }
 
-    #[allow(dead_code)] // 阶段 4 的歌词搜索用
     pub fn clear_defaults(mut self) -> Self {
         self.clear_default_params = true;
         self
@@ -320,7 +319,6 @@ impl Transport {
     }
 
     /// 取一次原始文本（歌词接口在 `decode=true` 下偶尔直接吐 LRC 纯文本）。
-    #[allow(dead_code)] // 阶段 4 的歌词下载用
     pub async fn get_text(&self, endpoint: &Endpoint<'_>, cached: bool) -> Result<String> {
         self.with_retry(|| self.get_text_once(endpoint, cached)).await
     }
@@ -383,7 +381,6 @@ impl Transport {
         Ok(value)
     }
 
-    #[allow(dead_code)] // 只被 get_text 调用，而 get_text 等阶段 4
     async fn get_text_once(&self, endpoint: &Endpoint<'_>, cached: bool) -> Result<String> {
         let prepared = self.prepare(endpoint);
         if cached
