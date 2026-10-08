@@ -43,6 +43,12 @@ pub const LYRICS_BASE: &str = "https://lyrics.kugou.com";
 /// 设备注册接口的独立域名（`module/register_dev.js` 自带 `baseURL`）。
 pub const USER_SERVICE_BASE: &str = "https://userservice.kugou.com";
 
+/// 登录接口的独立域名（`module/login_qr_key.js`、`module/login_qr_check.js` 自带 `baseURL`）。
+pub const LOGIN_BASE: &str = "https://login-user.kugou.com";
+
+/// 会员信息接口的独立域名（`module/user_vip_detail.js` 自带 `baseURL`）。
+pub const VIP_BASE: &str = "https://kugouvip.kugou.com";
+
 /// 上游默认 UA（`util/request.js:143`）。**不是** `kugou-tui/…`——
 /// 网关按 UA 判客户端类型，换掉它取流会失败。
 pub const USER_AGENT: &str = "Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi";

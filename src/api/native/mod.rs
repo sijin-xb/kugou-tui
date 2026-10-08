@@ -18,12 +18,13 @@ pub mod sign;
 pub mod transport;
 
 use crate::api::catalog::{StreamSource, StreamUrl, resolve_stream_url};
-use crate::api::cloud::{QrCheck, UserInfo, VipInfo};
+use crate::api::cloud::{QrCheck, QrStatus, UserInfo, VipInfo, VipKind};
 use crate::api::data_of;
-use crate::api::model::{Artist, Lyric, Playlist, RankBoard, Song, extract_songs};
+use crate::api::model::{Artist, Lyric, Playlist, RankBoard, Song, extract_songs, pick_i64, pick_string};
 use crate::api::native::device::random_string;
 use crate::api::native::transport::{
-    Endpoint, GATEWAY_BASE, LYRICS_BASE, Transport, USER_SERVICE_BASE,
+    EncryptType, Endpoint, GATEWAY_BASE, LOGIN_BASE, LYRICS_BASE, Transport, USER_SERVICE_BASE,
+    VIP_BASE,
 };
 use crate::api::traits::MusicApi;
 use crate::error::{AppError, Result};
@@ -392,6 +393,154 @@ pub(crate) fn parse_register_dev_response(aes_key: &str, body: &[u8]) -> Result<
     Ok(serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)))
 }
 
+/// 二维码 key 的请求规格（上游 `module/login_qr_key.js`，路由 `/login/qr/key`）。
+///
+/// 三个 `appid` 各不相同，照抄时最容易串：查询串里的 `appid` 固定 **1001**
+/// （上游 `params?.type === 'web' ? 1014 : 1001`，本项目不传 `type` 故取 1001），
+/// `srcappid` 固定 2919，只有 `qrcode_txt` 里嵌的那个才是**平台** `appid`
+/// （标准版 1005 / 概念版 3116）。串了不会报错，只是扫码后拿不到登录态。
+pub(crate) fn login_qr_key_endpoint(kind: SourceKind) -> Endpoint<'static> {
+    Endpoint::get(LOGIN_BASE, "/v2/qrcode")
+        .encrypt_type(EncryptType::Web)
+        .param("appid", "1001")
+        .param("type", "1")
+        .param("plat", "4")
+        .param(
+            "qrcode_txt",
+            format!("https://h5.kugou.com/apps/loginQRCode/html/index.html?appid={}&", crate::api::native::sign::appid(kind)),
+        )
+        .param("srcappid", crate::api::native::sign::SRCAPPID.to_string())
+}
+
+/// 二维码状态轮询的请求规格（上游 `module/login_qr_check.js`，路由 `/login/qr/check`）。
+///
+/// 这里的 `appid` 是**平台** `appid`（与上面那个 1001 不是一回事）。
+pub(crate) fn login_qr_check_endpoint(kind: SourceKind, key: &str) -> Endpoint<'static> {
+    Endpoint::get(LOGIN_BASE, "/v2/get_userinfo_qrcode")
+        .encrypt_type(EncryptType::Web)
+        .param("plat", "4")
+        .param("appid", crate::api::native::sign::appid(kind).to_string())
+        .param("srcappid", crate::api::native::sign::SRCAPPID.to_string())
+        .param("qrcode", key.to_string())
+}
+
+/// 用户资料的请求规格（上游 `module/user_detail.js`，路由 `/user/detail`）。
+///
+/// 该模块**没有** `baseURL`，所以走默认网关。`p` 是裸 RSA（无填充）加密
+/// `{"token":…,"clienttime":…}` 后转**大写** hex，注意上游 `cryptoRSAEncrypt`
+/// 返回小写，是模块自己 `.toUpperCase()` 的。
+///
+/// `clienttime` 由调用方注入：它同时进 body 与签名，不能取当前时间，否则
+/// 对照基准无法复现。
+pub(crate) fn user_detail_endpoint(
+    kind: SourceKind,
+    token: &str,
+    userid: Option<&str>,
+    clienttime: &str,
+) -> Result<Endpoint<'static>> {
+    let seconds: i64 = clienttime.parse().unwrap_or_default();
+    // 上游 `Number(params?.userid || params?.cookie?.userid || '0')`：非数字得到 NaN，
+    // 序列化成 null；这里退化成 0，比发出 `null` 更接近服务端预期。
+    let userid_value = match userid.and_then(|value| value.parse::<i64>().ok()) {
+        Some(value) => Value::from(value),
+        None => Value::from(0),
+    };
+    let rsa_input = serde_json::to_string(&serde_json::json!({
+        "token": token,
+        "clienttime": seconds,
+    }))
+    .map_err(|error| AppError::Other(format!("序列化 RSA 明文失败：{error}")))?;
+    let p = crate::api::native::crypto::raw_rsa_encrypt(kind, rsa_input.as_bytes())?.to_uppercase();
+    let body = serde_json::to_string(&serde_json::json!({
+        "visit_time": seconds,
+        "usertype": 1,
+        "p": p,
+        "userid": userid_value,
+    }))
+    .map_err(|error| AppError::Other(format!("序列化用户资料请求体失败：{error}")))?;
+    Ok(Endpoint::post(GATEWAY_BASE, "/v3/get_my_info")
+        .header("x-router", "usercenter.kugou.com")
+        .param("plat", "1")
+        .body(body))
+}
+
+/// 会员信息的请求规格（上游 `module/user_vip_detail.js`，路由 `/user/vip/detail`）。
+pub(crate) fn user_vip_detail_endpoint() -> Endpoint<'static> {
+    Endpoint::get(VIP_BASE, "/v1/get_union_vip").param("busi_type", "concept")
+}
+
+/// 二维码内容（上游 `module/login_qr_create.js`，路由 `/login/qr/create`）。
+///
+/// 上游这个模块**不联网**：它只是把 key 拼进 H5 登录页地址，再用 `qrcode` 包
+/// 渲染成 data URL。终端里由 `src/ui/widgets.rs` 自己编码，所以 `base64` 那半
+/// 不用管，只返回待编码的字符串。
+pub(crate) fn login_qr_content(key: &str) -> String {
+    format!("https://h5.kugou.com/apps/loginQRCode/html/index.html?qrcode={key}")
+}
+
+/// 把 `/login/qr/check` 的响应翻成 [`QrCheck`]。
+///
+/// 上游注释：`0` 过期、`1` 等待扫码、`2` 待确认、`4` 授权成功（此时才有 token）。
+/// 上游 `4` 时还会往 Set-Cookie 里塞裸 `token=…`/`userid=…`，本项目按客户端既有
+/// 约定直接读 body 字段（`src/app/cloud.rs` 的 `apply_login` 会自己拼 cookie）。
+pub(crate) fn parse_qr_check(root: &Value) -> QrCheck {
+    let data = data_of(root);
+    let status = match pick_i64(data, &["status", "code"]) {
+        Some(0) => QrStatus::Expired,
+        Some(2) => QrStatus::Pending,
+        Some(4) => QrStatus::Success,
+        _ => QrStatus::Waiting,
+    };
+    QrCheck {
+        status,
+        token: pick_string(data, &["token"]),
+        userid: pick_string(data, &["userid"]),
+        cookie: None,
+    }
+}
+
+/// 把 `/user/detail` 的响应翻成 [`UserInfo`]（与 `NodeApi` 同字段、同兜底）。
+pub(crate) fn parse_user_detail(root: &Value) -> UserInfo {
+    let data = data_of(root);
+    UserInfo {
+        nickname: pick_string(data, &["nickname"]).unwrap_or_default(),
+        pic: pick_string(data, &["pic"]).filter(|url| !url.trim().is_empty()),
+        grade: pick_i64(data, &["p_grade"]).and_then(|value| u32::try_from(value).ok()),
+        duration_min: pick_i64(data, &["duration"]).and_then(|value| u64::try_from(value).ok()),
+    }
+}
+
+/// 把 `/user/vip/detail` 的响应翻成 [`VipInfo`]（与 `NodeApi` 同逻辑）。
+///
+/// 顶层 `is_vip` 只反映标准版豪华 VIP；概念版等形态在 `busi_vip[]` 里。
+pub(crate) fn parse_user_vip_detail(root: &Value) -> VipInfo {
+    let data = data_of(root);
+    let mut info = VipInfo::default();
+    if pick_i64(data, &["is_vip", "vip_type"]) == Some(1) {
+        info.kind = VipKind::Standard;
+        info.product = "VIP".to_string();
+        info.end_time = pick_string(data, &["vip_end_time"]).unwrap_or_default();
+        return info;
+    }
+    if let Some(entries) = data.get("busi_vip").and_then(Value::as_array) {
+        for entry in entries {
+            if pick_i64(entry, &["is_vip"]) != Some(1) {
+                continue;
+            }
+            let busi_type = pick_string(entry, &["busi_type"]).unwrap_or_default();
+            info.kind = if busi_type == "concept" {
+                VipKind::Concept
+            } else {
+                VipKind::Other(busi_type)
+            };
+            info.product = pick_string(entry, &["product_type"]).unwrap_or_default();
+            info.end_time = pick_string(entry, &["vip_end_time"]).unwrap_or_default();
+            return info;
+        }
+    }
+    info
+}
+
 /// `NativeApi` 的歌词实现。
 ///
 /// 算法在 [`crate::api::lyric::fetch_lyric_via`]，与 `NodeApi` **共用同一份**；
@@ -519,23 +668,36 @@ impl MusicApi for NativeApi {
     }
 
     async fn login_qr_key(&self) -> Result<String> {
-        Err(unimplemented("login_qr_key"))
+        let endpoint = login_qr_key_endpoint(self.kind());
+        let root = self.transport.get_json(&endpoint, false).await?;
+        pick_string(data_of(&root), &["qrcode", "key"])
+            .ok_or_else(|| AppError::NotFound("`/login/qr/key` 未返回 key".to_string()))
     }
 
-    async fn login_qr_create(&self, _key: &str) -> Result<String> {
-        Err(unimplemented("login_qr_create"))
+    async fn login_qr_create(&self, key: &str) -> Result<String> {
+        Ok(login_qr_content(key))
     }
 
-    async fn login_qr_check(&self, _key: &str) -> Result<QrCheck> {
-        Err(unimplemented("login_qr_check"))
+    async fn login_qr_check(&self, key: &str) -> Result<QrCheck> {
+        let endpoint = login_qr_check_endpoint(self.kind(), key);
+        let root = self.transport.get_json(&endpoint, false).await?;
+        Ok(parse_qr_check(&root))
     }
 
     async fn user_detail(&self) -> Result<UserInfo> {
-        Err(unimplemented("user_detail"))
+        let cookies = self.transport.cookie_map();
+        let token = cookies.get("token").cloned().unwrap_or_default();
+        let userid = cookies.get("userid").cloned();
+        let clienttime = (crate::util::now_unix_millis() / 1000).to_string();
+        let endpoint = user_detail_endpoint(self.kind(), &token, userid.as_deref(), &clienttime)?;
+        let root = self.transport.get_json(&endpoint, false).await?;
+        Ok(parse_user_detail(&root))
     }
 
     async fn user_vip_detail(&self) -> Result<VipInfo> {
-        Err(unimplemented("user_vip_detail"))
+        let endpoint = user_vip_detail_endpoint();
+        let root = self.transport.get_json(&endpoint, false).await?;
+        Ok(parse_user_vip_detail(&root))
     }
 
     async fn claim_day_vip(&self, _receive_day: &str) -> Result<Value> {
@@ -615,6 +777,7 @@ impl MusicApi for NativeApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::native::transport::Method;
     use std::collections::BTreeMap;
 
     /// 与 `transport` 的 KAT 用同一组固定输入，方便两边互相对照。
@@ -1122,5 +1285,296 @@ mod tests {
     #[test]
     fn register_dev_response_rejects_unaligned_ciphertext() {
         assert!(parse_register_dev_response("15iw0r", b"not-a-block").is_err());
+    }
+
+    // ---- 阶段 5b：登录与用户信息 ----
+
+    const KAT_QR_KEY: &str = "QRKEYFIXTURE0123456789abcdef";
+
+    /// `/login/qr/key`：查询串里的 `appid` 固定 1001，平台 appid 只出现在
+    /// `qrcode_txt` 里。
+    #[test]
+    fn login_qr_key_endpoint_matches_kat() {
+        let standard = prepared_url(SourceKind::Kugou, &login_qr_key_endpoint(SourceKind::Kugou));
+        assert!(standard.starts_with("https://login-user.kugou.com/v2/qrcode?"), "{standard}");
+        assert!(standard.contains("appid=1001&"), "{standard}");
+        assert!(standard.contains("srcappid=2919&"), "{standard}");
+        assert!(
+            standard.contains("qrcode_txt=https:%2F%2Fh5.kugou.com%2Fapps%2FloginQRCode%2Fhtml%2Findex.html%3Fappid%3D1005%26"),
+            "{standard}"
+        );
+        assert!(standard.ends_with("signature=809add981f2890a0ba0f768e5ad3dc2e"), "{standard}");
+
+        let lite = prepared_url(
+            SourceKind::KugouConcept,
+            &login_qr_key_endpoint(SourceKind::KugouConcept),
+        );
+        assert!(lite.contains("appid=1001&"), "{lite}");
+        assert!(lite.contains("%3Fappid%3D3116%26"), "{lite}");
+        assert!(lite.ends_with("signature=30d693c55315a86f337c9d1b21fb0384"), "{lite}");
+    }
+
+    /// `/login/qr/check`：这里才是平台 appid（与上一个接口的 1001 不同）。
+    #[test]
+    fn login_qr_check_endpoint_matches_kat() {
+        let standard = prepared_url(
+            SourceKind::Kugou,
+            &login_qr_check_endpoint(SourceKind::Kugou, KAT_QR_KEY),
+        );
+        assert!(
+            standard.starts_with("https://login-user.kugou.com/v2/get_userinfo_qrcode?"),
+            "{standard}"
+        );
+        assert!(standard.contains("plat=4&"), "{standard}");
+        assert!(standard.contains("appid=1005&"), "{standard}");
+        assert!(standard.contains("srcappid=2919&"), "{standard}");
+        assert!(standard.contains(&format!("qrcode={KAT_QR_KEY}&")), "{standard}");
+        assert!(standard.ends_with("signature=e22b586d8f1406c8d2f8db8cd1fffb99"), "{standard}");
+
+        let lite = prepared_url(
+            SourceKind::KugouConcept,
+            &login_qr_check_endpoint(SourceKind::KugouConcept, KAT_QR_KEY),
+        );
+        assert!(lite.contains("appid=3116&"), "{lite}");
+        assert!(lite.ends_with("signature=485f49b591d41e2a85660bfd66e10b4e"), "{lite}");
+    }
+
+    /// 参数顺序也进签名，必须逐位对齐上游。
+    #[test]
+    fn login_endpoints_keep_kat_param_order() {
+        let qr_key = prepared_url(SourceKind::Kugou, &login_qr_key_endpoint(SourceKind::Kugou));
+        let query = qr_key.split_once('?').unwrap().1;
+        let keys: Vec<&str> = query
+            .split('&')
+            .map(|pair| pair.split('=').next().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "dfid",
+                "mid",
+                "uuid",
+                "appid",
+                "clientver",
+                "clienttime",
+                "token",
+                "userid",
+                "type",
+                "plat",
+                "qrcode_txt",
+                "srcappid",
+                "signature"
+            ]
+        );
+
+        let qr_check = prepared_url(
+            SourceKind::Kugou,
+            &login_qr_check_endpoint(SourceKind::Kugou, KAT_QR_KEY),
+        );
+        let query = qr_check.split_once('?').unwrap().1;
+        let keys: Vec<&str> = query
+            .split('&')
+            .map(|pair| pair.split('=').next().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                "dfid",
+                "mid",
+                "uuid",
+                "appid",
+                "clientver",
+                "clienttime",
+                "token",
+                "userid",
+                "plat",
+                "srcappid",
+                "qrcode",
+                "signature"
+            ]
+        );
+    }
+
+    /// `/user/detail`：POST 到默认网关，`p` 是裸 RSA 后**大写**的 hex。
+    #[test]
+    fn user_detail_endpoint_matches_kat() {
+        let standard = user_detail_endpoint(
+            SourceKind::Kugou,
+            "TOKENFIXTURE",
+            Some("10001"),
+            KAT_CLIENTTIME,
+        )
+        .unwrap();
+        let url = prepared_url(SourceKind::Kugou, &standard);
+        assert!(url.starts_with("https://gateway.kugou.com/v3/get_my_info?"), "{url}");
+        assert!(url.contains("plat=1&"), "{url}");
+        assert!(url.ends_with("signature=fabdd1361171f08041b8d14d1534762d"), "{url}");
+        assert_eq!(standard.method, Method::Post);
+        assert_eq!(standard.headers[0], ("x-router", "usercenter.kugou.com"));
+
+        let body = standard.data.clone().unwrap();
+        assert!(
+            body.starts_with(r#"{"visit_time":1700000000,"usertype":1,"p":"#),
+            "{body}"
+        );
+        assert!(body.ends_with(r#","userid":10001}"#), "{body}");
+        assert!(
+            body.contains(
+                "872BB0033583FBE8528E9C4B6BE4D7833E779E612D041DC920F224100D968A1565F8F60BE0B953031A8AF9FF8F78682EA1FDE18A8DB23C28F4B948A962C637ACAA4A2BED6517855AC6406323FDB6954143E74C94901FB112354769DCB437E9BFAD2115B658BE512C80708ABCDE43AC7B29C9DD84EB34E98E76A9AF4B0A02196F"
+            ),
+            "{body}"
+        );
+
+        let lite = user_detail_endpoint(
+            SourceKind::KugouConcept,
+            "TOKENFIXTURE",
+            Some("10001"),
+            KAT_CLIENTTIME,
+        )
+        .unwrap();
+        let url = prepared_url(SourceKind::KugouConcept, &lite);
+        assert!(url.ends_with("signature=6129a60675eca869e470623d32657131"), "{url}");
+    }
+
+    /// `p` 必须是 256 字符大写 hex——上游 `.toUpperCase()` 很容易漏。
+    #[test]
+    fn user_detail_p_is_uppercase_hex() {
+        let endpoint = user_detail_endpoint(SourceKind::Kugou, "TOKENFIXTURE", Some("10001"), KAT_CLIENTTIME)
+            .unwrap();
+        let body: Value = serde_json::from_str(endpoint.data.as_deref().unwrap()).unwrap();
+        let p = body["p"].as_str().unwrap();
+        assert_eq!(p.len(), 256);
+        assert!(p.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(p, p.to_uppercase());
+    }
+
+    /// `/user/vip/detail`：带 `busi_type=concept`。
+    #[test]
+    fn user_vip_detail_endpoint_matches_kat() {
+        let standard = prepared_url(SourceKind::Kugou, &user_vip_detail_endpoint());
+        assert!(
+            standard.starts_with("https://kugouvip.kugou.com/v1/get_union_vip?"),
+            "{standard}"
+        );
+        assert!(standard.contains("busi_type=concept&"), "{standard}");
+        assert!(standard.ends_with("signature=96cf2266d36f85b67a59246d5f0424db"), "{standard}");
+
+        let lite = prepared_url(SourceKind::KugouConcept, &user_vip_detail_endpoint());
+        assert!(lite.ends_with("signature=9db667847a40506f67f9834e90f75e58"), "{lite}");
+    }
+
+    /// `login_qr_create` 不联网：只把 key 拼进 H5 地址。
+    #[test]
+    fn login_qr_content_is_built_locally() {
+        assert_eq!(
+            login_qr_content(KAT_QR_KEY),
+            "https://h5.kugou.com/apps/loginQRCode/html/index.html?qrcode=QRKEYFIXTURE0123456789abcdef"
+        );
+    }
+
+    /// 上游注释：0 过期、1 等待、2 待确认、4 成功。未知值一律当等待。
+    #[test]
+    fn qr_check_status_mapping_matches_upstream() {
+        for (raw, expected) in [
+            (0, QrStatus::Expired),
+            (1, QrStatus::Waiting),
+            (2, QrStatus::Pending),
+            (4, QrStatus::Success),
+            (99, QrStatus::Waiting),
+        ] {
+            let root = serde_json::json!({ "data": { "status": raw } });
+            assert_eq!(parse_qr_check(&root).status, expected, "status={raw}");
+        }
+        // 上游 `pick_i64(data, ["status","code"])` 的兜底键。
+        let root = serde_json::json!({ "data": { "code": 4, "token": "T", "userid": "7" } });
+        let check = parse_qr_check(&root);
+        assert_eq!(check.status, QrStatus::Success);
+        assert_eq!(check.token.as_deref(), Some("T"));
+        assert_eq!(check.userid.as_deref(), Some("7"));
+        assert!(check.cookie.is_none());
+    }
+
+    /// `/user/detail` 的字段映射（`p_grade` 是 `u32`、`duration` 是分钟）。
+    #[test]
+    fn user_detail_parses_kat_body() {
+        let root = serde_json::json!({
+            "status": 1,
+            "error_code": 0,
+            "data": {
+                "nickname": "NICKFIXTURE",
+                "pic": "https://example.invalid/pic.jpg",
+                "p_grade": 12,
+                "duration": 79239,
+            }
+        });
+        let info = parse_user_detail(&root);
+        assert_eq!(info.nickname, "NICKFIXTURE");
+        assert_eq!(info.pic.as_deref(), Some("https://example.invalid/pic.jpg"));
+        assert_eq!(info.grade, Some(12));
+        assert_eq!(info.duration_min, Some(79239));
+    }
+
+    /// 空白 `pic` 视作没有头像。
+    #[test]
+    fn user_detail_treats_blank_pic_as_none() {
+        let root = serde_json::json!({ "data": { "nickname": "N", "pic": "   " } });
+        let info = parse_user_detail(&root);
+        assert!(info.pic.is_none());
+        assert_eq!(info.grade, None);
+        assert_eq!(info.duration_min, None);
+    }
+
+    /// 顶层 `is_vip` 命中即标准版 VIP。
+    #[test]
+    fn vip_detail_reads_top_level_flag() {
+        let root = serde_json::json!({
+            "data": { "is_vip": 1, "vip_end_time": "2027-01-01 00:00:00" }
+        });
+        let info = parse_user_vip_detail(&root);
+        assert_eq!(info.kind, VipKind::Standard);
+        assert_eq!(info.product, "VIP");
+        assert_eq!(info.end_time, "2027-01-01 00:00:00");
+    }
+
+    /// 顶层 `is_vip: 0` 但 `busi_vip` 里有概念版 SVIP 时，必须认出会员。
+    #[test]
+    fn vip_detail_falls_back_to_busi_vip() {
+        let root = serde_json::json!({
+            "data": {
+                "is_vip": 0,
+                "busi_vip": [
+                    { "is_vip": 0, "busi_type": "tvip" },
+                    {
+                        "is_vip": 1,
+                        "busi_type": "concept",
+                        "product_type": "svip",
+                        "vip_end_time": "2028-02-02 00:00:00",
+                    }
+                ]
+            }
+        });
+        let info = parse_user_vip_detail(&root);
+        assert_eq!(info.kind, VipKind::Concept);
+        assert_eq!(info.product, "svip");
+        assert_eq!(info.end_time, "2028-02-02 00:00:00");
+    }
+
+    /// 非 `concept` 的形态归到 `Other`，原样保留 `busi_type`。
+    #[test]
+    fn vip_detail_keeps_unknown_busi_type() {
+        let root = serde_json::json!({
+            "data": { "busi_vip": [{ "is_vip": 1, "busi_type": "tvip", "product_type": "tvip" }] }
+        });
+        assert_eq!(
+            parse_user_vip_detail(&root).kind,
+            VipKind::Other("tvip".to_string())
+        );
+    }
+
+    /// 什么都没命中时是「无会员」，不能是 `Standard`。
+    #[test]
+    fn vip_detail_defaults_to_none() {
+        let root = serde_json::json!({ "data": { "is_vip": 0, "busi_vip": [] } });
+        assert_eq!(parse_user_vip_detail(&root).kind, VipKind::None);
     }
 }
