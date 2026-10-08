@@ -30,6 +30,7 @@ node tools/kat/kat_device.js    # randomString / getGuid / calculateMid（注入
 node tools/kat/kat_notsign.js   # 截获 song_url / search_lyric 真实 options，复算签名
 node tools/kat/kat_object_order.js  # 对象型参数值的 JSON 键序（preserve_order 的依据）
 node tools/kat/kat_aes.js       # AES-128-CBC+PKCS7 与 /register/dev 的整份请求
+node tools/kat/kat_login.js     # 扫码登录三个接口与用户信息两个接口的整份请求
 node tools/kat/kat_request.js       # 固定时间与随机，录 request.js 构造出的整份请求
 node tools/kat/probe_outbound.js    # 录真实出站请求：URL / 参数 / 头
 node tools/kat/probe_outbound.js lite   # 只跑 lite 平台
@@ -47,6 +48,7 @@ node tools/kat/probe_outbound.js lite   # 只跑 lite 平台
 | `kat_notsign.js` | `src/api/native/sign.rs` | 假 `useAxios` 截获 `module/song_url.js`、`module/search_lyric.js` 真正发出的整份参数 |
 | `kat_object_order.js` | `src/api/native/sign.rs` | 对象型参数值的键序：证明上游用插入序而非字典序 |
 | `kat_aes.js` | `src/api/native/crypto.rs`、`mod.rs` | 钉死 `Math.random`/`Date.now`/`forge.random.getBytes`，录 `playlistAesEncrypt` 的加解密与 `/register/dev` 的整份请求 |
+| `kat_login.js` | `src/api/native/mod.rs` | 钉死 `Math.random`/`Date.now`，录 `/v2/qrcode`、`/v2/get_userinfo_qrcode`、`/v3/get_my_info`、`/v1/get_union_vip` 的整份请求；`user_detail` 额外截获裸 RSA 的明文 |
 | `kat_request.js` | `src/api/native/transport.rs`、`mod.rs` | 钉死 `Date.now`/`Math.random`，录 `request.js` 构造出的 URL/参数/头/body，供逐字节断言 |
 | `probe_outbound.js` | `src/api/native/`（网络层） | 本地假 gateway 录真实出站请求，供 native 逐项对齐 |
 
@@ -108,3 +110,9 @@ curl -s "http://127.0.0.1:3001/lyric?id=<lyric_id>&accesskey=<accesskey>&fmt=krc
   `RangeError: Invalid typed array length: -65`，而不是「解密失败」。
 - **node 侧复核 AES 要 `setAutoPadding(false)`**：`createCipheriv` 默认自带
   PKCS#7，会再补一整块，密文与上游对不上而且不报错。
+- **`login_qr_key.js` 里有两个不同的 appid**：`params.appid` 恒为 `1001`，而
+  `qrcode_txt` 里拼的是 `util/index.js` 导入的平台 appid（标准版 `1005`、
+  概念版 `3116`）。把两者当成同一个，`qrcode_txt` 与签名都会错。
+- **`user_detail.js` 的裸 RSA 明文键序是 `token` 在前、`clienttime` 在后**：
+  `cryptoRSAEncrypt({ token, clienttime })` 的对象字面量顺序就是 RSA 输入字节
+  顺序，键序写反得到的是另一串密文，服务端只会回鉴权失败。
