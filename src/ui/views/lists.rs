@@ -102,8 +102,13 @@ pub fn render_song_list(
         (visible < list.songs.len()).then_some(visible)
     });
 
-    let offset = list.cursor.offset();
-    let selected = list.cursor.selected();
+    // `offset`/`selected` 是 ratatui 在 `render_stateful_widget` **内部**才钳位的，这里读到
+    // 的是上一帧的旧值。列表刚缩短（删歌、换搜索结果）而光标还没来得及 clamp 时，旧下标
+    // 可能越界，会把**全部**真实行判成窗口外、整屏占位（闪烁一帧）。先按当前长度钳一遍，
+    // 让占位判定与 ratatui 内部口径一致。
+    let last = list.songs.len().saturating_sub(1);
+    let offset = list.cursor.offset().min(last);
+    let selected = list.cursor.selected().map(|index| index.min(last));
     let items: Vec<_> = list
         .songs
         .iter()
@@ -402,5 +407,75 @@ mod tests {
         assert!(text.contains("我的歌单"), "第一行应显示标题：{text:?}");
         assert!(text.contains("第二张"), "第二行应显示标题：{text:?}");
         assert!(text.contains("副标题"), "副标题也应显示：{text:?}");
+    }
+
+    /// 列表从底部缩短后，旧的滚动下标可能越界；渲染必须按当前长度钳位，
+    /// 否则整屏都会被判成「窗口外」而空白（闪烁一帧）。
+    #[test]
+    fn song_list_renders_real_rows_after_shrinking_from_the_bottom() {
+        use crate::api::model::Song;
+
+        let song = |index: usize| Song {
+            name: format!("曲目{index}"),
+            hash: format!("h{index}"),
+            ..Song::default()
+        };
+        let view = || SongView {
+            focused: true,
+            current_hash: None,
+            playback: PlaybackState::Playing,
+            pointer: None,
+        };
+
+        let mut list = SongList::default();
+        list.replace("测试", (0..40).map(song).collect());
+        // 模拟「滚到底」：选中并滚到最后一首。
+        list.cursor.select(Some(39));
+        *list.cursor.offset_mut() = 39;
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).expect("建测试终端");
+        terminal
+            .draw(|frame| {
+                render_song_list(
+                    frame,
+                    Rect::new(0, 0, 40, 8),
+                    &mut list,
+                    view(),
+                    &Theme::for_config(ThemeName::Default, false),
+                );
+            })
+            .expect("渲染滚到底的列表");
+
+        // 模拟「删到很少」：光标还停在旧下标 39，但列表只剩 3 首。
+        list.songs.truncate(3);
+        terminal
+            .draw(|frame| {
+                render_song_list(
+                    frame,
+                    Rect::new(0, 0, 40, 8),
+                    &mut list,
+                    view(),
+                    &Theme::for_config(ThemeName::Default, false),
+                );
+            })
+            .expect("渲染缩短后的列表");
+
+        let text = rendered_text(terminal.backend().buffer());
+        assert!(text.contains("曲目0"), "缩短后仍要渲染真实行：{text:?}");
+        assert!(text.contains("曲目2"), "缩短后仍要渲染真实行：{text:?}");
+
+        // 删到空也不能 panic。
+        list.songs.clear();
+        terminal
+            .draw(|frame| {
+                render_song_list(
+                    frame,
+                    Rect::new(0, 0, 40, 8),
+                    &mut list,
+                    view(),
+                    &Theme::for_config(ThemeName::Default, false),
+                );
+            })
+            .expect("渲染空列表");
     }
 }

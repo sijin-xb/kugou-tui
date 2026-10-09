@@ -516,3 +516,65 @@ async fn serve(
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// 直接拼一个句柄，绕开需要 D-Bus 的 `spawn`。
+    fn handle() -> MprisHandle {
+        MprisHandle {
+            info: Arc::new(Mutex::new(TrackInfo::default())),
+            connected: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// 同一首歌内每拍只该刷新进度/状态，不该反复重建元数据（歌名/歌手/封面）。
+    #[test]
+    fn update_track_skips_metadata_rebuild_for_the_same_track() {
+        let handle = handle();
+        let built = std::cell::Cell::new(0u32);
+        let build = || {
+            built.set(built.get() + 1);
+            TrackInfo {
+                title: "歌名".to_string(),
+                artists: vec!["歌手".to_string()],
+                track_id: "h1".to_string(),
+                ..TrackInfo::default()
+            }
+        };
+
+        handle.update_track("h1", 1_000, 10_000, PlaybackState::Playing, build);
+        assert_eq!(built.get(), 1, "换歌时必须重建一次元数据");
+
+        handle.update_track("h1", 2_000, 10_000, PlaybackState::Paused, build);
+        assert_eq!(built.get(), 1, "同一首歌内不该再重建元数据");
+
+        let info = handle.info.lock().expect("锁没中毒");
+        assert_eq!(info.title, "歌名", "元数据应保留");
+        assert_eq!(info.position_us, 2_000, "进度每拍都要刷新");
+        assert_eq!(info.status, PlaybackState::Paused, "状态每拍都要刷新");
+    }
+
+    /// 换歌时必须整份替换元数据（歌名、时长都跟着换）。
+    #[test]
+    fn update_track_rebuilds_metadata_when_the_track_changes() {
+        let handle = handle();
+        handle.update_track("h1", 0, 1_000, PlaybackState::Playing, || TrackInfo {
+            title: "旧".to_string(),
+            track_id: "h1".to_string(),
+            ..TrackInfo::default()
+        });
+        handle.update_track("h2", 5_000, 20_000, PlaybackState::Playing, || TrackInfo {
+            title: "新".to_string(),
+            track_id: "h2".to_string(),
+            ..TrackInfo::default()
+        });
+
+        let info = handle.info.lock().expect("锁没中毒");
+        assert_eq!(info.title, "新");
+        assert_eq!(info.track_id, "h2");
+        assert_eq!(info.duration_us, 20_000);
+    }
+}

@@ -462,17 +462,20 @@ impl App {
     /// 菜单可以作用在队列里**任意**一首上，而 `x`（remove_selected_from_queue）
     /// 只认当前选中那首——直接复用的话，右键第 5 首会删掉第 2 首。
     fn remove_song_from_queue(&mut self, song: &Song) {
-        let Some(index) = self
-            .state
-            .queue
-            .items()
-            .iter()
-            .position(|item| item.hash == song.hash)
+        let selected = self.state.queue_cursor.selected();
+        let Some((index, selected_after)) =
+            queue_removal(self.state.queue.items(), selected, &song.hash)
         else {
             self.state.warn("这首歌不在播放队列里");
             return;
         };
         if let Some(removed) = self.state.queue.remove(index) {
+            // 删掉选中项**之前**的歌会让后面整体前移，高亮要跟着挪一格才不会跳到别的歌上；
+            // 删的正好是选中项（含最后一项）时保持下标，越界交给 `clamp_queue_cursor` 收回末尾。
+            if let Some(next) = selected_after {
+                self.state.queue_cursor.select(Some(next));
+            }
+            self.clamp_queue_cursor();
             self.state.info(format!("已从队列移除《{}》", removed.name));
         }
     }
@@ -2967,6 +2970,27 @@ fn accepts_open_item<K: PartialEq>(open: Option<K>, arriving: K) -> bool {
     open.is_some_and(|current| current == arriving)
 }
 
+/// 从队列里删掉 `hash` 对应的一首时，决定「删哪个下标」与「删完后高亮落在哪」。
+///
+/// 优先删**选中那一份**：右键菜单就是冲着它打开的，而队列里可能有同 hash 的重复项，
+/// 按 hash 找第一份会删错歌。删掉选中项之前的歌会让后面整体前移，所以此时高亮要跟着
+/// 前移一格；删的是选中项本身或它之后的项则保持下标（越界由调用方 clamp）。
+fn queue_removal(
+    items: &[Song],
+    selected: Option<usize>,
+    hash: &str,
+) -> Option<(usize, Option<usize>)> {
+    let index = match selected {
+        Some(selected) if items.get(selected).is_some_and(|song| song.hash == hash) => selected,
+        _ => items.iter().position(|song| song.hash == hash)?,
+    };
+    let selected_after = match selected {
+        Some(selected) if index < selected => Some(selected - 1),
+        other => other,
+    };
+    Some((index, selected_after))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3112,5 +3136,31 @@ mod tests {
         assert!(accepts_open_item(Some("3_abc"), "3_abc"));
         assert!(!accepts_open_item(Some("3_abc"), "3_def"));
         assert!(!accepts_open_item::<&str>(None, "3_abc"));
+    }
+
+    /// 从队列移除时高亮要跟着被删位置挪，不能跳到别的歌上或越界丢失。
+    #[test]
+    fn queue_removal_keeps_the_highlight_on_the_same_song() {
+        let song = |hash: &str| Song {
+            hash: hash.to_string(),
+            ..Song::default()
+        };
+        let items = vec![song("a"), song("b"), song("c"), song("d")];
+
+        // 删选中项之后的歌：高亮不动
+        assert_eq!(queue_removal(&items, Some(2), "d"), Some((3, Some(2))));
+        // 删选中项之前的歌：后面整体前移，高亮跟着前移一格（仍是原来那首 c）
+        assert_eq!(queue_removal(&items, Some(2), "a"), Some((0, Some(1))));
+        // 删选中项自身（在末尾）：下标保持，越界交给 clamp 收回
+        assert_eq!(queue_removal(&items, Some(3), "d"), Some((3, Some(3))));
+        // 没有选中项时只按 hash 找
+        assert_eq!(queue_removal(&items, None, "c"), Some((2, None)));
+        // 不在队列里
+        assert_eq!(queue_removal(&items, Some(1), "zzz"), None);
+
+        // 同 hash 重复：优先删选中那一份，而不是第一份
+        let dup = vec![song("x"), song("y"), song("x")];
+        assert_eq!(queue_removal(&dup, Some(2), "x"), Some((2, Some(2))));
+        assert_eq!(queue_removal(&dup, Some(0), "x"), Some((0, Some(0))));
     }
 }

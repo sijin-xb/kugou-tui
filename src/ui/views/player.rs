@@ -504,8 +504,11 @@ pub fn render_queue(
     let row_width = inner.width.saturating_sub(1) as usize;
     // 可见行数（供 `row_is_visible` 判断哪些行值得真正构造）
     let visible_rows = inner.height as usize;
-    let offset = cursor.offset();
-    let selected = cursor.selected();
+    // 同 `render_song_list`：`offset`/`selected` 是渲染前的旧值，列表刚缩短时可能越界，
+    // 先按当前长度钳一遍，避免整屏被误判成窗口外。
+    let last = queue.len().saturating_sub(1);
+    let offset = cursor.offset().min(last);
+    let selected = cursor.selected().map(|index| index.min(last));
     let items: Vec<_> = queue
         .items()
         .iter()

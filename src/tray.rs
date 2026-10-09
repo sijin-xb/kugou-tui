@@ -1453,4 +1453,56 @@ mod tests {
             }
         }
     }
+
+    /// 同一首歌内每拍只该刷新状态/静音，不该反复重建歌名/歌手。
+    #[test]
+    fn update_track_skips_metadata_rebuild_for_the_same_track() {
+        let handle = TrayHandle {
+            info: Arc::new(Mutex::new(TrayInfo::default())),
+            connected: Arc::new(AtomicBool::new(true)),
+        };
+        let built = std::cell::Cell::new(0u32);
+        let build = || {
+            built.set(built.get() + 1);
+            TrayInfo {
+                title: "歌名".to_string(),
+                artists: vec!["歌手".to_string()],
+                ..TrayInfo::default()
+            }
+        };
+
+        handle.update_track("h1", PlaybackState::Playing, false, build);
+        assert_eq!(built.get(), 1, "换歌时必须重建一次元数据");
+
+        handle.update_track("h1", PlaybackState::Paused, true, build);
+        assert_eq!(built.get(), 1, "同一首歌内不该再重建元数据");
+
+        let info = handle.info.lock().expect("锁没中毒");
+        assert_eq!(info.title, "歌名", "元数据应保留");
+        assert!(info.muted, "静音每拍都要刷新");
+        assert_eq!(info.status, PlaybackState::Paused, "状态每拍都要刷新");
+    }
+
+    /// 换歌时必须整份替换元数据。
+    #[test]
+    fn update_track_rebuilds_metadata_when_the_track_changes() {
+        let handle = TrayHandle {
+            info: Arc::new(Mutex::new(TrayInfo::default())),
+            connected: Arc::new(AtomicBool::new(true)),
+        };
+        handle.update_track("h1", PlaybackState::Playing, false, || TrayInfo {
+            title: "旧".to_string(),
+            track_id: "h1".to_string(),
+            ..TrayInfo::default()
+        });
+        handle.update_track("h2", PlaybackState::Playing, false, || TrayInfo {
+            title: "新".to_string(),
+            track_id: "h2".to_string(),
+            ..TrayInfo::default()
+        });
+
+        let info = handle.info.lock().expect("锁没中毒");
+        assert_eq!(info.title, "新");
+        assert_eq!(info.track_id, "h2");
+    }
 }
