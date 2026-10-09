@@ -39,15 +39,16 @@ use crate::source::SourceKind;
 
 /// 用哪套后端实现。
 ///
-/// 默认 [`ApiBackend::Node`]：内嵌后端在阶段 2 起逐步接入，全部验收通过之前
-/// 不改变默认行为。
+/// 默认 [`ApiBackend::Native`]：酷狗接口在进程内实现，不需要 Node.js。
+/// [`ApiBackend::Node`] 保留作为回退（自建服务、别的机器上的服务、
+/// 或排查内嵌实现的差异时用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiBackend {
     /// 走本机 KuGouMusicApi（Node）。
-    #[default]
     Node,
     /// 内嵌的纯 Rust 实现，不需要 Node。
+    #[default]
     Native,
 }
 
@@ -387,10 +388,10 @@ mod tests {
         assert!(data_of(&root).get("lists").is_some());
     }
 
-    /// 默认必须是 node：阶段 1 的出口条件就是「默认行为与改动前一致」。
+    /// 默认必须是 native：酷狗接口在进程内实现，用户不装 Node 也能用。
     #[test]
-    fn node_is_the_default_backend() {
-        assert_eq!(ApiBackend::default(), ApiBackend::Node);
+    fn native_is_the_default_backend() {
+        assert_eq!(ApiBackend::default(), ApiBackend::Native);
     }
 
     /// `--api native` 只覆盖酷狗两个平台。

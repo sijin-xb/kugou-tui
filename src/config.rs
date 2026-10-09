@@ -210,8 +210,8 @@ pub struct Config {
 
     /// 酷狗接口由哪套后端实现。
     ///
-    /// 默认 `node`（本机 KuGouMusicApi）。`native` 是内嵌的纯 Rust 实现，
-    /// 不需要 Node.js；两个酷狗平台共享这个开关，网易云与汽水不受影响。
+    /// 默认 `native`（内嵌的纯 Rust 实现，不需要 Node.js）。`node` 是本机
+    /// KuGouMusicApi 回退；两个酷狗平台共享这个开关，网易云与汽水不受影响。
     #[serde(default)]
     pub api_backend: crate::api::ApiBackend,
 
@@ -975,25 +975,25 @@ volume = 0.5
         // 断言字面量而不是那个函数：这里要锁的是「对外承诺的默认值就是 200ms」，
         // 拿常量比自己跟自己比，改了默认值也照样通过。
         assert_eq!(parsed.lyric_anim_ms, 200);
-        // 新增的 `api_backend` 同理：老配置里没有这一项，必须落到 node。
-        // 若这里悄悄变成 native，老用户升级后会在毫不知情的情况下换掉整条接口链路。
-        assert_eq!(parsed.api_backend, crate::api::ApiBackend::Node);
+        // 新增的 `api_backend` 同理：老配置里没有这一项，落到默认值。
+        // 默认值就是 [`crate::api::ApiBackend::Native`]（接口内嵌，不需要 Node）。
+        assert_eq!(parsed.api_backend, crate::api::ApiBackend::Native);
     }
 
-    /// `--api native` 要能覆盖配置里的值，也要能落盘、读回。
+    /// `--api node` 要能覆盖配置里的默认值，也要能落盘、读回。
     #[test]
     fn cli_api_backend_overrides_and_round_trips() {
-        let cli = Cli::parse_from(["kugou-tui", "--api", "native"]);
+        let cli = Cli::parse_from(["kugou-tui", "--api", "node"]);
         let mut config = Config::default();
-        assert_eq!(config.api_backend, crate::api::ApiBackend::Node);
-
-        config.merge_cli(&cli);
         assert_eq!(config.api_backend, crate::api::ApiBackend::Native);
 
+        config.merge_cli(&cli);
+        assert_eq!(config.api_backend, crate::api::ApiBackend::Node);
+
         let text = toml::to_string_pretty(&config).expect("要能序列化");
-        assert!(text.contains("api_backend = \"native\""), "实际：\n{text}");
+        assert!(text.contains("api_backend = \"node\""), "实际：\n{text}");
         let parsed: Config = toml::from_str(&text).expect("要能读回");
-        assert_eq!(parsed.api_backend, crate::api::ApiBackend::Native);
+        assert_eq!(parsed.api_backend, crate::api::ApiBackend::Node);
     }
 
     /// 不传 `--api` 时保留配置里已有的值，不要被默认值抹掉。

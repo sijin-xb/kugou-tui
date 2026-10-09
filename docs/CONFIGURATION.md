@@ -6,7 +6,8 @@
 
 | 参数 | 环境变量 | 说明 |
 |---|---|---|
-| `-a`, `--api-base <URL>` | `KUGOU_API_BASE` | KuGouMusicApi 地址，默认 `http://127.0.0.1:3000` |
+| `--api <node\|native>` | `KUGOU_API_BACKEND` | 酷狗接口用哪套后端，默认 `native`（内嵌纯 Rust，不需要 Node.js），见下方说明 |
+| `-a`, `--api-base <URL>` | `KUGOU_API_BASE` | KuGouMusicApi 地址，默认 `http://127.0.0.1:3000`（仅 `--api node` 时使用） |
 | `-c`, `--cookie <COOKIE>` | `KUGOU_COOKIE` | 登录凭据，形如 `token=xxx; userid=xxx` |
 | `-s`, `--search <KEYWORDS>` | — | 启动后立刻搜索该关键词 |
 | `--volume <0-100>` | — | 初始音量 |
@@ -67,7 +68,8 @@ Windows 是 `%LOCALAPPDATA%\kugou-tui\`。
 连同最终生效的值一起打出来）。
 
 ```toml
-api_base = "http://127.0.0.1:3000"
+api_backend = "native"              # native（默认，内嵌）| node（本机服务回退）
+api_base = "http://127.0.0.1:3000"  # 仅 --api node 时使用
 cookie = "token=xxx; userid=xxx"   # 登录态，可手动填
 dfid = "..."                        # 设备指纹，首次启动自动获取
 volume = 0.7                        # 0.0–1.0
@@ -134,6 +136,26 @@ priority = 30
 # device_id / iid / fp 留空 = 用签名侧自己的设备身份
 # x_helios / x_medusa 是抓来的静态签名头，会过期
 ```
+
+### 酷狗接口的后端（`api_backend`）
+
+默认 `native`：酷狗标准版与概念版的接口全部在进程内用纯 Rust 实现，**不需要 Node.js**，
+启动即可用，也没有「首次运行准备服务」这一步。
+
+`node` 是回退：走本机（或别的机器上的）KuGouMusicApi 服务，保留给自建服务、
+排查内嵌实现差异的场景。切换方式：
+
+```bash
+kugou-tui --api node            # 临时切回 Node 服务
+kugou-tui --api native          # 临时切回内嵌（等于默认）
+```
+
+```toml
+api_backend = "node"            # 长期切换，写进配置文件
+```
+
+登录态与设备指纹两种后端共用同一份（`cookie` / `dfid`），**来回切换不需要重新登录**。
+这个开关只影响酷狗两个音源，网易云与汽水不受影响。
 
 ### 接口服务的自动拉起
 

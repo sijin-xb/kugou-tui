@@ -26,21 +26,21 @@
 
 接口实现**内嵌在二进制里**（纯 Rust），默认不需要 Node.js。两种后端可以随时切换：
 
-| | `--api native`（内嵌，推荐） | `--api node`（回退） |
+| | `--api native`（默认，内嵌） | `--api node`（回退） |
 |---|---|---|
 | 需要 Node.js | **不需要** | 需要 ≥ 12 |
 | 常驻内存 | 约 19 MiB（单进程） | 本程序约 19 MiB **+ 独立的 node 服务进程 42–67 MiB** |
 | 覆盖范围 | 酷狗标准版 / 概念版全部功能 | 同上，另含网易云与汽水音源的传输层 |
 
-> 当前版本的**默认值仍是 `--api node`**（保持与历史版本一致）。想用内嵌后端，
-> 加 `--api native`，或写进配置文件：`api_backend = "native"`。默认值会在验收完成后
-> 切换到 `native`；`--api node` 始终保留作为回退。
+> **默认后端是 `native`**：酷狗接口在进程内实现，装了就能用，不需要 Node.js。
+> 想切回 Node 服务（自建服务、跑在别的机器上、或排查差异），加 `--api node`，
+> 或写进配置文件：`api_backend = "node"`。
 
 **cargo**（推荐）：
 
 ```bash
 cargo install kugou-tui
-kugou-tui --api native
+kugou-tui
 ```
 
 内嵌后端启动即可用，没有「首次运行准备服务」这一步。若要用 Node 回退（或跑网易云、

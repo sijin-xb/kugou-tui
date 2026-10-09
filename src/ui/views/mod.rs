@@ -889,9 +889,12 @@ mod tests {
 
     /// 侧边栏装不下时要「**能放几行放几行**」，并在末尾说明还有什么没显示。
     ///
-    /// 早先是「一块放不下就整块丢掉」：108×30 的终端里「连接」整块被吞掉，
-    /// 屏幕上一条状态都没有——比只显示前几行还糟。而且丢掉时没有任何提示，
-    /// 用户不知道下面还有东西。
+    /// 早先是「一块放不下就整块丢掉」：108×30 的终端里第一块（当时的标题是
+    /// 「连接」）整块被吞掉，屏幕上一条状态都没有——比只显示前几行还糟。而且丢掉时
+    /// 没有任何提示，用户不知道下面还有东西。
+    ///
+    /// 现在默认后端是 native，第一块的标题成了「接口 · 内嵌」；这条测的是**裁块
+    /// 逻辑**，与后端无关，所以跟着默认标题走。
     #[test]
     fn sidebar_fills_what_it_can_and_names_what_it_dropped() {
         let state = AppState::new(Config::default());
@@ -899,10 +902,10 @@ mod tests {
         // 108×30 是 README 用的参考尺寸，也是这个 bug 最容易露出来的地方
         let text = screen_text(&draw_sidebar(&state, 108, 30));
         assert!(
-            text.contains("连接"),
-            "「连接」的标题必须放得下——放不下就等于一条状态都不显示：{text}"
+            text.contains("接口"),
+            "第一块的标题必须放得下——放不下就等于一条状态都不显示：{text}"
         );
-        assert!(text.contains("API"), "连接块的前几行应当照常显示：{text}");
+        assert!(text.contains("API"), "第一块的前几行应当照常显示：{text}");
         assert!(
             text.contains("另有"),
             "有内容没显示时必须说明，不能静默裁掉：{text}"
@@ -935,7 +938,9 @@ mod tests {
             !text.contains("另有"),
             "内容全放得下时不该提示有省略：{text}"
         );
-        for block in ["连接", "播放", "缓存"] {
+        // 第一块的标题随后端变（native 是「接口 · 内嵌」，node 是「连接 · …」），
+        // 这里断言的是「三块都画出来了」，所以用各自稳定的字眼。
+        for block in ["接口", "播放", "缓存"] {
             assert!(text.contains(block), "60 行终端应显示完整的「{block}」块");
         }
     }
