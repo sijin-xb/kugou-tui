@@ -367,10 +367,7 @@ mod tests {
         let converted = AppError::from(error);
         let text = converted.to_string();
         assert!(!text.contains(secret), "token 不该进错误文案：{text}");
-        assert!(
-            !text.contains("10001"),
-            "userid 不该进错误文案：{text}"
-        );
+        assert!(!text.contains("10001"), "userid 不该进错误文案：{text}");
         assert!(
             !text.contains(&port.to_string()),
             "URL 整体都该被摘掉：{text}"
