@@ -63,6 +63,9 @@ mod tray;
 mod ui;
 mod util;
 mod window;
+// WebSocket 服务：跨平台（只依赖 tokio 的 TcpListener 与 rustls），不像 MPRIS
+// 那样需要桌面环境。
+mod ws;
 
 use anyhow::Context;
 use clap::Parser;

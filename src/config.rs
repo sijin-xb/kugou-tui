@@ -35,6 +35,12 @@ const DEFAULT_CACHE_LIMIT_MIB: u64 = 512;
 const DEFAULT_QUALITY: &str = "128";
 const APP_DIR_NAME: &str = "kugou-tui";
 
+/// WebSocket 服务的默认端口。
+///
+/// 与 MoeKoeMusic 一致（其文档写 `ws://127.0.0.1:6520/`），这样面向它的第三方
+/// 客户端不用改配置就能连上。
+pub const DEFAULT_WS_PORT: u16 = 6520;
+
 /// `/song/url` 支持的音质取值。
 ///
 /// 前五个是常规音质；`viper_*` 是酷狗的「蝰蛇音效」系列，仅部分歌曲支持，
@@ -208,6 +214,19 @@ pub struct Config {
     /// 不需要 Node.js；两个酷狗平台共享这个开关，网易云与汽水不受影响。
     #[serde(default)]
     pub api_backend: crate::api::ApiBackend,
+
+    /// 是否启动 WebSocket 服务，供第三方客户端读取播放状态、歌词并遥控播放。
+    ///
+    /// 默认开启。**只监听 `127.0.0.1`**，不接受来自其他主机的连接；命令行可用
+    /// `--no-ws` 临时关闭。协议与 MoeKoeMusic 兼容，见 `ws.rs` 的模块注释。
+    #[serde(default = "default_ws")]
+    pub ws: bool,
+
+    /// WebSocket 服务监听的端口。
+    ///
+    /// 默认 6520（与 MoeKoeMusic 相同，面向它的客户端可直接连上）。
+    #[serde(default = "default_ws_port")]
+    pub ws_port: u16,
 }
 
 /// 把命令行传上来的可选字符串收拾成「有内容才 Some」。
@@ -241,6 +260,17 @@ fn default_tray() -> bool {
     // 非 Unix 平台上托盘（StatusNotifierItem）与 MPRIS 都是 D-Bus 接口，根本
     // 不存在，默认就关——免得配置里留一个「开了也不会有反应」的 true。
     cfg!(unix)
+}
+
+fn default_ws() -> bool {
+    // 与 `tray` 不同，WebSocket 不依赖桌面环境，各平台行为一致，所以默认就开。
+    // 它只绑 127.0.0.1，且控制面只映射到已有的播放 `Action`，风险可控；
+    // 不用的人用 `--no-ws` 或配置里 `ws = false` 关掉即可。
+    true
+}
+
+fn default_ws_port() -> u16 {
+    DEFAULT_WS_PORT
 }
 
 /// 首页那块大封面怎么铺满它的区域。
@@ -318,6 +348,8 @@ impl Default for Config {
             api_dir: None,
             sources: SourceSet::default(),
             api_backend: crate::api::ApiBackend::default(),
+            ws: default_ws(),
+            ws_port: default_ws_port(),
         }
     }
 }
@@ -500,6 +532,12 @@ impl Config {
         }
         if let Some(backend) = cli.api {
             self.api_backend = backend;
+        }
+        if cli.no_ws {
+            self.ws = false;
+        }
+        if let Some(port) = cli.ws_port {
+            self.ws_port = port;
         }
 
         // 汽水的凭据与签名：只覆盖**显式传了**的项，其余保留配置文件里的值。

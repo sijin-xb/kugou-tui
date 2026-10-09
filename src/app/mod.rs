@@ -162,6 +162,9 @@ pub struct App {
     /// 托盘句柄。`config.tray == false` 或环境探测失败时为 `None`。
     #[cfg(unix)]
     tray: Option<crate::tray::TrayHandle>,
+
+    /// WebSocket 服务句柄。`config.ws == false` 或端口绑定失败时为 `None`。
+    ws: Option<crate::ws::WsHandle>,
 }
 
 /// 动画帧间隔（约 30fps）。终端里再往上（60fps）看不出差别，但重绘成本是线性的，
@@ -238,6 +241,14 @@ impl App {
             None
         };
 
+        // WebSocket 服务。同样共享 bus：入站的 `control` 命令经它派发成播放动作。
+        // 绑定失败（端口被占）只记一条 WARN，不影响播放。
+        let ws_handle = if config.ws {
+            crate::ws::spawn(bus.clone(), config.ws_port)
+        } else {
+            None
+        };
+
         let state = AppState::new(config);
 
         let mut app = Self {
@@ -260,6 +271,7 @@ impl App {
             mpris,
             #[cfg(unix)]
             tray: tray_handle,
+            ws: ws_handle,
         };
 
         app.state.picker = Some(detect_image_picker());

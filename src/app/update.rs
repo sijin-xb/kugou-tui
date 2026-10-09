@@ -2790,6 +2790,8 @@ impl App {
             self.sync_mpris();
             self.sync_tray();
         }
+        // WebSocket 服务跨平台，所以不放进上面的 cfg 块
+        self.sync_ws();
 
         if self.state.playback == PlaybackState::Playing {
             self.update_active_lyric();

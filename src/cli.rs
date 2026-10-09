@@ -113,6 +113,18 @@ pub struct Cli {
     #[arg(long)]
     pub no_tray: bool,
 
+    /// 启动时不开启 WebSocket 服务。配置文件里的 `ws` 也可关。
+    ///
+    /// 服务只监听 `127.0.0.1`，用于第三方客户端读取播放状态与歌词、遥控播放。
+    #[arg(long)]
+    pub no_ws: bool,
+
+    /// WebSocket 服务的监听端口（默认 6520）。
+    ///
+    /// 只影响监听端口，仍然只绑 `127.0.0.1`。
+    #[arg(long, value_name = "PORT")]
+    pub ws_port: Option<u16>,
+
     /// 不自动拉起本机接口服务。
     ///
     /// 服务由你自己管理（跑在别的机器上、交给 systemd、或本来就常驻着）。端口上

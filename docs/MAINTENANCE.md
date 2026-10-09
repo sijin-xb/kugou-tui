@@ -26,6 +26,7 @@ src/
 ├─ error.rs           AppError 与「重试不重试」的判据
 ├─ mpris.rs           桌面集成：MPRIS（playerctl / DMS 等）——**仅 Unix**，见下
 ├─ tray.rs            系统托盘——**仅 Unix**，同上
+├─ ws.rs              WebSocket 服务：状态 / 歌词推送 + 遥控（仅 127.0.0.1）
 ├─ api/               接口层（只跟 KuGouMusicApi 说话）
 │  ├─ client.rs       带重试的 HTTP；AppError 归类在这里
 │  ├─ catalog.rs      搜索 / 歌单 / 榜单 / 歌手 / 取播放直链
@@ -49,7 +50,7 @@ src/
 │  ├─ search.rs       搜索：提交与分页追加
 │  ├─ cloud.rs        登录 / 音源切换 / VIP / 云端歌单 / 账号资料
 │  ├─ settings.rs     设置页：候选值 + 显示文本 + 三个交互（移动 / 点击 / 改值）
-│  ├─ desktop.rs      MPRIS / 系统托盘 / 窗口控制
+│  ├─ desktop.rs      MPRIS / 系统托盘 / 窗口控制 / WebSocket 快照
 │  ├─ queue.rs        播放队列与播放模式
 │  └─ session.rs      会话持久化（上次听到哪）
 └─ ui/                ratatui 渲染（只读 state，不改）
@@ -63,6 +64,7 @@ input thread ──┐
 async tasks ───┘                      │
                                       └─→ AppState（主线程独占，无锁）
 audio thread(kugou-audio) ───────────→ 原子量（位置/时长/音量/状态）+ EventBus
+ws thread(ws.rs) ────────────────────→ 自己的 current_thread runtime（见 1.9）
 ```
 
 三条铁律：
@@ -71,6 +73,9 @@ audio thread(kugou-audio) ───────────→ 原子量（位�
 2. 异步任务的产物一律**回到主线程**再由 `update.rs` 消费（`bus.emit(Loaded::…)`）。
 3. 音频线程与主线程之间**高频数据走原子量**（位置/音量/电平），**离散事件走 EventBus**
    （装载完成、曲目结束、错误）。
+
+WebSocket 线程是这三条的一个例外写法，但**不破坏**它们：它读的是主循环每拍写进去的
+`watch` 快照（只读），入站命令则经 `EventBus` 回到主线程——和异步任务同一条路径。
 
 ### 1.3 播放一首歌的数据流
 
@@ -334,6 +339,55 @@ search ──→ （无）
   不是「它写在哪个标题下面」（见上面那张表）。
 * 常量跟着用它的人走：`RESTART_THRESHOLD_MS` 搬进 `playback.rs`，
   `SEARCH_MAX_PAGES` 搬进 `search.rs`——它们只被那一块用。
+
+### 1.9 WebSocket 服务（`ws.rs`）
+
+协议对齐 MoeKoeMusic（<https://music.moekoe.cn/zh-CN/websocket-api.html>），默认监听
+`127.0.0.1:6520`，`--no-ws` / `ws = false` 关闭，`--ws-port` 改端口。
+
+```
+main loop(tick) ──sync_ws()──→ watch::Sender<Arc<Snapshot>>   （只写快照）
+                                        │
+ws thread ──watch::Receiver─────────────┘  diff_messages() → broadcast → 各连接
+    │
+    └── 入站 control ──EventBus──→ main loop 派发成已有 Action
+```
+
+几条设计取舍，改之前先读：
+
+* **自己起线程 + `current_thread` runtime**，不往主 runtime 里塞。它只做两件事：
+  收发 WebSocket 帧、比对快照。主循环的 tick 节奏不该被网络 I/O 影响。
+* **`sync_ws` 每拍写一份完整快照**（含 `Song` 克隆），`send_if_modified` 用
+  `Snapshot` 的自定义 `PartialEq` 判等——它只比较「会改变推送内容」的字段，
+  刻意不比整个 `Song`（`privilege` 是个大嵌套 JSON，每拍比一遍不值）。
+  快照没变就不唤醒广播任务，暂停期间这条调用近乎免费。
+* **`playerState` 只在播放 / 暂停翻转时推**，不是每拍推。上游
+  `updatePlayerState` 的唯一调用点是 `electron/main.js` 的 `play-pause-action`；
+  文档写的是「播放状态发生变化时」。连接建立时单独补发一次。
+* **`lyrics` 每拍推**（上游 `server-lyrics` 路径同样不防抖；只有桌面歌词那条 IPC
+  按行去抖）。`lyricsData` 是**原始歌词文本**，即 `Lyric::text`——不是解析后的
+  `lines`，因为逐字标记与 `[language:]` 标签正是第三方客户端要自己排版的。
+* **welcome 的 `data` 是纯字符串**，不是文档样例里的嵌套对象。以源码为准。
+* **未知 `control` 命令回一条 `error`**，不像上游那样静默忽略。
+* **握手校验 `Origin`**：浏览器里任何页面都能连本机端口，不校验等于把播放控制
+  开放给当时打开的每个标签页。没有 `Origin` 的原生客户端放行。
+* **入站消息限 64 KiB**（tungstenite 默认 64 MiB 太宽）。出站不限，KRC 可能几十 KB。
+* **`lyrics` 变体是 `Box<LyricsData>`**：不装箱时枚举每个实例都 264 字节，而它是
+  按值在 `Vec` 里传的。
+
+### 1.10 WebSocket 的验证方式
+
+没有自动化集成测试（要真起播放器），靠一个外部客户端手工验：
+
+```bash
+# 1) 起播放器（隔离配置目录！别碰 ~/.config/kugou-tui）
+KUGOU_TUI_CONFIG_DIR=/tmp/kt-ws ./target/debug/kugou-tui --search 周杰伦 --no-tray
+# 2) 另开一个终端，用任意 WS 客户端连 ws://127.0.0.1:6520/
+#    期望：先收 welcome + playerState，播放后每 200ms 一条 lyrics；
+#    发 {"type":"control","data":{"command":"toggle"}} 应切换播放并收到 playerState。
+```
+
+`node --experimental-websocket` 或浏览器控制台都行，不需要额外依赖。
 
 
 ---
