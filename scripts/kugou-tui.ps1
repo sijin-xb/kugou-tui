@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    kugou-tui —— Windows 启动器：确保 KuGouMusicApi 在跑，然后进入播放器。
+    kugou-tui —— Windows 启动器：需要本机接口服务时确保它在跑，然后进入播放器。
 
 .DESCRIPTION
     对应 Unix 侧的 `scripts/kugou-tui`。
@@ -9,8 +9,13 @@
     但什么都搜不到，容易让人以为程序坏了。这里把「检查 → 拉起 → 等待就绪」收进一条命令；
     服务已经在跑时它只是一次本地探测，开销可忽略。
 
+    但它**只在需要服务时才做这些**。默认后端 `native` 把酷狗接口实现在进程内，本机既
+    不需要 KuGouMusicApi、也不需要 Node.js——启动器认 `api_backend`（以及 `--api` /
+    `KUGOU_API_BACKEND`），是 `native` 就直接进播放器，不探端口、不拉进程。
+
 .PARAMETER 其余参数
-    全部原样透传给播放器：`-s 海阔天空`、`-a http://127.0.0.1:3001`、`--volume 50`……
+    全部原样透传给播放器：`-s 海阔天空`、`-a http://127.0.0.1:3001`、`--api node`、
+    `--volume 50`……
 
     刻意**不写 `param()` 块**：一旦声明了参数，PowerShell 就会把不认识的 `-s` 当成
     写错的参数名直接报「找不到匹配的参数」。没有 `param()` 时所有参数都进 `$args`，
@@ -41,9 +46,28 @@ $ProgressPreference = 'SilentlyContinue'
 # ==================================================================
 $dryRun = $false
 $playerArgs = @()
+
+# 顺带记下 `--api`（或 `KUGOU_API_BACKEND`）请求的后端：它决定本机到底还需不需要
+# Node 服务。参数本身仍然原样透传给播放器，这里只是**顺便看一眼**。
+$requestedBackend = if ($env:KUGOU_API_BACKEND) { $env:KUGOU_API_BACKEND } else { '' }
+$expectBackend = $false
 foreach ($argument in $args) {
+    if ($expectBackend) {
+        $requestedBackend = $argument
+        $expectBackend = $false
+        $playerArgs += $argument
+        continue
+    }
     if ($argument -eq '-DryRun' -or $argument -eq '--dry-run') {
         $dryRun = $true
+    }
+    elseif ($argument -eq '--api') {
+        $expectBackend = $true
+        $playerArgs += $argument
+    }
+    elseif ($argument -like '--api=*') {
+        $requestedBackend = $argument.Substring(6)
+        $playerArgs += $argument
     }
     else {
         $playerArgs += $argument
@@ -180,6 +204,29 @@ $needsService = -not $isSodam
 $serviceName = if ($isSodam) { '汽水公网接口' } elseif ($isNetease) { 'NeteaseCloudMusicApi' } else { 'KuGouMusicApi' }
 $defaultApiDirName = if ($isNetease) { 'NeteaseCloudMusicApi' } else { 'KuGouMusicApi' }
 
+# 后端是 `native` 时酷狗接口实现在**进程内**，本机根本不需要 KuGouMusicApi。
+# 早先这里只看音源，于是后端明明是 native，启动器照样探端口、探不到就 `node app.js`
+# ——刚装好的纯 Rust 版本，第一次启动就在后台拉了一个 Node 进程。
+#
+# 取值顺序与 Rust 侧一致：`--api` / `KUGOU_API_BACKEND` > 配置 > 默认 `native`。
+# 与 `ApiBackend::effective_for()` 对齐：`native` 只覆盖酷狗两个平台，网易云与汽水
+# 的接口不在 `MusicApi` 里，它们照旧要本机服务。
+$serviceSkipReason = ''
+if (-not $requestedBackend) {
+    $requestedBackend = Get-ConfigValue -Text $configText -Key 'api_backend'
+}
+if (-not $requestedBackend) { $requestedBackend = 'native' }
+
+if ($needsService -and $requestedBackend -eq 'native') {
+    if ($activeSource -in @('kugou', 'kugou_concept')) {
+        $needsService = $false
+        $serviceSkipReason = '内嵌后端（--api native）在进程内实现酷狗接口，不需要 Node.js'
+    }
+}
+if (-not $needsService -and -not $serviceSkipReason) {
+    $serviceSkipReason = '该音源直连公网，本机没有服务'
+}
+
 # 实例名（standard / lite）——与 `kugou-api`（bash 版与 kugou-api.ps1）的实例名、
 # PID 文件命名保持一致。这样启动器拉起来的服务，`kugou-api.ps1 status` 看得见、
 # `kugou-api.ps1 stop` 停得掉；否则就只能靠任务管理器手杀 node。
@@ -245,9 +292,10 @@ if ($dryRun) {
     Write-Host "当前音源    : $activeSource"
     Write-Host "播放器      : $bin"
     Write-Host "透传参数    : $($playerArgs -join ' ')"
+    Write-Host "接口后端    : $requestedBackend"
     if (-not $needsService) {
         # 说清「不需要」而不是打一串用不上的端口/目录：那会让人以为还得去准备点东西。
-        Write-Host '接口服务    : 不需要（该音源直连公网，本机没有服务）'
+        Write-Host "接口服务    : 不需要（$serviceSkipReason）"
     }
     else {
         Write-Host "实例        : $instanceName（PID 文件 $pidFile）"

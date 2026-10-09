@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 #
-# kugou-tui —— 启动器：确保 KuGouMusicApi 在跑，然后进入播放器。
+# kugou-tui —— 启动器：需要本机接口服务时确保它在跑，然后进入播放器。
 #
 # 为什么需要它：kugou-tui 只是客户端，数据全来自 KuGouMusicApi。服务没起时界面能开
 # 但什么都搜不到，容易让人以为程序坏了。这里把「检查 → 拉起 → 等待就绪」收进一条命令；
 # 服务已经在跑时它只是一次本地探测，开销可忽略。
 #
+# 但它**只在需要服务时才做这些**。默认后端 `native` 把酷狗接口实现在进程内，本机既
+# 不需要 KuGouMusicApi、也不需要 Node.js——启动器认 `api_backend`（以及 `--api` /
+# `KUGOU_API_BACKEND`），是 `native` 就直接进播放器，不探端口、不拉进程。
+#
 # 用法：
 #   kugou-tui                 # 打开播放器
 #   kugou-tui -s 海阔天空      # 启动即搜索（其余参数原样透传）
+#   kugou-tui --api node      # 改用本机 KuGouMusicApi（缺了就自动拉起）
 #   kugou-tui --dry-run       # 只打印决策，不启动任何东西（排查「为什么说服务没起」）
 #   KUGOU_API_BASE=http://other:3000 kugou-tui
 #
@@ -95,6 +100,22 @@ config_file="$(config_root)/kugou-tui/config.toml"
 read_active_source() {
   [ -r "$config_file" ] || return 0
   sed -n 's/^[[:space:]]*active[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$config_file" |
+    head -n 1
+}
+
+# 读配置里的 `api_backend`（`node` / `native`）。读不到就输出空，调用方按 `native`
+# 处理——与 Rust 侧 `ApiBackend::default()` 一致。
+#
+# 为什么启动器要知道后端：`native` 把酷狗接口实现在**进程内**，本机根本不需要
+# KuGouMusicApi。早先启动器只看音源决定要不要起服务，于是后端明明是 native，它照样
+# 探端口、探不到就 `npm install` + `node app.js`——刚装好的纯 Rust 版本，第一次启动
+# 就在后台拉了一个 Node 进程，而那个进程对 native 后端毫无用处。
+#
+# `[ -r ]` 的理由同 `read_active_source`：配置文件不存在时不能让 `sed` 的非零退出码
+# 经由 `pipefail` 把脚本带走。
+read_api_backend() {
+  [ -r "$config_file" ] || return 0
+  sed -n 's/^[[:space:]]*api_backend[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$config_file" |
     head -n 1
 }
 
@@ -252,12 +273,54 @@ api_alive() { curl -sf --max-time 2 -o /dev/null "$CHECK_BASE/" 2>/dev/null; }
 # ==================================================================
 DRY_RUN="${KUGOU_TUI_DRY_RUN:-}"
 PLAYER_ARGS=()
+
+# 顺带记下 `--api`（或 `KUGOU_API_BACKEND`）请求的后端：它决定本机到底还需不需要
+# Node 服务。参数本身仍然原样透传给播放器，这里只是**顺便看一眼**。
+REQUESTED_BACKEND="${KUGOU_API_BACKEND:-}"
+expect_backend=0
 for arg in "$@"; do
+  if [ "$expect_backend" = 1 ]; then
+    REQUESTED_BACKEND="$arg"
+    expect_backend=0
+    PLAYER_ARGS+=("$arg")
+    continue
+  fi
   case "$arg" in
     --dry-run | -DryRun) DRY_RUN=1 ;;
+    --api)
+      expect_backend=1
+      PLAYER_ARGS+=("$arg")
+      ;;
+    --api=*)
+      REQUESTED_BACKEND="${arg#--api=}"
+      PLAYER_ARGS+=("$arg")
+      ;;
     *) PLAYER_ARGS+=("$arg") ;;
   esac
 done
+
+# 生效后端：显式请求 > 配置 > 默认 `native`，与 Rust 侧 `ApiBackend::default()` 一致。
+if [ -z "$REQUESTED_BACKEND" ]; then
+  REQUESTED_BACKEND="$(read_api_backend)"
+fi
+[ -n "$REQUESTED_BACKEND" ] || REQUESTED_BACKEND="native"
+
+# 与 Rust 侧 `ApiBackend::effective_for()` 对齐：`native` 只覆盖酷狗两个平台，
+# 网易云与汽水的接口不在 `MusicApi` 里，它们照旧要本机服务。
+#
+# 空 `ACTIVE_SOURCE`（配置还没生成）按标准版算，那也是 Rust 侧的默认音源。
+SERVICE_SKIP_REASON=""
+if [ "$NEEDS_SERVICE" = 1 ] && [ "$REQUESTED_BACKEND" = "native" ]; then
+  case "$ACTIVE_SOURCE" in
+    kugou | kugou_concept | "") NEEDS_SERVICE=0 ;;
+  esac
+  if [ "$NEEDS_SERVICE" = 0 ]; then
+    SERVICE_SKIP_REASON="内嵌后端（--api native）在进程内实现酷狗接口，不需要 Node.js"
+  fi
+fi
+if [ "$NEEDS_SERVICE" = 0 ] && [ -z "$SERVICE_SKIP_REASON" ]; then
+  SERVICE_SKIP_REASON="该音源直连公网，本机没有服务"
+fi
 
 # 空数组在 bash 3.2（macOS 自带的那版）+ `set -u` 下展开会报 unbound variable，
 # 所以要写成 `${PLAYER_ARGS[@]+"${PLAYER_ARGS[@]}"}`。下面的 exec 都这么用。
@@ -268,9 +331,10 @@ if [ -n "$DRY_RUN" ]; then
     "$([ -n "$ACTIVE_SOURCE" ] || printf '（默认）')"
   printf '播放器      : %s\n' "$BIN"
   printf '透传参数    : %s\n' "${PLAYER_ARGS[*]-}"
+  printf '接口后端    : %s\n' "$REQUESTED_BACKEND"
   if [ "$NEEDS_SERVICE" = 0 ]; then
     # 说清「不需要」而不是打一串用不上的端口/目录：那会让人以为还得去准备点东西。
-    printf '接口服务    : 不需要（该音源直连公网，本机没有服务）\n'
+    printf '接口服务    : 不需要（%s）\n' "$SERVICE_SKIP_REASON"
   else
     printf '实例        : %s（PID 文件 %s）\n' "$INSTANCE_NAME" "$PID_FILE"
     printf '探测地址    : %s（端口 %s%s）\n' \

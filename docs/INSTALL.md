@@ -139,7 +139,7 @@ paru -S kugou-tui          # 或 yay -S kugou-tui
 | Windows | Unix 侧对应 | 干什么 |
 |---|---|---|
 | `scripts/kugou-api-install.ps1` | `kugou-api-install` | 拉取接口服务 + 装依赖（只需一次） |
-| `scripts/kugou-tui.ps1` | `kugou-tui` | 启动器：确保服务在跑，然后进播放器 |
+| `scripts/kugou-tui.ps1` | `kugou-tui` | 启动器：需要服务时确保它在跑，然后进播放器 |
 | `scripts/kugou-api.ps1` | `kugou-api` | 服务启停管理：`start` / `stop` / `restart` / `status` / `logs` |
 | `scripts/build-windows.ps1` | `make-release-tarball` | 构建 + 打包 zip |
 
@@ -189,13 +189,22 @@ cargo build --release
 .\scripts\kugou-tui.ps1 --dry-run        # 只打印决策，不启动任何东西
 # 配置        : C:\Users\you\AppData\Roaming\kugou-tui\config.toml
 # 当前音源    : kugou_concept
+# 接口后端    : native
+# 接口服务    : 不需要（内嵌后端（--api native）在进程内实现酷狗接口，不需要 Node.js）
+```
+
+默认的 `--api native` 不需要本机服务，启动器直接进播放器。只有 `--api node` 才会走
+「检查 → 拉起 → 等待就绪」（约 20 秒超时），那时 dry-run 打的是端口与目录：
+
+```powershell
+.\scripts\kugou-tui.ps1 --dry-run --api node
+# 接口后端    : node
 # 探测地址    : http://127.0.0.1:3001（端口 3001，平台 lite）
 # 服务目录    : C:\Users\you\KuGouMusicApi
 # 服务在跑吗  : 没起
 ```
 
-服务没起时启动器会自己拉起并等它就绪（约 20 秒超时）；已经起着就只做一次本地探测。
-也可以完全手动，两个终端各跑一条：
+也可以完全手动，两个终端各跑一条（仅在 `--api node` 路径上需要）：
 
 ```powershell
 cd $env:USERPROFILE\KuGouMusicApi; $env:PORT=3000; node app.js
@@ -344,8 +353,13 @@ npm start          # 注意是 npm start，不是 npm run dev
 
 | 脚本 | 作用 |
 |---|---|
-| `scripts/kugou-tui` | 启动播放器；API 服务没起就自动拉起并等待就绪 |
+| `scripts/kugou-tui` | 启动播放器；**需要**本机 API 服务时，没起就自动拉起并等待就绪 |
 | `scripts/kugou-api` | 一次拉起**两个** API 实例（标准版 + 概念版） |
+
+> `scripts/kugou-tui` 认后端：默认的 `--api native` 把酷狗接口实现在进程内，本机不需要
+> KuGouMusicApi、也不需要 Node.js，启动器直接进播放器，**不探端口、不拉进程**。只有
+> `--api node`（或配置里 `api_backend = "node"`）才会走下面的「检查 → 拉起 → 等待就绪」。
+> 网易云与汽水音源的接口不在内嵌实现里，照旧需要本机服务（汽水直连公网，是唯一例外）。
 
 ```bash
 ln -s "$PWD/scripts/kugou-tui" "$PWD/scripts/kugou-api" ~/.local/bin/
@@ -386,13 +400,24 @@ kugou-api help      # 完整说明
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
+| `KUGOU_API_BACKEND` | 配置文件里的 `api_backend`，再退到 `native` | 与程序同名变量一致。`native` 时启动器不碰本机服务；`--api <node\|native>` 参数优先于它 |
 | `KUGOU_API_BASE` | **不设置** | 设了才给程序传 `--api-base` 并拿它探活；不设时让程序读配置里选中的音源 |
-| `KUGOU_API_DIR` | `$HOME/KuGouMusicApi` | 服务所在目录，用于自动拉起 |
+| `KUGOU_API_DIR` | `$HOME/KuGouMusicApi` | 服务所在目录，用于自动拉起（仅 `--api node` 时用得上） |
 | `KUGOU_API_LOG` | `$XDG_CACHE_HOME/kugou-tui/api.log` | 服务日志路径 |
 | `KUGOU_TUI_BIN` | 自动探测 | 手动指定二进制路径。默认先找 `脚本目录/../target/release/kugou-tui`，再找 `PATH` 上的 |
 | `API_PORT` | `3000` | 自动拉起服务时用的端口 |
 
+`kugou-tui --dry-run` 会打印它算出的后端与是否需要服务，排查「为什么它没起服务 / 为什么它起了服务」时用：
+
+```
+接口后端    : native
+接口服务    : 不需要（内嵌后端（--api native）在进程内实现酷狗接口，不需要 Node.js）
+```
+
 ### 不想让 node 常驻？
+
+只有在 `--api node` 回退路径上才会有 node 进程；默认的 `--api native` 根本不拉它，
+这一节可以跳过。
 
 `scripts/kugou-tui` 用 `setsid` 把服务留在后台、退出时**不回收**（为了下次开播秒起）。
 不想留常驻进程的话，两种做法：
@@ -410,9 +435,11 @@ kugou-api help      # 完整说明
 
 **不登录也能听歌**，搜索和云端歌单才需要账号。
 
-1. 确认 KuGouMusicApi 已在跑（`curl -s http://127.0.0.1:3000/`）。
-2. 启动：`kugou-tui`。
-3. 按 **`3`** 进歌单广场 → `Enter` 打开一个歌单 → 移动光标 → `Enter` 播放。
+1. 启动：`kugou-tui`（默认内嵌后端，不需要先准备任何服务）。
+2. 按 **`3`** 进歌单广场 → `Enter` 打开一个歌单 → 移动光标 → `Enter` 播放。
+
+> 只有走 `--api node` 回退路径时才需要先确认 KuGouMusicApi 在跑
+> （`curl -s http://127.0.0.1:3000/`）；启动器会自动把它拉起来。
 
 数字键落点：`1` 首页、`2` 搜索、`3` 歌单、`4` 歌手、`5` 排行榜、`6` 云端、`7` 队列、
 `8` 音源、`9` 设置、`0` 可视化（完整表见 [KEYBINDINGS.md](../KEYBINDINGS.md)）。想搜歌按 `2`，
