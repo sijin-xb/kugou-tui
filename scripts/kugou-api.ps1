@@ -12,6 +12,9 @@
     PID 文件的格式（`<PID> <端口>`，空格分隔）与 Unix 侧完全一致，两个平台看到的是
     同一套状态；启动器 `kugou-tui.ps1` 起的实例，这里也认得、停得掉。
 
+    网易云实例（`netease`）同样由启动器拉起，这里不负责 `start` 它；但 `stop` /
+    `status` / `logs` 认得它，所以启动器拉起的网易云也停得掉、看得到。
+
     为什么要两个实例：酷狗两个平台是两套独立的鉴权体系，平台由服务端 `platform`
     决定（`lite` = 概念版），而一个 Node 进程只能加载一份配置。所以要同时用两个
     音源，就得起两个进程、各占一个端口。
@@ -22,7 +25,7 @@
     `start` / `stop` / `restart` / `status` / `logs` / `help`。默认 `start`。
 
 .PARAMETER Instance
-    只对 `logs` 有效：跟哪个实例的日志，`standard`（默认）或 `lite`。
+    只对 `logs` 有效：跟哪个实例的日志，`standard`（默认）、`lite` 或 `netease`。
 
 .EXAMPLE
     .\scripts\kugou-api.ps1 status
@@ -40,7 +43,7 @@ param(
     [string]$Command = 'start',
 
     [Parameter(Position = 1)]
-    [ValidateSet('standard', 'lite')]
+    [ValidateSet('standard', 'lite', 'netease')]
     [string]$Instance = 'standard'
 )
 
@@ -120,6 +123,15 @@ $instances = @(
     [pscustomobject]@{ Name = 'lite'; Port = $litePort; Platform = 'lite' }
 )
 
+# 网易云不是酷狗实例，由启动器 kugou-tui.ps1 自己拉起（目录、平台都和酷狗不是一套），
+# 所以这里不负责 start 它。但 stop / status / logs 必须认得它：它和酷狗写同一套 PID
+# 文件，认不得就只能放任它占着端口（以前更糟——它沿用 standard 实例名，stop 会照着
+# api-standard.pid 误杀到酷狗标准版）。
+$neteasePort = [int](Pick-Value 'NETEASE_PORT' '3002')
+$externalInstances = @(
+    [pscustomobject]@{ Name = 'netease'; Port = $neteasePort }
+)
+
 # ==================================================================
 # 小工具
 # ==================================================================
@@ -168,6 +180,15 @@ function Get-PortOwner {
         Select-Object -First 1
     if ($connection) { return [int]$connection.OwningProcess }
     return 0
+}
+
+# 外部实例（网易云）的端口不写死：它跟着当前音源的 api_base 走，启动器已经写进了
+# PID 文件。读不到（还没起过、或文件已删）才退回配置里的默认端口。
+function Get-ExternalPort {
+    param([pscustomobject]$Instance)
+    $record = Read-PidRecord (Join-Path $logDir "api-$($Instance.Name).pid")
+    if ($record -and $record.Port) { return $record.Port }
+    return $Instance.Port
 }
 
 function Write-Die {
@@ -400,11 +421,18 @@ switch ($Command) {
     'stop' {
         Write-Host '停止 KuGouMusicApi'
         foreach ($item in $instances) { Stop-One $item }
+        # 网易云由启动器拉起，但它和酷狗写同一套 PID 文件，stop 就该把它也停掉，
+        # 而不是留着它继续占端口。
+        foreach ($item in $externalInstances) {
+            Stop-One ([pscustomobject]@{ Name = $item.Name; Port = (Get-ExternalPort $item) })
+        }
     }
 
     'restart' {
         Write-Host '重启 KuGouMusicApi'
         foreach ($item in $instances) { Stop-One $item }
+        # 网易云不在重启范围内：restart 的语义是重启 KuGouMusicApi，而这里不负责
+        # 拉起网易云（那是启动器的事）。停掉它反而会留下一个没人再起的服务。
         # 端口释放需要一点时间，不等的话下一轮会把「还没退干净」误判成端口占用
         Start-Sleep -Seconds 1
         Assert-ApiDir
@@ -421,6 +449,9 @@ switch ($Command) {
     'status' {
         Write-Host 'KuGouMusicApi 状态'
         foreach ($item in $instances) { Show-Status $item }
+        foreach ($item in $externalInstances) {
+            Show-Status ([pscustomobject]@{ Name = $item.Name; Port = (Get-ExternalPort $item) })
+        }
     }
 
     'logs' {

@@ -113,7 +113,6 @@ $configFile = Join-Path $configDir 'config.toml'
 $cacheDir = Join-Path (
     Resolve-BaseDir $env:LOCALAPPDATA 'LocalApplicationData' ([System.IO.Path]::GetTempPath())
 ) $appDirName
-$apiLog = if ($env:KUGOU_API_LOG) { $env:KUGOU_API_LOG } else { Join-Path $cacheDir 'api.log' }
 
 $homeDir = Resolve-BaseDir $env:USERPROFILE 'UserProfile' ([System.IO.Path]::GetTempPath())
 
@@ -227,11 +226,15 @@ if (-not $needsService -and -not $serviceSkipReason) {
     $serviceSkipReason = '该音源直连公网，本机没有服务'
 }
 
-# 实例名（standard / lite）——与 `kugou-api`（bash 版与 kugou-api.ps1）的实例名、
+# 实例名（standard / lite / netease）——与 `kugou-api`（bash 版与 kugou-api.ps1）的实例名、
 # PID 文件命名保持一致。这样启动器拉起来的服务，`kugou-api.ps1 status` 看得见、
 # `kugou-api.ps1 stop` 停得掉；否则就只能靠任务管理器手杀 node。
-$instanceName = if ($isSodam) { 'sodam' } elseif ($activeSource -eq 'kugou_concept') { 'lite' } else { 'standard' }
+$instanceName = if ($isSodam) { 'sodam' } elseif ($isNetease) { 'netease' } elseif ($activeSource -eq 'kugou_concept') { 'lite' } else { 'standard' }
 $pidFile = Join-Path $cacheDir "api-$instanceName.pid"
+
+# 日志名与实例名绑定（`api-<name>.log`），这样 `kugou-api.ps1 logs <name>` 读到的
+# 就是启动器写的那份。以前写死 api.log，`kugou-api.ps1 logs standard` 永远跟不到。
+$apiLog = if ($env:KUGOU_API_LOG) { $env:KUGOU_API_LOG } else { Join-Path $cacheDir "api-$instanceName.log" }
 
 # 服务目录按**当前音源**选择。写死 KuGouMusicApi 会导致：当前音源是网易云时，
 # 启动器拿酷狗的代码去监听 :3002，而真正的网易云服务已经占用了这个端口 ——

@@ -808,8 +808,7 @@ fn run_npm(dir: &Path) -> Result<()> {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() > deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_npm_child(&mut child);
                     return Err(AppError::Service(format!(
                         "npm install 超过 {} 分钟仍未结束（多半是网络不通）。手动重试：cd \"{}\" && npm install --omit=dev",
                         INSTALL_TIMEOUT.as_secs() / 60,
@@ -844,6 +843,28 @@ fn npm_command() -> Command {
     {
         Command::new("npm")
     }
+}
+
+/// 结束 npm 子进程并回收它。
+///
+/// Windows 上子进程是 `cmd /C npm` 的 cmd.exe，`Child::kill` 只杀得掉 cmd.exe，
+/// 真正的 node.exe（npm-cli.js）会留在后台继续装——所以走 `taskkill /T /F` 把
+/// 整棵进程树一起收（与 [`kill_pid`] 同一做法）。超时后必须真的收干净，否则用户
+/// 以为已经中断，后台却还在改 node_modules。
+fn kill_npm_child(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
 }
 
 /// 安装锁：防止两个 kugou-tui 同时往同一个目录里 `npm install`。

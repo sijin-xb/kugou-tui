@@ -142,9 +142,10 @@ pub enum AudioEvent {
 /// RSS——见 `logger::rss_kib` 那个追踪开关。
 ///
 /// 门控精确到 glibc：`malloc_trim` 是 glibc 专有符号，Darwin 的 libc 里没有，
-/// 用 `cfg(unix)` 会让 macOS 构建直接失败。Windows 的 MSVC 堆本来就积极归还。
+/// 用 `cfg(unix)` 会让 macOS 构建直接失败。Windows 的 MSVC 堆本来就积极归还；
+/// 单写 `target_env = "gnu"` 还会误伤 `*-pc-windows-gnu`，那条 libc 也没这符号。
 pub fn trim_heap() {
-    #[cfg(target_env = "gnu")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         libc::malloc_trim(0);
     }
@@ -1564,7 +1565,7 @@ mod tests {
     /// ```bash
     /// cargo test --release mmap_threshold_effect_probe -- --ignored --nocapture
     /// ```
-    #[cfg(target_env = "gnu")]
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     #[ignore = "诊断用，靠 --ignored 手动跑"]
     fn mmap_threshold_effect_probe() {

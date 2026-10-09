@@ -105,8 +105,9 @@ fn main() -> anyhow::Result<()> {
     //
     // 门控必须精确到 glibc：`mallopt` / `M_MMAP_THRESHOLD` 是 glibc 专有符号，
     // Darwin（macOS）同属 Unix 但 libc 里没有这两样，用 `cfg(unix)` 会直接编译失败。
-    // Windows 的 MSVC 堆本来就积极归还，同样不需要。
-    #[cfg(target_env = "gnu")]
+    // Windows 的 MSVC 堆本来就积极归还，同样不需要；而 `target_env = "gnu"` 单用
+    // 会连 `*-pc-windows-gnu` 一起命中——那条工具链的 libc 也没有这些符号。
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
         // M_MMAP_THRESHOLD 的惯例写法是传 -3（glibc 的内部编号）
         libc::mallopt(libc::M_MMAP_THRESHOLD, 256 * 1024);

@@ -85,7 +85,6 @@ cache_root() {
 }
 
 CACHE_DIR="$(cache_root)/kugou-tui"
-API_LOG="${KUGOU_API_LOG:-$CACHE_DIR/api.log}"
 
 # 配置文件路径。全新安装（还没跑过客户端）时它并不存在，所以下面每一处读取
 # 都必须容忍这一点。
@@ -140,7 +139,7 @@ prefer_system_api_dir() {
   fi
 }
 
-# 实例名（standard / lite）—— 与 `scripts/kugou-api` 的实例名、PID 文件命名保持一致。
+# 实例名（standard / lite / netease）—— 与 `scripts/kugou-api` 的实例名、PID 文件命名保持一致。
 # 这样启动器拉起来的服务，`kugou-api status` 看得见、`kugou-api stop` 停得掉。
 #
 # `NEEDS_SERVICE=0` 表示**该音源没有本机服务**，下面整套探活/拉起/等就绪都要跳过。
@@ -160,7 +159,9 @@ case "$ACTIVE_SOURCE" in
   netease)
     API_DIR="${NETEASE_API_DIR:-$(prefer_system_api_dir netease "$HOME/NeteaseCloudMusicApi")}"
     SERVICE_NAME="NeteaseCloudMusicApi"
-    INSTANCE_NAME="standard"
+    # 网易云不是酷狗实例，绝不能沿用 standard：那会和酷狗标准版抢同一个
+    # api-standard.pid，kugou-api stop 时按 PID 误杀到对方进程。
+    INSTANCE_NAME="netease"
     ;;
   kugou_concept)
     API_DIR="${KUGOU_API_DIR:-$(prefer_system_api_dir kugou "$HOME/KuGouMusicApi")}"
@@ -175,6 +176,10 @@ case "$ACTIVE_SOURCE" in
 esac
 
 PID_FILE="$CACHE_DIR/api-$INSTANCE_NAME.pid"
+
+# 日志名与实例名绑定（`api-<name>.log`），这样 `kugou-api logs <name>` 读到的
+# 就是启动器写的那份。以前写死 api.log，`kugou-api logs standard` 永远跟不到。
+API_LOG="${KUGOU_API_LOG:-$CACHE_DIR/api-$INSTANCE_NAME.log}"
 
 # 定位二进制：优先环境变量，其次脚本所在仓库的 target/release，最后 PATH。
 #
