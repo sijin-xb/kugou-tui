@@ -165,6 +165,17 @@ pub struct App {
 
     /// WebSocket 服务句柄。`config.ws == false` 或端口绑定失败时为 `None`。
     ws: Option<crate::ws::WsHandle>,
+
+    /// 本轮「源不可用」自动跳歌已经跳过的次数。
+    ///
+    /// 用户手动切歌 / 暂停 / 起播新歌时清零；连续跳歌达到上限就停下，避免整条
+    /// 队列都连不上时无限重试。
+    auto_skip_count: usize,
+
+    /// 本轮自动跳歌里已经确认不可用的音源。
+    ///
+    /// 同一个源失败一次就够了：后面同源的歌直接跳过，不再逐个发必然失败的请求。
+    failed_sources: Vec<crate::source::SourceKind>,
 }
 
 /// 动画帧间隔（约 30fps）。终端里再往上（60fps）看不出差别，但重绘成本是线性的，
@@ -267,6 +278,8 @@ impl App {
             active_stream: None,
             stream_retried: None,
             pending_stream_retry: None,
+            auto_skip_count: 0,
+            failed_sources: Vec::new(),
             #[cfg(unix)]
             mpris,
             #[cfg(unix)]
@@ -597,6 +610,8 @@ impl App {
             active_stream: None,
             stream_retried: None,
             pending_stream_retry: None,
+            auto_skip_count: 0,
+            failed_sources: Vec::new(),
             #[cfg(unix)]
             mpris: None,
             #[cfg(unix)]

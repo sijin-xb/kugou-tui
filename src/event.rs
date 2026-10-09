@@ -239,6 +239,16 @@ pub enum Loaded {
         buffer: StreamingBuffer,
         start_at_ms: u64,
     },
+    /// 取**播放直链**失败（`song_stream_url`）。
+    ///
+    /// 单独一个变体，而不是复用 [`Self::Failed`]：要不要「自动跳下一首」取决于
+    /// 这次失败是不是取链失败、以及是不是源级失败（连不上 / 未登录 / 服务没起）。
+    /// 混进 `Failed` 就只能靠比对 `context` 文案来认，太脆；而下载、写云端那些
+    /// `Failed` 也绝不该触发跳歌。
+    StreamFailed {
+        song: Box<Song>,
+        error: AppError,
+    },
     /// 云端写操作（加歌/删歌）的提示信息。
     CloudNotice(String),
     /// 云端歌单的内容变了（加歌 / 删歌成功），需要重新拉取。

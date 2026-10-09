@@ -46,6 +46,7 @@ impl App {
 
     /// 用一批歌曲替换播放队列并起播第 `index` 首。
     pub fn play_from(&mut self, songs: Vec<Song>, index: usize) {
+        self.reset_auto_skip();
         let Some(song) = self.state.queue.replace_with(songs, index).cloned() else {
             self.state.warn("列表为空，无法播放");
             return;
@@ -68,6 +69,7 @@ impl App {
     }
 
     pub(super) fn play_from_queue(&mut self) {
+        self.reset_auto_skip();
         let Some(index) = self.state.queue_cursor.selected() else {
             self.state.warn("播放队列为空");
             return;
@@ -80,6 +82,7 @@ impl App {
     }
 
     pub(super) fn toggle_playback(&mut self) {
+        self.reset_auto_skip();
         match self.state.playback {
             // 正在缓冲时忽略，避免连按导致状态错乱
             PlaybackState::Loading => {}
@@ -123,6 +126,7 @@ impl App {
     }
 
     pub(super) fn next_track(&mut self, triggered_by_user: bool) {
+        self.reset_auto_skip();
         let Some(index) = self.state.queue.advance(triggered_by_user) else {
             // 顺序播放到底：停止而不是循环
             self.audio.stop();
@@ -138,6 +142,7 @@ impl App {
     }
 
     pub(super) fn previous_track(&mut self) {
+        self.reset_auto_skip();
         // 播放超过 3 秒时先回到本曲开头，这是主流播放器的通用行为
         if self.state.position_ms > RESTART_THRESHOLD_MS {
             self.audio.seek_to(0);
@@ -243,6 +248,7 @@ impl App {
     /// 光调 `audio.stop()` 会漏掉流式下载：音频线程停了，后台任务还在把整首
     /// 往缓冲和 `.part` 文件里灌，谁也不回收它。
     pub(super) fn stop_playback(&mut self) {
+        self.reset_auto_skip();
         if let Some(stream) = self.active_stream.take() {
             stream.cancel();
         }
@@ -338,9 +344,7 @@ impl App {
         let api = match self.client_for(source) {
             Ok(client) => client,
             Err(error) => {
-                self.state
-                    .error(format!("无法连接「{}」：{error}", source.label()));
-                self.abort_loading();
+                self.handle_stream_failed(song, error);
                 return;
             }
         };
@@ -356,7 +360,10 @@ impl App {
                     is_trial: stream.is_trial,
                     reason: stream.reason,
                 }),
-                Err(error) => bus.fail(format!("获取《{}》的播放地址失败", song.name), error),
+                Err(error) => bus.emit(Loaded::StreamFailed {
+                    song: Box::new(song),
+                    error,
+                }),
             }
         });
     }
