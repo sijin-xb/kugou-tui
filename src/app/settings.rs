@@ -320,6 +320,10 @@ fn home_dir() -> Option<PathBuf> {
 /// `~/foo` 与 `~\foo` 都认：Windows 上用户很自然会用反斜杠。
 /// `~user/foo` 这种跨用户的写法不处理（两个平台语义都不一样），原样返回，
 /// 让下载器去报「路径不存在」，比在这里猜一个要好。
+///
+/// 展开后的分隔符是**本机**的（由 `PathBuf` 决定：Windows 是 `\`，其它是 `/`），
+/// 不是写死的 `/`。断言结果时用 `Path::join` 拼期望值，别把分隔符写死——写死
+/// 只会在其中一个平台上假失败。
 fn expand_with_home(value: Option<&str>, home: Option<&Path>) -> String {
     let raw = value.unwrap_or("~/Music");
     let suffix = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\"));
@@ -676,17 +680,20 @@ mod tests {
     fn expand_download_dir_handles_all_forms() {
         let home = Path::new("/home/tester");
 
+        // 期望值用 `Path::join` 拼，而不是写死 `/`：`expand_with_home` 走的是
+        // `PathBuf`，展开后的分隔符**由平台决定**（Windows 是 `\`）。写死 `/`
+        // 只会在 Windows 上假失败——CI 的 Windows 那一栏就是这么红的。
         assert_eq!(
-            expand_with_home(Some("~/Music"), Some(home)),
-            "/home/tester/Music"
+            PathBuf::from(expand_with_home(Some("~/Music"), Some(home))),
+            home.join("Music")
         );
         assert_eq!(
-            expand_with_home(Some("~/Downloads/Music"), Some(home)),
-            "/home/tester/Downloads/Music"
+            PathBuf::from(expand_with_home(Some("~/Downloads/Music"), Some(home))),
+            home.join("Downloads").join("Music")
         );
         assert_eq!(
-            expand_with_home(None, Some(home)),
-            "/home/tester/Music",
+            PathBuf::from(expand_with_home(None, Some(home))),
+            home.join("Music"),
             "None 兜底为 ~/Music，第一次启动不该让下载坏在路径上"
         );
         assert_eq!(
@@ -700,9 +707,11 @@ mod tests {
     #[test]
     fn expand_download_dir_accepts_backslash_separator() {
         let home = Path::new(r"C:\Users\tester");
+        // 关键是「`~\Music` 被展开了」，而不是原样漏出去（那会落成一个叫 `~`
+        // 的目录）。展开后用哪个分隔符由平台决定，所以期望值同样用 `home.join`。
         assert_eq!(
-            expand_with_home(Some(r"~\Music"), Some(home)),
-            r"C:\Users\tester/Music",
+            PathBuf::from(expand_with_home(Some(r"~\Music"), Some(home))),
+            home.join("Music"),
             "反斜杠写法不能原样漏出去，否则会落成一个叫 `~` 的目录"
         );
     }
