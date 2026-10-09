@@ -364,7 +364,6 @@ impl Transport {
 
     /// **写接口**：与 [`Self::get_json`] 相同但不重试，理由见
     /// [`crate::api::client::HttpClient::get_json_mutating`]。
-    #[allow(dead_code)] // 阶段 5 的云端写接口用
     pub async fn get_json_mutating(&self, endpoint: &Endpoint<'_>, cached: bool) -> Result<Value> {
         self.get_json_once(endpoint, cached).await
     }

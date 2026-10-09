@@ -1,4 +1,4 @@
-// 生成阶段 5c 九个只读接口的 KAT（对应上游 module/ 下九个文件）：
+// 生成阶段 5c/5d 云歌单与会员相关接口的 KAT（对应上游 module/ 下各文件）：
 //   plazaPlaylists      /top/playlist        module/top_playlist.js
 //   playlistTracks      /playlist/track/all  module/playlist_track_all.js
 //   userPlaylists       /user/playlist       module/user_playlist.js
@@ -8,6 +8,8 @@
 //   rankList            /rank/list           module/rank_list.js
 //   rankAudio           /rank/audio          module/rank_audio.js
 //   monthVipRecord      /youth/month/vip/record  module/youth_month_vip_record.js
+//   dayVip              /youth/day/vip           module/youth_day_vip.js
+//   dayVipUpgrade       /youth/day/vip/upgrade   module/youth_day_vip_upgrade.js
 //
 // 与 kat_login.js 同一套手法：钉死 Math.random 与 Date.now，把 axios 换成只记录
 // 配置的假实现，然后用上游真实的 module/*.js 跑一遍，抓出送进 axios 的
@@ -80,6 +82,7 @@ const GLOBAL_ID = 'GLOBALCOLLECTIONIDFIXTURE';
 const LIST_ID = '1234567890';
 const ARTIST_ID = '12345';
 const RANK_ID = '8888';
+const DAY_VIP_DATE = '2026-09-23';
 
 function ok(body) {
   return { data: { status: 1, error_code: 0, ...body }, headers: {} };
@@ -180,6 +183,22 @@ async function runPlatform(platform) {
     path + '/module/youth_month_vip_record.js',
     {},
     ok({ data: { list: [] } }),
+  );
+
+  // ---- 领取当天 VIP：/youth/day/vip（POST，无 body）----
+  // `receive_day` 是要领的那一天，不是「今天」。
+  out.dayVip = await call(
+    path + '/module/youth_day_vip.js',
+    { receive_day: DAY_VIP_DATE },
+    ok({ data: {} }),
+  );
+
+  // ---- 升级当天 VIP：/youth/day/vip/upgrade（POST，无 body）----
+  // `kugouid` 取 `Number(userid || 0)`，userid 来自 cookie。
+  out.dayVipUpgrade = await call(
+    path + '/module/youth_day_vip_upgrade.js',
+    {},
+    ok({ data: {} }),
   );
 
   return out;

@@ -1,5 +1,5 @@
 //! 纯 Rust 后端。底层（签名 / 设备指纹 / KRC 解密）已实现并有 known-answer
-//! 测试对照上游；网络接口按阶段逐个接入，尚未接入的仍明确报「尚未实现」。
+//! 测试对照上游；网络接口按阶段逐个接入，每个都先有 KAT 再有实现。
 //!
 //! 实现顺序：底层先行，KAT 全绿之后才接网络——签名错一个字节就全部失败，
 //! 而且不会有清楚的报错，混在网络调试里查不动。
@@ -70,14 +70,6 @@ impl NativeApi {
     fn kind(&self) -> SourceKind {
         self.transport.kind()
     }
-}
-
-/// 尚未接入的方法统一从这里报错。
-///
-/// 阶段 1 的出口条件之一就是 `--api native` 必须**明确报错**而不是静默失败，
-/// 所以这里不返回空列表、不返回默认值。
-fn unimplemented(name: &str) -> AppError {
-    AppError::Other(format!("native 后端尚未实现：{name}"))
 }
 
 /// 上游 `module/search.js` 的请求规格（路由 `/search`）。
@@ -711,6 +703,35 @@ pub(crate) fn claimed_vip_days_endpoint() -> Endpoint<'static> {
         .param("latest_limit", "100")
 }
 
+/// 领取某一天会员的请求规格（上游 `module/youth_day_vip.js`，
+/// 路由 `/youth/day/vip`）。
+///
+/// 这个模块**没有 body**，`source_id` 是写死的 `90139`（只有概念版账号能领），
+/// `receive_day` 是要领取的那一天（`2026-09-23`），不是「今天」。它带一个
+/// `content-type: application/x-www-form-urlencoded` 头，但请求体是空的——
+/// 上游 `request.js` 无 `data` 时传空串，签名用的就是那个空串。
+pub(crate) fn claim_day_vip_endpoint(receive_day: &str) -> Endpoint<'static> {
+    Endpoint::post(GATEWAY_BASE, "/youth/v1/recharge/receive_vip_listen_song")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .param("source_id", "90139")
+        .param("receive_day", receive_day.to_string())
+}
+
+/// 升级当天会员的请求规格（上游 `module/youth_day_vip_upgrade.js`，
+/// 路由 `/youth/day/vip/upgrade`）。
+///
+/// 同样没有 body，也没有自定义头。`kugouid` 取上游
+/// `Number(params?.userid || params?.cookie?.userid || 0)`——非数字得到 `NaN`、
+/// 序列化成 `null`，这里退化成 `0`（与 [`user_detail_endpoint`] 同一处理）。
+pub(crate) fn upgrade_day_vip_endpoint(userid: Option<&str>) -> Endpoint<'static> {
+    let kugouid = userid
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or_default();
+    Endpoint::post(GATEWAY_BASE, "/youth/v1/listen_song/upgrade_vip_reward")
+        .param("kugouid", kugouid.to_string())
+        .param("ad_type", "1")
+}
+
 // ----------------------------------------------------------------------
 // 云歌单写接口（上游 module/{playlist_add,playlist_del,
 // playlist_tracks_add,playlist_tracks_del}.js）
@@ -1260,12 +1281,24 @@ impl MusicApi for NativeApi {
         Ok(parse_user_vip_detail(&root))
     }
 
-    async fn claim_day_vip(&self, _receive_day: &str) -> Result<Value> {
-        Err(unimplemented("claim_day_vip"))
+    /// 上游 `module/youth_day_vip.js`（路由 `/youth/day/vip`）。
+    ///
+    /// 写接口，**不重试**：重发可能重复领取。返回原始响应而不替调用方断言成功——
+    /// 「今天已经领过」「账号被风控」不一定给非零 `error_code`。
+    async fn claim_day_vip(&self, receive_day: &str) -> Result<Value> {
+        let endpoint = claim_day_vip_endpoint(receive_day);
+        self.transport.get_json_mutating(&endpoint, false).await
     }
 
+    /// 上游 `module/youth_day_vip_upgrade.js`（路由 `/youth/day/vip/upgrade`）。
+    ///
+    /// 写接口，不重试。`kugouid` 从 cookie 的 `userid` 取，与上游
+    /// `Number(params?.userid || params?.cookie?.userid || 0)` 一致。
     async fn upgrade_day_vip(&self) -> Result<Value> {
-        Err(unimplemented("upgrade_day_vip"))
+        let cookies = self.transport.cookie_map();
+        let userid = cookies.get("userid").map(String::as_str);
+        let endpoint = upgrade_day_vip_endpoint(userid);
+        self.transport.get_json_mutating(&endpoint, false).await
     }
 
     async fn claimed_vip_days(&self) -> Result<Vec<String>> {
@@ -1499,22 +1532,6 @@ mod tests {
             .split('&')
             .filter_map(|pair| pair.split_once('=').map(|(name, _)| name.to_string()))
             .collect()
-    }
-
-    /// 阶段 1 的出口条件：尚未接入的方法必须明确报错，不能静默返回空。
-    ///
-    /// 目录类、登录类与云歌单写接口都已接入，剩下的占位是会员领取类，这里用
-    /// 其中一个当样本。
-    #[tokio::test]
-    async fn placeholder_reports_not_implemented() {
-        let api = NativeApi::new(SourceKind::KugouConcept, None, None).unwrap();
-        let error = api.claim_day_vip("2026-10-08").await.unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("尚未实现"), "实际：{message}");
-        assert!(
-            message.contains("claim_day_vip"),
-            "要指出是哪个方法：{message}"
-        );
     }
 
     /// 两套平台的盐值/appid 不同，构造时就必须带上平台。
@@ -3305,6 +3322,129 @@ mod tests {
         );
     }
 
+    /// 出站 URL、头与请求体逐字节对齐上游 `dayVip` 基准。
+    ///
+    /// 这个接口**没有 body**，签名里的 `data` 是空串；`content-type` 是模块自己
+    /// 加的头（`request.js` 的 `Content-Type` 只在有对象 body 时才由 axios 补）。
+    #[test]
+    fn claim_day_vip_endpoint_matches_kat() {
+        let standard = claim_day_vip_endpoint("2026-09-23");
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://gateway.kugou.com/youth/v1/recharge/receive_vip_listen_song?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&source_id=90139&receive_day=2026-09-23&signature=fd42ca24c3e83727ca8671b0629e0a96"#
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            vec![
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"content-type"#.to_string(),
+                    r#"application/x-www-form-urlencoded"#.to_string()
+                ),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                )
+            ]
+        );
+        assert_eq!(prepared_body(SourceKind::Kugou, &standard), None);
+
+        let lite = claim_day_vip_endpoint("2026-09-23");
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://gateway.kugou.com/youth/v1/recharge/receive_vip_listen_song?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&source_id=90139&receive_day=2026-09-23&signature=76e25350091fbea351263e6578b26fcf"#
+        );
+    }
+
+    /// 出站 URL、头与请求体逐字节对齐上游 `dayVipUpgrade` 基准。
+    ///
+    /// `kugouid` 与默认参数里的 `userid` 是**两个不同的键、同一个值**：上游
+    /// `paramsMap` 自己算了一份，`defaultParams` 又带了一份，两边都不能少。
+    #[test]
+    fn upgrade_day_vip_endpoint_matches_kat() {
+        let standard = upgrade_day_vip_endpoint(Some("10001"));
+        assert_eq!(
+            prepared_url(SourceKind::Kugou, &standard),
+            r#"https://gateway.kugou.com/youth/v1/listen_song/upgrade_vip_reward?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=20489&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&kugouid=10001&ad_type=1&signature=add5a4a6c7728af06d8037f973165a4e"#
+        );
+        assert_eq!(
+            prepared_headers(SourceKind::Kugou, &standard),
+            vec![
+                (
+                    r#"User-Agent"#.to_string(),
+                    r#"Android15-1070-11083-46-0-DiscoveryDRADProtocol-wifi"#.to_string()
+                ),
+                (r#"clienttime"#.to_string(), r#"1700000000"#.to_string()),
+                (
+                    r#"dfid"#.to_string(),
+                    r#"1234567890abcdef12345678"#.to_string()
+                ),
+                (r#"kg-rc"#.to_string(), r#"1"#.to_string()),
+                (r#"kg-rec"#.to_string(), r#"1"#.to_string()),
+                (
+                    r#"kg-rf"#.to_string(),
+                    r#"B9EDA08A64250DEFFBCADDEE00F8F25F"#.to_string()
+                ),
+                (r#"kg-thash"#.to_string(), r#"5d816a0"#.to_string()),
+                (
+                    r#"mid"#.to_string(),
+                    r#"231699103997194646178265604655475531917"#.to_string()
+                )
+            ]
+        );
+        assert_eq!(prepared_body(SourceKind::Kugou, &standard), None);
+
+        let lite = upgrade_day_vip_endpoint(Some("10001"));
+        assert_eq!(
+            prepared_url(SourceKind::KugouConcept, &lite),
+            r#"https://gateway.kugou.com/youth/v1/listen_song/upgrade_vip_reward?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11440&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&kugouid=10001&ad_type=1&signature=46edb84063cb667d4ea05dfd4908eac6"#
+        );
+    }
+
+    /// `kugouid` 走 `Number(...)`：cookie 里没有 userid 时上游得到 `0`（不是空串）。
+    ///
+    /// 写成空串会进签名与 URL，服务端只会回业务错误码，不会说是参数错了。
+    /// 注意默认参数里的 `userid` 来自 cookie、与这里的 `kugouid` 是**两个键**：
+    /// 上游 cookie 有 userid 时它照常出现，只有 `kugouid` 会退化成 0。
+    #[test]
+    fn upgrade_day_vip_userid_falls_back_to_zero() {
+        let missing = upgrade_day_vip_endpoint(None);
+        assert!(
+            prepared_url(SourceKind::Kugou, &missing).contains("&kugouid=0&"),
+            "缺 userid 时 kugouid 该是 0：{}",
+            prepared_url(SourceKind::Kugou, &missing)
+        );
+
+        let non_numeric = upgrade_day_vip_endpoint(Some("abc"));
+        assert!(
+            prepared_url(SourceKind::Kugou, &non_numeric).contains("&kugouid=0&"),
+            "非数字 userid 该退化成 0：{}",
+            prepared_url(SourceKind::Kugou, &non_numeric)
+        );
+
+        let numeric = upgrade_day_vip_endpoint(Some("10001"));
+        assert!(
+            prepared_url(SourceKind::Kugou, &numeric).contains("&kugouid=10001&"),
+            "数字 userid 原样带上：{}",
+            prepared_url(SourceKind::Kugou, &numeric)
+        );
+    }
+
     /// 九个目录类接口的参数顺序必须与上游逐位一致。
     ///
     /// 上游签名先把参数按 key 排序再拼串，但**URL 本身的顺序**来自
@@ -3515,6 +3655,40 @@ mod tests {
                     "signature",
                 ],
                 claimed_vip_days_endpoint(),
+            ),
+            (
+                "claim_day_vip",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "source_id",
+                    "receive_day",
+                    "signature",
+                ],
+                claim_day_vip_endpoint("2026-09-23"),
+            ),
+            (
+                "upgrade_day_vip",
+                vec![
+                    "dfid",
+                    "mid",
+                    "uuid",
+                    "appid",
+                    "clientver",
+                    "clienttime",
+                    "token",
+                    "userid",
+                    "kugouid",
+                    "ad_type",
+                    "signature",
+                ],
+                upgrade_day_vip_endpoint(Some("10001")),
             ),
         ];
 
