@@ -324,10 +324,14 @@ fn expand_with_home(value: Option<&str>, home: Option<&Path>) -> String {
     let raw = value.unwrap_or("~/Music");
     let suffix = raw.strip_prefix("~/").or_else(|| raw.strip_prefix("~\\"));
     if let (Some(suffix), Some(home)) = (suffix, home) {
-        // 用 `to_string_lossy` 而不是 `home.display()`：这里要的就是一个 `String`
-        // （拼进 `format!` 之后还要被上层当字符串用），而 `display()` 给的是
-        // `Display` 适配器，还得再转一道。
-        return format!("{}/{}", home.to_string_lossy(), suffix);
+        // 用 `PathBuf::push` 逐段拼，而不是 `format!("{}/{}", …)`：手写的 `/` 在
+        // Windows 上会拼出 `C:\Users\me/Music` 这种混合分隔符。按 `/`、`\` 两种
+        // 分隔符再切一遍，是为了让 `~/Downloads/Music` 这类多段写法也各段都规范。
+        let mut path = home.to_path_buf();
+        for part in suffix.split(['/', '\\']).filter(|part| !part.is_empty()) {
+            path.push(part);
+        }
+        return path.to_string_lossy().into_owned();
     }
     raw.to_string()
 }

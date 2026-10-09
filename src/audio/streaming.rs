@@ -269,7 +269,9 @@ impl StreamingBuffer {
         // 再从磁盘取。`split_off` 出来的新块容量正好等于长度，旧的大块在这里
         // 释放——RSS 因此不会随曲目体积线性上涨。
         if self.spill.is_some() && inner.data.len() > self.window.max {
-            let dropped = inner.data.len() - self.window.target;
+            // `Window` 的 `target <= max` 只是约定、类型不保证；用 `saturating_sub`
+            // 兜底，将来窗口配反了也只是少丢一点，不至于整数下溢 panic。
+            let dropped = inner.data.len().saturating_sub(self.window.target);
             let tail = inner.data.split_off(dropped);
             inner.base += dropped as u64;
             inner.data = tail;
@@ -725,5 +727,14 @@ mod tests {
         ok.finish(None);
         assert!(ok.is_finished());
         assert!(ok.is_complete());
+    }
+
+    /// 窗口配反（`target > max`）时回收不能整数下溢 panic——`Window` 的
+    /// `target <= max` 只是约定，类型不保证。
+    #[test]
+    fn reclaim_survives_a_misconfigured_window() {
+        let (buffer, file, path) = spilled(None, Some((8, 64)));
+        write_and_push(&buffer, &file, &[0u8; 32]);
+        cleanup(&path);
     }
 }

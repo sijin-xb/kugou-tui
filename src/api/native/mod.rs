@@ -437,7 +437,9 @@ pub(crate) fn user_detail_endpoint(
     userid: Option<&str>,
     clienttime: &str,
 ) -> Result<Endpoint<'static>> {
-    let seconds: i64 = clienttime.parse().unwrap_or_default();
+    let seconds: i64 = clienttime.parse().map_err(|error| {
+        AppError::Other(format!("clienttime 不是合法整数（{clienttime}）：{error}"))
+    })?;
     // 上游 `Number(params?.userid || params?.cookie?.userid || '0')`：非数字得到 NaN，
     // 序列化成 null；这里退化成 0，比发出 `null` 更接近服务端预期。
     let userid_value = match userid.and_then(|value| value.parse::<i64>().ok()) {
@@ -644,7 +646,9 @@ pub(crate) fn artist_tracks_endpoint(
 ) -> Result<Endpoint<'static>> {
     // `signParamsKey(clienttime)`：上游传的是数字，模板串里会转成十进制文本。
     let key = sign::sign_params_key(kind, clienttime, None, None);
-    let clienttime_number = clienttime.parse::<i64>().unwrap_or_default();
+    let clienttime_number = clienttime.parse::<i64>().map_err(|error| {
+        AppError::Other(format!("clienttime 不是合法整数（{clienttime}）：{error}"))
+    })?;
 
     let body = serde_json::json!({
         "appid": sign::appid(kind),
@@ -2257,6 +2261,33 @@ mod tests {
         assert_eq!(p.len(), 256);
         assert!(p.chars().all(|c| c.is_ascii_hexdigit()));
         assert_eq!(p, p.to_uppercase());
+    }
+
+    /// `clienttime` 同时进 body 与签名，解析失败不能静默变 0——那样只会换来一个
+    /// 看不懂的 403。
+    #[test]
+    fn endpoints_reject_a_non_numeric_clienttime() {
+        assert!(
+            user_detail_endpoint(
+                SourceKind::Kugou,
+                "TOKENFIXTURE",
+                Some("10001"),
+                "not-a-number"
+            )
+            .is_err()
+        );
+        assert!(
+            artist_tracks_endpoint(
+                SourceKind::Kugou,
+                1,
+                "hot",
+                1,
+                20,
+                "not-a-number",
+                "mid-filler",
+            )
+            .is_err()
+        );
     }
 
     /// `/user/vip/detail`：带 `busi_type=concept`。

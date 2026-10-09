@@ -573,10 +573,14 @@ pub async fn create_qr_session(api: &ApiClient) -> Result<String> {
 
 /// 第 2 步：取二维码内容。
 pub fn scan_url_for(token: &str) -> Result<String> {
-    SCAN_URLS
+    // 锁中毒和「token 不在表里」是两码事：前者是别处 panic 过，后者才是会话过期。
+    // 以前用 `.ok()` 把两者都归成 None，于是内部错误被报成「请重新按 L」，用户白扫一次。
+    let guard = SCAN_URLS
         .lock()
-        .ok()
-        .and_then(|slot| slot.as_ref().and_then(|map| map.get(token).cloned()))
+        .map_err(|_| AppError::Other("汽水二维码会话状态已损坏（内部错误）".to_string()))?;
+    guard
+        .as_ref()
+        .and_then(|map| map.get(token).cloned())
         .filter(|url| !url.is_empty())
         .ok_or_else(|| AppError::NotFound("汽水二维码会话已过期，请重新按 L".to_string()))
 }
@@ -1058,5 +1062,13 @@ mod tests {
         let parsed: SearchResponse =
             serde_json::from_slice(r#"{"result_groups":[{"data":[{}]}]}"#.as_bytes()).unwrap();
         assert!(parsed.result_groups[0].data[0].entity.track.id.is_empty());
+    }
+
+    /// 会话过期与锁中毒要分开报：拿一个从没登记过的 token，应当得到「会话已过期」，
+    /// 而不是内部错误。
+    #[test]
+    fn scan_url_for_reports_an_unknown_token_as_expired() {
+        let error = scan_url_for("这个 token 从没登记过").unwrap_err();
+        assert!(matches!(error, AppError::NotFound(_)), "实际：{error:?}");
     }
 }
