@@ -2,13 +2,16 @@
 
 ## 接口服务
 
-**Q：`cargo install` 之后启动说找不到 node？**
-A：接口服务是 Node.js 写的，`crates.io` 只分发 Rust 代码、带不了它。装一个 Node.js（≥ 12，
-带 npm）再启动即可——程序会自己把服务准备好并拉起，不需要你 clone 任何仓库。
+**Q：启动说找不到 node？**
+A：那只会在 `--api node` 回退路径上发生——它跑的是第三方服务 KuGouMusicApi，是 Node.js
+写的。装一个 Node.js（≥ 12，带 npm）再启动即可，程序会自己把服务准备好并拉起，不需要你
+clone 任何仓库。**默认的内嵌后端（`--api native`）不需要 Node.js**，如果你不打算用回退，
+加 `--api native` 就行；想连引导代码一起去掉，用 `--no-default-features` 构建。
 
 **Q：第一次启动卡了半分钟，正常吗？**
-A：正常。首次运行要下载 KuGouMusicApi（钉住的提交）并 `npm install --omit=dev`，实测约 25 秒。
-之后每次启动探到端口就直接复用。想提前做完：`kugou-tui --api-start`。
+A：只有 `--api node` 会这样。首次运行要下载 KuGouMusicApi（钉住的提交）并
+`npm install --omit=dev`，实测约 25 秒。之后每次启动探到端口就直接复用。想提前做完：
+`kugou-tui --api node --api-start`。内嵌后端没有这一步，启动即可用。
 
 **Q：服务起不来 / 端口被占？**
 A：看日志 `~/.cache/kugou-tui/api-standard.log`（概念版是 `api-lite.log`）。端口被别的程序

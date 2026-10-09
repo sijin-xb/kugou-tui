@@ -3,7 +3,8 @@
 本文是 [README](../README.md) 的展开版：环境要求、各平台的安装路径、第三方 API 服务怎么部署、
 启动器脚本与环境变量、装完先做什么。
 
-**先看这一句**：不管走哪条路，机器上都要有 **Node.js ≥ 12**——接口实现不在本程序里
+**先看这一句**：接口实现**内嵌在二进制里**，默认路径（`--api native`）**不需要 Node.js**。
+只有走 `--api node` 回退（或网易云音源）时，才需要本机有一个第三方 API 服务
 （见「[部署第三方 API 服务](#部署第三方-api-服务)」）。
 
 ---
@@ -12,7 +13,7 @@
 
 | 项目 | 要求 |
 |---|---|
-| Node.js | **必须**，≥ 12（含 npm）。用于运行 KuGouMusicApi |
+| Node.js | **仅 `--api node` 回退需要**，≥ 12（含 npm），用于运行 KuGouMusicApi。`--api native` 与 `--no-default-features` 构建都不需要 |
 | Rust 工具链 | 1.90+（edition 2024）。下限由**依赖**顶上去（`quantette` 要 1.90），不是本项目代码决定的 |
 | 音频输出 | rodio 支持的后端：Linux 是 ALSA / PipeWire / PulseAudio，Windows 是 WASAPI，macOS 是 CoreAudio |
 | 终端 | 支持 UTF-8；**真彩（24 位）** 才有完整的主题配色与逐字渐变，老终端可加 `--basic-color` 退回 16 色 |
@@ -31,18 +32,20 @@
 
 ```bash
 cargo install kugou-tui
-kugou-tui
+kugou-tui --api native      # 内嵌后端，不需要 Node
 ```
 
-只装主程序，但**不需要手工部署接口服务**：首次启动会自己把它准备好并拉起（下载钉住的
-上游提交 → `npm install --omit=dev` → 起服务，实测约 25 秒），之后每次启动探到端口就复用。
+内嵌后端**开箱即用**，没有「首次准备服务」这一步。想用 Node 回退（或跑网易云音源）时
+才需要下面这套：首次启动会自己把接口服务准备好并拉起（下载钉住的上游提交 →
+`npm install --omit=dev` → 起服务，实测约 25 秒），之后每次启动探到端口就复用。
 
 | 项 | 说明 |
 |---|---|
-| 首次启动 | 需要网络。想提前做完：`kugou-tui --api-start`（它拉起的服务留在后台，`--api-stop` 停） |
+| 首次启动（仅 `--api node`） | 需要网络。想提前做完：`kugou-tui --api node --api-start`（它拉起的服务留在后台，`--api-stop` 停） |
 | 服务装在哪 | 优先 `/usr/share/kugou-tui/api/kugou`（发行包）与已存在的 `~/KuGouMusicApi`，都没有才装到 `~/.local/share/kugou-tui/api/kugou` |
 | 想自己管服务 | 配置 `api_auto_start = false`，或 `--no-api-start` |
 | 退出行为 | 自己拉起的实例随退出停止，不留常驻 node；已在跑的（你或别的实例起的）不动 |
+| 想彻底去掉引导代码 | `cargo install kugou-tui --no-default-features`（关掉 `node-bootstrap` feature，二进制里不含下载器 / npm / spawn node 的代码） |
 
 > 这条路拿不到仓库里的 `scripts/*`（它们不是 crate 的一部分）。要那套一键脚本就用下面的
 > 预编译包。
@@ -56,7 +59,7 @@ cargo build --release
 ./target/release/kugou-tui --help
 ```
 
-release 产物约 **7.0 MiB**（`opt-level="z"` + fat LTO + strip）。Windows 上把二进制路径换成
+release 产物约 **11.7 MiB**（`opt-level="z"` + fat LTO + strip）。Windows 上把二进制路径换成
 `.\target\release\kugou-tui.exe`，前置与脚本见「[在 Windows 上构建与运行](#在-windows-上构建与运行)」。
 
 ### 路径三：预编译二进制（GitHub Release）
@@ -288,12 +291,15 @@ cd kugou-tui && cargo build --release
 
 ## 部署第三方 API 服务
 
+> **这一节只在你要用 `--api node` 回退（或网易云音源）时才需要。**
+> 默认的内嵌后端（`--api native`）把接口实现在进程内，不碰这一节。
+
 **`cargo install` 装的、或用过预编译包 / AUR 的，这一节基本不用看**——程序启动时会自己
 探活、缺了就装好并拉起。下面这套是给「要手动控制」和「要装网易云那份服务」的人准备的。
 
-本项目**不含任何接口实现**，数据全部来自独立仓库
-[KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi)（本仓库没有 submodule，也没有
-vendor 目录）。
+酷狗接口的**协议**来自独立仓库 [KuGouMusicApi](https://github.com/MakcRe/KuGouMusicApi)
+（本仓库没有 submodule，也没有 vendor 目录）；内嵌后端是照它逐项移植的纯 Rust 实现，
+`--api node` 回退则是直接跑那个 Node 服务。
 
 ### 一键
 

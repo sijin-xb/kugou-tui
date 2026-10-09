@@ -137,20 +137,24 @@ priority = 30
 
 ### 接口服务的自动拉起
 
-接口服务（KuGouMusicApi）是 Node.js 写的，`cargo install` 带不了它，所以由程序自己在
-**运行时**补齐：启动时探一次端口，有服务就复用（退出时不碰它），没有才动手。查找顺序是
-「配置的 `api_dir` → `/usr/share/kugou-tui/api/kugou`（发行包）→
+> **只在 `--api node` 回退（或网易云音源）时适用。** 默认的内嵌后端（`--api native`）
+> 把接口实现在进程内，不需要本机服务，也不需要 Node.js。
+
+`--api node` 走的是第三方服务 KuGouMusicApi（Node.js 写的），`cargo install` 带不了它，
+所以由程序自己在**运行时**补齐：启动时探一次端口，有服务就复用（退出时不碰它），没有才
+动手。查找顺序是「配置的 `api_dir` → `/usr/share/kugou-tui/api/kugou`（发行包）→
 `~/.local/share/kugou-tui/api/kugou` → `~/KuGouMusicApi`」，都没有就下载钉住的提交并
 `npm install --omit=dev`。
 
 | 场景 | 怎么做 |
 |---|---|
 | 服务常驻在别的机器上 / 交给 systemd | `api_auto_start = false`（或 `--no-api-start`） |
-| 想提前装好、以后秒开 | `kugou-tui --api-start`（拉起的服务留后台，`--api-stop` 停） |
+| 想提前装好、以后秒开 | `kugou-tui --api node --api-start`（拉起的服务留后台，`--api-stop` 停） |
 | 服务目录在别处 | `api_dir = "/opt/KuGouMusicApi"` 或 `KUGOU_API_DIR=...` |
 
 **前提**：机器上要有 Node.js（≥ 12）与 npm。默认行为是「自己拉起的服务随退出停止」，
-不留常驻进程。
+不留常驻进程。不想在二进制里保留这套引导代码，用 `--no-default-features` 构建
+（见 [README](../README.md#安装)）。
 
 ### 封面铺满（`cover_fill`）
 
@@ -216,8 +220,8 @@ aplay -D default /dev/zero -f cd     # 打不开（busy / 无此设备）就是 
   `viper_atmos`、`viper_tape`。后三个是「蝰蛇音效」，**仅部分歌曲支持**，拿不到时服务端
   返回空地址，界面会给提示。
 - **`lite_mode`** —— 关掉三样最吃资源的（**听歌本身不受影响**）：不下载 / 解码封面、不算实时
-  频谱、刷新降到 5fps 且不做动画提速。实测常驻内存空闲 14.2 MiB / 播放中 16.9 MiB，开启后能
-  再降一截。分场景数字见 [DESIGN.md](DESIGN.md#低资源占用)。
+  频谱、刷新降到 5fps 且不做动画提速。实测常驻内存空闲 19.1 MiB / 播放中 19.1 MiB（`--api native`），
+  开启后能再降一截。分场景数字见 [DESIGN.md](DESIGN.md#低资源占用)。
 - **`tray`** —— 系统托盘，默认开启：注册成 `org.kde.StatusNotifierItem` 后，Quickshell /
   waybar / KDE 会显示图标，右键弹出菜单（播放 / 暂停、上一首、下一首，niri 下还多一项
   「最小化 / 显示窗口」）。没有图形会话、没有 session bus、或状态栏没提供
