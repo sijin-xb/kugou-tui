@@ -252,7 +252,10 @@ pub fn parse_lrc(text: &str) -> Lyric {
     lines.sort_by_key(|line| line.time_ms);
     lines.dedup_by(|a, b| a.time_ms == b.time_ms && a.text == b.text);
 
-    Lyric { lines }
+    Lyric {
+        text: text.to_string(),
+        lines,
+    }
 }
 
 /// 吃掉行首连续的 `[...]` 时间标签，返回 (时间戳列表, 剩余文本)。
@@ -783,6 +786,9 @@ mod tests {
         assert_eq!(lyric.lines[0].time_ms, 1_000);
         assert_eq!(lyric.lines[1].time_ms, 5_500);
         assert_eq!(lyric.lines[1].text, "第二句");
+        // 原文要原样留着：WebSocket 的 `lyricsData` 发的是它，不是解析后的 `lines`。
+        // 解析会丢掉逐字标记与 `[ti:]` 这类标签，而那正是第三方客户端排版要用的。
+        assert_eq!(lyric.text, text);
     }
 
     #[test]

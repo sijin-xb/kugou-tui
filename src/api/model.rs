@@ -254,6 +254,15 @@ impl LyricWord {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Lyric {
+    /// 解密后的**原始歌词文本**（KRC 或 LRC），未做任何解析。
+    ///
+    /// 解析成 [`Self::lines`] 会丢掉逐字标记与 `[language:]` 等标签，而这些正是
+    /// 第三方客户端自己排版需要的。WebSocket 的 `lyricsData` 字段就是它，对应
+    /// 上游 MoeKoeMusic 的 `originalLyrics`（`lyricResponse.decodeContent`）。
+    ///
+    /// 体积上留一份是划算的：一首歌几十 KB，且只在当前曲目上存活。
+    #[serde(default)]
+    pub text: String,
     pub lines: Vec<LyricLine>,
 }
 
@@ -1081,6 +1090,7 @@ mod tests {
     #[test]
     fn finds_current_lyric_line() {
         let lyric = Lyric {
+            text: String::new(),
             lines: vec![
                 LyricLine {
                     time_ms: 1_000,

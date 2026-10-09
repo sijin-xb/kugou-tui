@@ -1616,6 +1616,7 @@ mod tests {
         // 行数必须**多于**视口，居中定位才会生效——歌词行不够时 Paragraph 是顶对齐
         // 的，当前行根本不在中间（这条最初就踩了，断言全读到空格子）
         state.lyric.lyric = crate::api::model::Lyric {
+            text: String::new(),
             lines: (0..15)
                 .map(|_| line_with_words(1000, "一二三四五"))
                 .collect(),
@@ -1662,6 +1663,7 @@ mod tests {
         let theme = Theme::for_config(ThemeName::Default, false);
         let mut state = AppState::new(crate::config::Config::default());
         state.lyric.lyric = crate::api::model::Lyric {
+            text: String::new(),
             lines: (0..21)
                 .map(|_| line_with_words(1000, "一二三四五"))
                 .collect(),
@@ -1740,6 +1742,7 @@ mod tests {
         let theme = Theme::for_config(ThemeName::Default, false);
         let mut state = AppState::new(crate::config::Config::default());
         state.lyric.lyric = crate::api::model::Lyric {
+            text: String::new(),
             lines: vec![line_with_words(1000, "一二三四五")],
         };
         state.lyric.active_line = Some(0);
@@ -1760,6 +1763,7 @@ mod tests {
     /// 一段 15 行的歌词，行距 `gap_ms`。行数必须**多于视口**，居中定位才生效。
     fn many_lines(count: usize, gap_ms: u64) -> crate::api::model::Lyric {
         crate::api::model::Lyric {
+            text: String::new(),
             lines: (0..count)
                 .map(|index| line_with_words(index as u64 * gap_ms, "一二三四五"))
                 .collect(),

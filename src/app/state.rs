@@ -1895,6 +1895,7 @@ mod tests {
 
     fn lyric_with(times: &[u64]) -> Lyric {
         Lyric {
+            text: String::new(),
             lines: times
                 .iter()
                 .map(|time_ms| LyricLine {
