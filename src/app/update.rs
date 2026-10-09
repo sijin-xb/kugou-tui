@@ -1939,6 +1939,11 @@ impl App {
             }
 
             Loaded::StreamFailed { song, error } => {
+                // 与其它 Stream* 事件一致：用户切歌后，旧歌迟到的失败要丢弃，
+                // 否则源级失败会误跳走、单曲级失败会误停正在放的那首。
+                if !self.is_current(&song) {
+                    return;
+                }
                 self.handle_stream_failed(*song, error);
             }
 
@@ -3553,5 +3558,29 @@ mod tests {
 
         assert_eq!(app.auto_skip_count, 0);
         assert!(app.failed_sources.is_empty());
+    }
+
+    /// 用户切歌后，旧歌迟到的取流失败要被丢弃：不跳歌、不停当前播放、不计失败源。
+    #[test]
+    fn stale_stream_failure_is_ignored() {
+        use crate::source::SourceKind::{Kugou, Netease};
+        let mut app = App::for_test();
+        app.state.current = Some(song_from(Netease, "b"));
+        app.state.playback = PlaybackState::Playing;
+
+        // A 的取流失败姗姗来迟，但 A 已经不是当前歌
+        app.handle_loaded(Loaded::StreamFailed {
+            song: Box::new(song_from(Kugou, "a")),
+            error: crate::error::AppError::Service("本地服务未启动".to_string()),
+        });
+
+        assert_eq!(
+            app.state.current.as_ref().map(|s| s.hash.as_str()),
+            Some("b"),
+            "当前歌不能被换掉"
+        );
+        assert_eq!(app.state.playback, PlaybackState::Playing, "不能误停");
+        assert_eq!(app.auto_skip_count, 0, "不能误跳歌");
+        assert!(!app.failed_sources.contains(&Kugou), "不能记失败源");
     }
 }
