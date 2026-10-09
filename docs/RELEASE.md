@@ -107,7 +107,7 @@ macOS 的二进制要 Apple SDK。
 tag 要与 `main` 当前的版本号一致：
 
 ```bash
-gh workflow run release.yml --ref <分支> -f tag=v0.6.0 -f dry_run=true
+gh workflow run release.yml --ref <分支> -f tag=v0.6.1 -f dry_run=true
 ```
 
 ### 补资产（`workflow_dispatch`）
