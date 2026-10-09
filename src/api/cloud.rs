@@ -508,7 +508,7 @@ impl NodeApi {
                 &[("name", name.to_string()), ("type", "0".to_string())],
             )
             .await?;
-        Ok(pick_i64(data_of(&root), &["listid", "list_id", "id"]))
+        Ok(created_listid(&root))
     }
 }
 
@@ -631,6 +631,71 @@ mod tests {
     fn created_listid_is_none_when_the_server_omits_it() {
         let root = json!({"data": {"info": {"name": "x"}}, "status": 1, "error_code": 0});
         assert_eq!(created_listid(&root), None);
+    }
+
+    /// `/playlist/add` 的真实响应把 `listid` 埋在 `data.info` 里，Node 版也必须能取到。
+    ///
+    /// 起一个真的 HTTP 服务端而不是 mock 掉解析：这条路径要验的正是「响应穿过
+    /// `HttpClient` 之后还认得出 listid」，手写 TcpListener 和 `catalog.rs` 那组同路子。
+    #[tokio::test]
+    async fn node_create_playlist_reads_listid_from_the_nested_info() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+        let addr = listener.local_addr().expect("取本地地址");
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().expect("克隆流"));
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    continue;
+                }
+                // 把请求头与 body 读完，否则 reqwest 会认为连接异常
+                let mut length = 0usize;
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if header.trim().is_empty() => break,
+                        Ok(_) => {
+                            if let Some(value) =
+                                header.to_ascii_lowercase().strip_prefix("content-length:")
+                            {
+                                length = value.trim().parse().unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+                if length > 0 {
+                    let mut body = vec![0u8; length];
+                    let _ = std::io::Read::read_exact(&mut reader, &mut body);
+                }
+
+                // 真实形状：listid 只在 data.info 里
+                let payload = json!({
+                    "data": {"info": {"listid": 42, "name": "x"}, "list_count": 5},
+                    "status": 1,
+                    "error_code": 0
+                })
+                .to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        let client = NodeApi::new(&format!("http://{addr}"), None, None).expect("构造客户端");
+        let list_id = client
+            .create_playlist(crate::source::SourceKind::Kugou, "x")
+            .await
+            .expect("新建歌单应当成功");
+        assert_eq!(list_id, Some(42));
     }
 
     #[test]
