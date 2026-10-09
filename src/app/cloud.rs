@@ -29,6 +29,7 @@
 use std::time::Instant;
 
 use crate::api::cloud::{QrStatus, VipInfo, VipKind};
+use crate::api::model::Song;
 use crate::api::traits::MusicApi;
 use crate::app::App;
 use crate::app::state::{ConfirmAction, LoginPicker, LoginState};
@@ -60,6 +61,29 @@ fn readable_reason(error: &AppError) -> String {
         AppError::Api { message, .. } => message.clone(),
         other => other.to_string(),
     }
+}
+
+/// 云端歌单只接受**与歌单同源**的歌。
+///
+/// 歌单接口是按「歌单所属源」选客户端的：把另一个源的歌喂过去，酷狗侧按 fileid、
+/// 网易云侧按 hash 去定位，都会定位到不存在（甚至别人的）条目，把歌单写坏。保守
+/// 做法是直接拒绝跨源，不做源间转换——那是另一个功能，本轮不做。
+fn playlist_accepts_song(playlist_source: SourceKind, song: &Song) -> bool {
+    song.source == playlist_source
+}
+
+/// 批量加入时逐首分拣：返回（能进这个歌单的歌，跨源被跳过的首数）。
+fn partition_by_playlist_source(
+    playlist_source: SourceKind,
+    songs: Vec<Song>,
+) -> (Vec<Song>, usize) {
+    let total = songs.len();
+    let kept: Vec<Song> = songs
+        .into_iter()
+        .filter(|song| playlist_accepts_song(playlist_source, song))
+        .collect();
+    let skipped = total - kept.len();
+    (kept, skipped)
 }
 
 impl App {
@@ -816,9 +840,20 @@ impl App {
             return;
         };
 
+        // 歌单接口按「歌单所属源」选客户端，跨源的歌会被喂错客户端——先拦掉。
+        let source = self.state.config.active_source_kind();
+        if !playlist_accepts_song(source, &song) {
+            self.state.warn(format!(
+                "《{}》来自「{}」，不能从「{}」的歌单里移除",
+                song.name,
+                song.source.label(),
+                source.label()
+            ));
+            return;
+        }
+
         // 酷狗靠**歌单条目的 fileid** 定位，网易云靠**歌曲 id**（`Song::hash`），
         // 所以只有前者需要 fileid——用一个统一的检查把网易云的歌也拦掉是错的。
-        let source = self.state.config.active_source_kind();
         if !matches!(source, SourceKind::Netease) && song.file_id.is_none() {
             // 只有歌单接口才给 fileid；搜索结果没有，无法定位酷狗歌单内的条目。
             self.state
@@ -941,9 +976,19 @@ impl App {
             return;
         };
 
+        let source = self.state.config.active_source_kind();
+        if !playlist_accepts_song(source, &song) {
+            self.state.warn(format!(
+                "《{}》来自「{}」，不能加入「{}」的歌单",
+                song.name,
+                song.source.label(),
+                source.label()
+            ));
+            return;
+        }
+
         let label = describe_song(&song);
         let playlist_name = target.name.clone();
-        let source = self.state.config.active_source_kind();
         let api = self.api.clone();
         let bus = self.bus.clone();
 
@@ -989,10 +1034,18 @@ impl App {
             return;
         }
 
-        let songs = self.state.queue.items().to_vec();
+        let source = self.state.config.active_source_kind();
+        let (songs, skipped) =
+            partition_by_playlist_source(source, self.state.queue.items().to_vec());
+        if songs.is_empty() {
+            self.state.warn(format!(
+                "队列里的 {skipped} 首歌都不属于「{}」，没有可同步的",
+                source.label()
+            ));
+            return;
+        }
         let count = songs.len();
         let playlist_name = target.name.clone();
-        let source = self.state.config.active_source_kind();
         let api = self.api.clone();
         let bus = self.bus.clone();
 
@@ -1000,11 +1053,108 @@ impl App {
 
         self.runtime.spawn(async move {
             match api.add_tracks_to_playlist(source, list_id, &songs).await {
-                Ok(written) => bus.emit(Loaded::CloudNotice(format!(
-                    "已把 {written} 首歌同步到《{playlist_name}》"
-                ))),
+                Ok(written) => bus.emit(Loaded::CloudNotice(if skipped > 0 {
+                    format!(
+                        "已把 {written} 首歌同步到《{playlist_name}》（跳过 {skipped} 首跨源歌曲）"
+                    )
+                } else {
+                    format!("已把 {written} 首歌同步到《{playlist_name}》")
+                })),
                 Err(error) => bus.fail(format!("同步到《{playlist_name}》失败"), error),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn song(source: SourceKind, hash: &str) -> Song {
+        Song {
+            source,
+            hash: hash.to_string(),
+            ..Song::default()
+        }
+    }
+
+    fn writable_playlist() -> crate::api::model::Playlist {
+        crate::api::model::Playlist {
+            list_id: Some(1),
+            name: "我的歌单".to_string(),
+            is_own: true,
+            ..Default::default()
+        }
+    }
+
+    /// 同源放行。
+    #[test]
+    fn playlist_guard_accepts_a_same_source_song() {
+        use SourceKind::{Kugou, Netease};
+        assert!(playlist_accepts_song(Kugou, &song(Kugou, "a")));
+        assert!(playlist_accepts_song(Netease, &song(Netease, "b")));
+    }
+
+    /// 跨源拒绝。
+    #[test]
+    fn playlist_guard_rejects_a_cross_source_song() {
+        use SourceKind::{Kugou, Netease};
+        assert!(!playlist_accepts_song(Kugou, &song(Netease, "b")));
+        assert!(!playlist_accepts_song(Netease, &song(Kugou, "a")));
+    }
+
+    /// 批量分拣只留下同源的歌。
+    #[test]
+    fn partition_keeps_only_the_matching_songs() {
+        use SourceKind::{Kugou, Netease, Sodam};
+        let songs = vec![
+            song(Kugou, "a"),
+            song(Netease, "b"),
+            song(Kugou, "c"),
+            song(Sodam, "d"),
+        ];
+        let (kept, skipped) = partition_by_playlist_source(Kugou, songs);
+        assert_eq!(skipped, 2);
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().all(|song| song.source == Kugou));
+    }
+
+    /// 整批都是跨源时，一首都不留。
+    #[test]
+    fn partition_of_an_all_cross_source_batch_keeps_nothing() {
+        use SourceKind::{Kugou, Netease};
+        let (kept, skipped) = partition_by_playlist_source(Kugou, vec![song(Netease, "b")]);
+        assert!(kept.is_empty());
+        assert_eq!(skipped, 1);
+    }
+
+    /// 跨源加入被拒时，不发任何请求（`busy` 只在真正发请求前才设）。
+    #[test]
+    fn adding_a_cross_source_song_is_refused_before_any_request() {
+        use SourceKind::Netease;
+        let mut app = App::for_test();
+        app.state.logged_in = true;
+        app.state.sync_target = Some(writable_playlist());
+        app.state.current = Some(song(Netease, "b"));
+
+        app.add_focused_song_to_cloud();
+
+        assert!(app.state.busy.is_none(), "跨源被拒不该发起请求");
+    }
+
+    /// 混合队列同步时只把同源的歌发出去。
+    #[test]
+    fn syncing_a_mixed_queue_only_sends_matching_songs() {
+        use SourceKind::{Kugou, Netease};
+        let mut app = App::for_test();
+        app.state.logged_in = true;
+        app.state.sync_target = Some(writable_playlist());
+        app.state
+            .queue
+            .replace_with(vec![song(Kugou, "a"), song(Netease, "b")], 0);
+
+        app.sync_queue_to_cloud();
+
+        assert_eq!(app.state.busy.as_deref(), Some("同步 1 首到《我的歌单》"));
     }
 }
