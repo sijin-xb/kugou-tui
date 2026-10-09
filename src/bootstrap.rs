@@ -735,7 +735,14 @@ fn spawn(
 /// 读 PID 文件的第一个字段。
 fn read_pid_file(path: &Path) -> Option<u32> {
     let content = fs::read_to_string(path).ok()?;
-    content.split_whitespace().next()?.parse().ok()
+    // PowerShell 5.1 的 Set-Content 可能写出带 UTF-8 BOM 的文件。BOM 不是空白字符，
+    // split_whitespace 去不掉，会让首字段变成 "\u{feff}1234" 而 parse 失败，所以先剥掉。
+    content
+        .trim_start_matches('\u{feff}')
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// 结束指定 PID 的进程。
@@ -970,5 +977,24 @@ mod tests {
                 ensure_running(ApiBackend::Native, kind, "http://127.0.0.1:3002", None).is_ok()
             );
         }
+    }
+
+    /// PID 文件可能由 PowerShell 的 Set-Content 写出，5.1 下会带 UTF-8 BOM；
+    /// 带不带 BOM 都必须能读出 PID，否则 `--api-stop` 会找不到自己拉起的服务。
+    #[test]
+    fn pid_file_parses_with_and_without_a_bom() {
+        let path = std::env::temp_dir().join(format!("kugou-tui-pid-{}", std::process::id()));
+
+        std::fs::write(&path, "4321 3002").expect("写临时 PID 文件");
+        assert_eq!(read_pid_file(&path), Some(4321), "普通 PID 文件应能解析");
+
+        std::fs::write(&path, "\u{feff}4321 3002").expect("写带 BOM 的临时 PID 文件");
+        assert_eq!(
+            read_pid_file(&path),
+            Some(4321),
+            "带 BOM 的 PID 文件也要能解析"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 }
