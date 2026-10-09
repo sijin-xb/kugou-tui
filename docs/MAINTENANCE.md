@@ -237,7 +237,8 @@ macOS 上 `dirs` **不读** XDG 变量，所以脚本也不能读。不对齐的
   `head -c 3 scripts/*.ps1 | od -An -tx1` 确认每个文件都以 `ef bb bf` 开头；
   行尾保持 LF 即可（5.1 读 LF 的脚本没问题）。
 * `Start-Process` **不允许**把 stdout 与 stderr 重定向到同一个文件，所以服务日志
-  是两个：`api.log` 与 `api.log.err`，报错时两个都打。
+  是两个：`api-<实例名>.log` 与 `api-<实例名>.log.err`（实例名 `standard`/`lite`/`netease`），
+  报错时两个都打。
 * 启动器里那份配置解析（读 `sources.active` 与 `[sources.<kind>].api_base`）是手写的
   正则，不是 TOML 解析器。改配置结构时要同步改它——同理，`kugou-api-install.ps1`
   里钉住的提交必须和 bash 版的一致（一处钉、一处跟 master 是最坏的组合）。
@@ -588,8 +589,18 @@ let position_ms = self.last_position_ms;   // 上一帧还在播时的值
     `decoded_multichannel_files_are_downmixed_to_stereo`（自造 4 声道 WAV 走
     `build_decoder`，断言 `channels() <= 2`）与
     `the_mixer_hears_the_song_only_because_we_downmixed_first`（用
-    `rodio::mixer::mixer` 搭不依赖声卡的 mixer，对照证明「直接进 mixer 只剩前两个声道、
-    先下混再进才对」——钉的正是 bug 发生的那一层）。
+     `rodio::mixer::mixer` 搭不依赖声卡的 mixer，对照证明「直接进 mixer 只剩前两个声道、
+     先下混再进才对」——钉的正是 bug 发生的那一层）。
+
+改 `app/desktop.rs`（把播放状态同步给桌面集成）之前，这条也要守住：
+
+13. **每拍先比对、再克隆。** `tick` 每 200ms 调一次 `sync_ws` / `sync_mpris` / `sync_tray`，
+     它们只拿 `&self.state`：**不要**把当前曲目、歌手列表、整份歌词 `clone()` 出来再交给
+     句柄判等。`WsHandle::update_from` / `MprisHandle::update_track` / `TrayHandle::update_track`
+     都是「先比 `hash` / `track_id` 与进度，变了才重建元数据」，传引用 + 闭包即可；曲目比的
+     是**原始 hash 字符串**（不是摘要），逐字节相等才算没变。守护测试：
+     `update_from_wakes_only_when_the_snapshot_changes`、
+     `update_track_skips_metadata_rebuild_for_the_same_track`。
 
 ---
 
@@ -705,6 +716,11 @@ let position_ms = self.last_position_ms;   // 上一帧还在播时的值
   （`TestBackend` + `terminal.draw`，见 `render_home_in_a_short_wide_area_does_not_panic`）。
   实测 `[Min(6), Length(8)]` 在空间不够时是 `Min` 赢，所以封面栏最低仍有 4 行——
   但那是**实测出来的行为，不是文档承诺**，升级 ratatui 后要重新测。
+- **登录二维码不要每帧重编码**：`render_login` 直接复用 `login.qr`（收到二维码时就按
+  `config.qr_aspect` 渲染好了，见 `Loaded::LoginQr`），`qr_lines_fitted` 只对已渲染的行做
+  「装不装得下」判断、不再自己编码；只有终端装不下时才用 `qr_needed_size` 编一次。
+  一次编码实测约 0.9ms，在 30fps 下是很大一块预算（基准：`bench_qr_encoding_cost`、
+  `bench_login_render_cost`）。
 
 **测试**
 

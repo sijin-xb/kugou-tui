@@ -4,6 +4,32 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 修复
+
+- 登录弹窗在不足 7 行的终端里不再崩溃（`clamp(7, area.height)` 在 `min > max` 时 panic）。
+- 日志重定向失败时不再启动死锁（持 `SINK` 锁期间重复上锁）。
+- VIP 到期日遇到非 ASCII 的 `end_time` 不再切片 panic。
+- 系统托盘 D-Bus 信号连续发送失败时判定断连并自动重连，不再静默冻结。
+- 流式下载任务异常终止时收尾写入端并摘除登记，读者不再永久阻塞。
+- 从播放队列移除歌曲后，高亮不再错位或越界丢失。
+- 网易云服务使用独立实例名（`api-netease.pid`），不再与酷狗标准版争用 PID 文件。
+- 若干静默吞错补上日志（KRC 解码、汽水封面/会员查询），`clienttime` 解析失败改为显式报错。
+
+### 变更
+
+- 服务日志文件名统一为 `api-<name>.log`（启动器与 `kugou-api` 一致）。
+- 网易云端口 `NETEASE_PORT` 现在也能写进配置文件（与其它端口一致）。
+- Windows 交叉编译的平台门控收紧为 `all(target_os = "linux", target_env = "gnu")`，不再误伤 `*-pc-windows-gnu`。
+- Windows 下 npm 安装超时会结束整棵进程树（`taskkill /T /F`）。
+
+### 性能
+
+- 歌曲列表与播放队列每帧只构造可见窗口内的行。
+- 桌面集成（WebSocket / MPRIS / 托盘）每拍先比对再克隆，不再无条件深拷贝当前曲目与歌词。
+- 登录二维码复用已渲染好的行，不再每帧重新编码（实测每帧省下约 0.9ms）。
+
 ## [0.6.0] - 2026-10-09
 
 ### 新增
