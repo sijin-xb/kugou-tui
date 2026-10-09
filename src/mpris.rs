@@ -80,10 +80,32 @@ pub struct MprisHandle {
 }
 
 impl MprisHandle {
-    /// 更新快照。每次 tick 调一次即可——桌面组件轮询频率远低于此。
-    pub fn update(&self, info: TrackInfo) {
-        if let Ok(mut guard) = self.info.lock() {
+    /// 刷新快照：位置 / 时长 / 状态每拍都写，元数据只在换歌时重建。
+    ///
+    /// `build` 里是歌名 / 歌手 / 专辑 / 封面的克隆，而它们只在 `track_id` 变化时
+    /// 才需要重算。主循环每拍（默认 200ms）都会调到这里，逐拍重建整份元数据纯属
+    /// 浪费——尤其是 `cover_url` 的字符串替换。桌面组件轮询频率远低于此。
+    pub fn update_track(
+        &self,
+        track_id: &str,
+        position_us: i64,
+        duration_us: i64,
+        status: PlaybackState,
+        build: impl FnOnce() -> TrackInfo,
+    ) {
+        let Ok(mut guard) = self.info.lock() else {
+            return;
+        };
+        if guard.track_id != track_id {
+            let mut info = build();
+            info.position_us = position_us;
+            info.duration_us = duration_us;
+            info.status = status;
             *guard = info;
+        } else {
+            guard.position_us = position_us;
+            guard.duration_us = duration_us;
+            guard.status = status;
         }
     }
 

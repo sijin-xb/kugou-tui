@@ -161,8 +161,8 @@ impl Snapshot {
 /// 只比较「会改变推送内容」的字段。
 ///
 /// 刻意不用 `Song` 的完整比较：曲目换了但 hash 相同时推送内容不会变，而逐字段比较
-/// 每次都要把 `privilege` 这类嵌套 JSON 走一遍。这样 [`WsHandle::update`] 能在没变化
-/// 时直接跳过，暂停期间不会白白唤醒广播任务。
+/// 每次都要把 `privilege` 这类嵌套 JSON 走一遍。[`WsHandle::update_from`] 在构造
+/// 快照前就按这套字段比对，没变化时连克隆都不做。
 impl PartialEq for Snapshot {
     fn eq(&self, other: &Self) -> bool {
         self.song_hash() == other.song_hash()
@@ -243,13 +243,35 @@ pub struct WsHandle {
 }
 
 impl WsHandle {
-    /// 写入一份新快照。内容没变时不做任何唤醒。
-    pub fn update(&self, snapshot: Snapshot) {
+    /// 用**引用**写入一份新快照：内容没变时不克隆任何东西。
+    ///
+    /// 直接构造 [`Snapshot`] 再判等，会先把整份 `Song` 与可能几十 KB 的歌词文本
+    /// 克隆一遍，然后才发现根本没变——而主循环每拍（默认 200ms）都会调一次。
+    /// 这里先用引用与当前快照比一遍，只有真的变了才克隆构造。
+    pub fn update_from(
+        &self,
+        song: Option<&Song>,
+        lyric_text: Option<&str>,
+        is_playing: bool,
+        position_ms: u64,
+        duration_ms: u64,
+    ) {
         let _ = self.changes.send_if_modified(|current| {
-            if **current == snapshot {
+            if current.song_hash() == song.map(|song| song.hash.as_str())
+                && current.lyric_text.as_deref() == lyric_text
+                && current.is_playing == is_playing
+                && current.position_ms == position_ms
+                && current.duration_ms == duration_ms
+            {
                 return false;
             }
-            *current = Arc::new(snapshot);
+            *current = Arc::new(Snapshot {
+                song: song.cloned(),
+                lyric_text: lyric_text.map(str::to_string),
+                is_playing,
+                position_ms,
+                duration_ms,
+            });
             true
         });
     }
@@ -1056,5 +1078,40 @@ mod tests {
                 Some(Ok(other)) => panic!("超长消息不该被正常处理，收到：{other:?}"),
             }
         }
+    }
+
+    /// 内容没变时 `update_from` 不该唤醒广播（主循环每拍都调，唤醒会白推一帧）。
+    #[test]
+    fn update_from_wakes_only_when_the_snapshot_changes() {
+        let (changes, mut rx) = watch::channel(Arc::new(Snapshot::default()));
+        let handle = WsHandle {
+            changes,
+            running: Arc::new(AtomicBool::new(false)),
+        };
+        let song = Song {
+            hash: "abc".to_string(),
+            ..Song::default()
+        };
+
+        // 与默认快照一致：不产生变化。
+        handle.update_from(None, None, false, 0, 0);
+        assert!(!rx.has_changed().expect("通道未关闭"), "没变化不该唤醒广播");
+
+        // 有变化：写入并唤醒。
+        handle.update_from(Some(&song), Some("[ti:x]"), true, 1_000, 10_000);
+        assert!(rx.has_changed().expect("通道未关闭"), "变化必须唤醒");
+        let snapshot = rx.borrow_and_update().clone();
+        assert_eq!(snapshot.song_hash(), Some("abc"));
+        assert_eq!(snapshot.lyric_text.as_deref(), Some("[ti:x]"));
+        assert!(snapshot.is_playing);
+        assert_eq!(snapshot.position_ms, 1_000);
+        assert_eq!(snapshot.duration_ms, 10_000);
+
+        // 再写一次相同内容：不该重复唤醒。
+        handle.update_from(Some(&song), Some("[ti:x]"), true, 1_000, 10_000);
+        assert!(
+            !rx.has_changed().expect("通道未关闭"),
+            "内容相同不该重复唤醒"
+        );
     }
 }

@@ -187,6 +187,29 @@ pub fn selection_list<'a>(items: Vec<ListItem<'a>>, theme: &Theme) -> List<'a> {
         .scroll_padding(2)
 }
 
+/// 列表行是否落在「可能出现在屏幕上」的窗口内。
+///
+/// [`List`] 必须收到与真实列表**等长**的 items（它靠 `items.len()` 维护滚动
+/// 偏移、并按 offset 迭代），所以不能只把可见那几行传进去。但真正昂贵的只有
+/// [`song_row`] / [`entry_row`] 里的字符串格式化与显示宽度扫描；窗口外的行用
+/// 等高的空占位顶上去即可，滚动、高亮、滚动条的行为分毫不动。上千首的歌单或
+/// 队列下，这一层能把每帧的构造量从 O(整表) 降到 O(可见)。
+///
+/// 窗口取「当前偏移」与「选中项」两侧各一屏多：按 End 或鼠标跳转时 ratatui 会把
+/// 选中项滚进视野，那一屏也得是真行，否则会闪一帧空白。
+pub fn row_is_visible(
+    index: usize,
+    offset: usize,
+    selected: Option<usize>,
+    visible_rows: usize,
+) -> bool {
+    let focus = selected.unwrap_or(offset);
+    let margin = visible_rows.saturating_add(1);
+    let low = offset.min(focus).saturating_sub(margin);
+    let high = offset.max(focus).saturating_add(margin);
+    index >= low && index <= high
+}
+
 /// 统一的带边框面板。
 ///
 /// `focused` 决定边框亮度——这是界面里唯一表示「键盘焦点在哪」的视觉线索，
@@ -482,6 +505,33 @@ mod tests {
         assert_eq!(popup.y, 5);
         assert_eq!(popup.width, 20);
         assert_eq!(popup.height, 10);
+    }
+
+    // ---- 只构造可见窗口的行 ----
+
+    #[test]
+    fn row_window_covers_the_offset_plus_a_screenful() {
+        // 没有选中项时以偏移为焦点：一屏 10 行，上下各多留一屏多。
+        assert!(row_is_visible(0, 0, None, 10));
+        assert!(row_is_visible(11, 0, None, 10));
+        assert!(!row_is_visible(12, 0, None, 10));
+    }
+
+    #[test]
+    fn row_window_follows_the_selected_item_off_screen() {
+        // 选中项被滚到视野外时（例如按 End），它那一屏也得是真行，
+        // 否则 ratatui 把选中项滚进来时会闪一帧空白。
+        assert!(row_is_visible(100, 90, Some(100), 10));
+        assert!(row_is_visible(85, 90, Some(100), 10));
+        assert!(!row_is_visible(78, 90, Some(100), 10));
+        assert!(!row_is_visible(112, 90, Some(100), 10));
+    }
+
+    #[test]
+    fn row_window_survives_empty_and_tiny_lists() {
+        // 空列表（visible_rows 为 0）也不能越界或反向。
+        assert!(row_is_visible(0, 0, None, 0));
+        assert!(!row_is_visible(2, 0, None, 0));
     }
 
     // ---- 二维码按可用区域自适应 ----

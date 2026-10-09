@@ -6,7 +6,7 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
+use ratatui::widgets::{ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
 use crate::api::model::{Artist, Playlist, RankBoard};
 use crate::app::state::{EntryList, SearchPane, SongList};
@@ -16,7 +16,8 @@ use crate::keymap::key_hint_for;
 use crate::ui::theme::Theme;
 use crate::ui::views::{empty_placeholder, failed_placeholder, loading_placeholder};
 use crate::ui::widgets::{
-    RowContext, display_width, entry_row, panel, selection_list, song_row, truncate_to_width,
+    RowContext, display_width, entry_row, panel, row_is_visible, selection_list, song_row,
+    truncate_to_width,
 };
 
 /// 面板太小时直接跳过绘制。
@@ -84,6 +85,8 @@ pub fn render_song_list(
 
     // 右侧留 1 列给滚动条
     let row_width = inner.width.saturating_sub(1) as usize;
+    // 可见行数（供 `row_is_visible` 判断哪些行值得真正构造）
+    let visible_rows = inner.height as usize;
 
     // 把鼠标位置换算成「数据行下标」：List 内部按 cursor.offset() 滚动，
     // 屏幕第 r 行对应的是 offset + r。
@@ -99,11 +102,18 @@ pub fn render_song_list(
         (visible < list.songs.len()).then_some(visible)
     });
 
+    let offset = list.cursor.offset();
+    let selected = list.cursor.selected();
     let items: Vec<_> = list
         .songs
         .iter()
         .enumerate()
         .map(|(index, song)| {
+            // 窗口外的行只放等高占位：`List` 需要等长的 items 才能算滚动偏移，
+            // 但没必要为看不见的行做整串格式化（见 `row_is_visible`）。
+            if !row_is_visible(index, offset, selected, visible_rows) {
+                return ListItem::from("");
+            }
             let context = RowContext {
                 width: row_width,
                 is_current: view.current_hash == Some(song.hash.as_str()),

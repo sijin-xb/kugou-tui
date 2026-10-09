@@ -8,7 +8,7 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Gauge, ListState, Paragraph};
+use ratatui::widgets::{Gauge, ListItem, ListState, Paragraph};
 use ratatui_image::picker::ProtocolType;
 use ratatui_image::{FontSize, Resize, StatefulImage};
 
@@ -21,7 +21,7 @@ use crate::keymap::key_hint_for;
 use crate::ui::theme::{Theme, mix};
 use crate::ui::views::{empty_placeholder, failed_placeholder, loading_placeholder};
 use crate::ui::widgets::{
-    RowContext, display_width, panel, selection_list, song_row, truncate_to_width,
+    RowContext, display_width, panel, row_is_visible, selection_list, song_row, truncate_to_width,
 };
 
 /// 播放条高度：2 行内容 + 上下边框。
@@ -502,11 +502,19 @@ pub fn render_queue(
     }
 
     let row_width = inner.width.saturating_sub(1) as usize;
+    // 可见行数（供 `row_is_visible` 判断哪些行值得真正构造）
+    let visible_rows = inner.height as usize;
+    let offset = cursor.offset();
+    let selected = cursor.selected();
     let items: Vec<_> = queue
         .items()
         .iter()
         .enumerate()
         .map(|(index, song)| {
+            // 窗口外的行只放等高占位，理由见 `row_is_visible`。
+            if !row_is_visible(index, offset, selected, visible_rows) {
+                return ListItem::from("");
+            }
             let context = RowContext {
                 width: row_width,
                 is_current: view.current_hash == Some(song.hash.as_str()),

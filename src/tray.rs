@@ -86,9 +86,12 @@ pub struct TrayInfo {
     pub status: PlaybackState,
     /// 是否静音。托盘菜单的「静音 / 取消静音」措辞跟着它走。
     pub muted: bool,
+    /// 当前曲目的标识（酷狗的 hash）。只用来判断「换歌了没有」——换歌才需要
+    /// 重建 `title` / `artists`，其余每拍只刷新 `status` / `muted`。
+    pub track_id: String,
 }
 
-/// 主循环持有它，每帧调 [`Self::update`] 刷一次。
+/// 主循环持有它，每帧调 [`Self::update_track`] 刷一次。
 #[derive(Clone)]
 pub struct TrayHandle {
     info: Arc<Mutex<TrayInfo>>,
@@ -97,9 +100,28 @@ pub struct TrayHandle {
 }
 
 impl TrayHandle {
-    pub fn update(&self, info: TrayInfo) {
-        if let Ok(mut guard) = self.info.lock() {
+    /// 刷新快照：`status` / `muted` 每拍都写，元数据只在换歌时重建。
+    ///
+    /// `build` 里是歌名 / 歌手名的克隆，只在 `track_id` 变化时才需要重算。
+    pub fn update_track(
+        &self,
+        track_id: &str,
+        status: PlaybackState,
+        muted: bool,
+        build: impl FnOnce() -> TrayInfo,
+    ) {
+        let Ok(mut guard) = self.info.lock() else {
+            return;
+        };
+        if guard.track_id != track_id {
+            let mut info = build();
+            info.status = status;
+            info.muted = muted;
+            info.track_id = track_id.to_string();
             *guard = info;
+        } else {
+            guard.status = status;
+            guard.muted = muted;
         }
     }
 
