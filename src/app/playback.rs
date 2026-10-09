@@ -253,6 +253,20 @@ impl App {
         self.audio.stop();
     }
 
+    /// 取链/装载还没成功就失败时，把「缓冲中」收回来。
+    ///
+    /// `start_playback` 先 `mark_loading()` 把状态设成 `Loading`，但引擎在
+    /// 「没装载任何东西」时不会去改它（`sync()` 见 `!loaded` 直接返回）。取链
+    /// 失败时如果不管，状态就永远停在 `Loading`——而 `toggle_playback` 恰恰
+    /// 忽略 `Loading`，用户按 Space 毫无反应，看起来就是卡死。显式停一下让引擎
+    /// 把状态落回 `Stopped`。
+    pub(super) fn abort_loading(&mut self) {
+        self.audio.stop();
+        self.state.playback = PlaybackState::Stopped;
+        self.state.busy = None;
+        self.state.download_progress = None;
+    }
+
     /// 起播一首歌：先查缓存，未命中则解析直链 → 下载 → 播放。
     pub(super) fn start_playback(&mut self, song: Song, start_at_ms: u64) {
         // 上一首如果还在边下边播，通知后台任务收工：任务退出、内存窗口和
@@ -326,6 +340,7 @@ impl App {
             Err(error) => {
                 self.state
                     .error(format!("无法连接「{}」：{error}", source.label()));
+                self.abort_loading();
                 return;
             }
         };

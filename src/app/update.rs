@@ -2212,6 +2212,15 @@ impl App {
             } => {
                 self.state.busy = None;
                 self.state.download_progress = None;
+                // 取链/下载失败时，播放状态可能还停在 `start_playback` 设的
+                // `Loading`，而引擎在没装载任何东西时不会去清它（`sync()` 见
+                // `!loaded` 直接返回）。不收回来就会一直显示「缓冲中」，Space 也被
+                // `Loading` 吃掉。只在确实处于 `Loading` 时才动播放状态，免得把正在
+                // 放的那首误停（封面/歌词之外的失败也走这条）。
+                if self.state.playback == PlaybackState::Loading {
+                    self.audio.stop();
+                    self.state.playback = PlaybackState::Stopped;
+                }
                 tlog!(crate::logger::LEVEL_ERROR, "{context}：{error}");
                 // 凭据被服务端作废后，界面若还挂着「登录 是」就是谎言——用户会
                 // 以为登录态是好的、转而去怀疑别处。标记失效后，按 L 直接进扫码
