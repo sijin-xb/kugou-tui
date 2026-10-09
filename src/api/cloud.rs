@@ -102,8 +102,11 @@ impl VipInfo {
     /// 只取日期部分：服务端给的是 `YYYY-MM-DD HH:MM:SS`，界面上一行放不下。
     fn end_date(&self) -> String {
         match self.end_time.split(' ').next() {
-            Some(date) if date.len() >= 10 => date[5..10].to_string(),
-            _ => String::new(),
+            // 用 `get` 而不是 `date[5..10]`：这是服务端可控的字符串，按**字节**
+            // 切片时一旦里面有多字节字符（理论上不该有，但服务端是外部输入），
+            // 切点落在字符中间会直接 panic。`get` 遇到非字符边界返回 `None`。
+            Some(date) => date.get(5..10).unwrap_or("").to_string(),
+            None => String::new(),
         }
     }
 
@@ -581,6 +584,34 @@ mod tests {
         let none = VipInfo::default();
         assert_eq!(none.label(), "非会员");
         assert_eq!(none.short_label(), "非会员");
+    }
+
+    /// 到期日按字节切片遇到多字节字符时不能 panic。
+    ///
+    /// `end_time` 是服务端可控的字符串，早先用 `date[5..10]` 按**字节**切；只要
+    /// 里面出现一个多字节字符（中文、全角数字），切点就可能落在字符中间，而
+    /// release 是 `panic = "abort"`，进程会直接死在解析会员信息上。改成 `get`
+    /// 后遇到非字符边界返回 `None`。三种输入各钉一次。
+    #[test]
+    fn end_date_is_sliced_on_char_boundaries() {
+        let normal = VipInfo {
+            end_time: "2026-09-28 12:00:00".to_string(),
+            ..VipInfo::default()
+        };
+        assert_eq!(normal.end_date(), "09-28");
+
+        let short = VipInfo {
+            end_time: "2026-09".to_string(),
+            ..VipInfo::default()
+        };
+        assert_eq!(short.end_date(), "");
+
+        // 「年」占 3 字节，字节 5 落在它中间：旧写法在这里 panic。
+        let multibyte = VipInfo {
+            end_time: "2026年09月28日".to_string(),
+            ..VipInfo::default()
+        };
+        assert_eq!(multibyte.end_date(), "");
     }
 
     /// HTTP 200 但业务失败时必须报错——否则界面会谎报「已收藏」。

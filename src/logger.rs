@@ -324,27 +324,35 @@ pub fn redirect_stderr_to_log() {
         return;
     };
 
-    #[cfg(unix)]
+    // 重定向只有 Unix / Windows 两个实现；别的目标上保持原样，连守卫都按原样
+    // 在函数末尾释放。
+    #[cfg(any(unix, windows))]
     {
-        use std::os::fd::AsRawFd;
-        // SAFETY：`dup2` 只改本进程的 fd 表，失败返回 -1 不破坏其它状态。
-        // 锁守卫随后释放，但 fd 2 已经是独立副本，仍然有效。
-        let result = unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) };
-        if result < 0 {
-            // 这里**不能**用 eprintln!——那正是要拦下来的东西。
-            report_redirect_failure();
-        }
-    }
+        #[cfg(unix)]
+        let redirected = {
+            use std::os::fd::AsRawFd;
+            // SAFETY：`dup2` 只改本进程的 fd 表，失败返回 -1 不破坏其它状态。
+            // fd 2 是独立副本，守卫释放后仍然有效。
+            unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) >= 0 }
+        };
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+        #[cfg(windows)]
+        let redirected = {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
 
-        // SAFETY：句柄来自仍然活着的 `File`（它被 `SINK` 持有到进程结束），
-        // `SetStdHandle` 只是把标准错误指向它，不转移所有权、不关闭任何东西。
-        let ok = unsafe { SetStdHandle(STD_ERROR_HANDLE, file.as_raw_handle() as _) };
-        if ok == 0 {
+            // SAFETY：句柄来自仍然活着的 `File`（它被 `SINK` 持有到进程结束），
+            // `SetStdHandle` 只是把标准错误指向它，不转移所有权、不关闭任何东西。
+            unsafe { SetStdHandle(STD_ERROR_HANDLE, file.as_raw_handle() as _) != 0 }
+        };
+
+        // **先放掉 sink 锁再报告失败**：`report_redirect_failure` 会走 `write()`，
+        // 而 `write()` 会再次 `sink.lock()`。std 的 `Mutex` 不可重入，持锁调用等于
+        // 死锁——重定向失败这种罕见路径会把进程挂死在这里，连一句日志都留不下。
+        // 放锁是安全的：Unix 的 fd 2 已是独立副本，Windows 的句柄由 `SINK` 里的
+        // `File` 持有到进程结束，都不依赖这个守卫。
+        drop(file);
+        if !redirected {
             report_redirect_failure();
         }
     }

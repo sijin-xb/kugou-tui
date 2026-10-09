@@ -463,7 +463,10 @@ pub fn render_login(
         .unwrap_or(0) as u16;
     // 边距收到最小：二维码本来就大，多一圈留白就把「装不下」的临界点往前推
     let popup_width = (qr_width + 4).max(30);
-    let popup_height = (qr_lines.len() as u16 + 5).clamp(7, area.height);
+    // `clamp(7, area.height)` 在终端比弹窗还矮时会 panic（clamp 要求 min <= max，
+    // 高度不足 7 行时 7 反而大于 max）。换成 `max(7).min(area.height)`：够高时与
+    // clamp 等价，矮到装不下 7 行时退成整个画面高度，照样把「太小」的提示画出来。
+    let popup_height = (qr_lines.len() as u16 + 5).max(7).min(area.height);
     let popup = crate::ui::widgets::centered_rect(area, popup_width, popup_height);
     frame.render_widget(Clear, popup);
 
@@ -885,6 +888,41 @@ mod tests {
             .draw(|frame| render_sidebar(frame, Rect::new(0, 0, width, height), state, &theme))
             .expect("渲染侧边栏");
         terminal
+    }
+
+    /// 登录弹窗在矮终端下不能 panic。
+    ///
+    /// 弹窗高度原先是 `(行数 + 5).clamp(7, area.height)`，而 `clamp` 要求
+    /// min <= max：终端高度不足 7 行时（缩窗口、分屏、嵌在小面板里都会出现）
+    /// 直接 panic，界面没了、终端还留在 raw 模式。这里逐档钉住临界高度。
+    #[test]
+    fn login_modal_survives_a_short_terminal() {
+        let login = LoginState {
+            qr: vec!["██".to_string()],
+            qr_content: "https://example.com/login?key=abcdef".to_string(),
+            key: "abcdef".to_string(),
+            message: "等待扫码…".to_string(),
+            finished: false,
+            succeeded: false,
+        };
+        let theme = Theme::for_config(ThemeName::Default, false);
+        let aspect = Config::default().qr_aspect;
+
+        // 7 是原 `clamp` 的下界，取它上下各几档把边界夹住。
+        for height in [1, 3, 5, 6, 7, 8] {
+            let mut terminal = Terminal::new(TestBackend::new(80, height)).expect("建测试终端");
+            terminal
+                .draw(|frame| {
+                    render_login(
+                        frame,
+                        &login,
+                        crate::source::SourceKind::Kugou,
+                        aspect,
+                        &theme,
+                    )
+                })
+                .unwrap_or_else(|error| panic!("高度 {height} 渲染登录弹窗失败：{error}"));
+        }
     }
 
     /// 侧边栏装不下时要「**能放几行放几行**」，并在末尾说明还有什么没显示。
