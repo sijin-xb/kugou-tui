@@ -67,6 +67,15 @@ fn control_action(command: &str) -> Option<Action> {
     }
 }
 
+/// 只接受本机回环地址的连接。
+///
+/// 正常情况这个检查必然成立（监听套接字本身就只绑了 `127.0.0.1`）。显式写出来是
+/// 为了将来有人把绑定地址改成 `0.0.0.0` 时不会**静默地**把播放控制面暴露出去——
+/// 那时这行会拦住，而不是等到有人扫到端口才发现。
+fn peer_allowed(peer: std::net::SocketAddr) -> bool {
+    peer.ip().is_loopback()
+}
+
 /// `Origin` 头是否可接受。
 ///
 /// 没有 `Origin` 说明不是浏览器发起的（原生客户端、`websocat` 都不带），放行；
@@ -324,9 +333,7 @@ async fn serve(
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                // 只绑了回环，正常情况这里必然成立；显式检查是为了将来有人把绑定地址
-                // 改成 `0.0.0.0` 时不会静默地把控制面暴露出去。
-                if !peer.ip().is_loopback() {
+                if !peer_allowed(peer) {
                     crate::logger::tlog!(
                         crate::logger::LEVEL_WARN,
                         "拒绝来自 {peer} 的 WebSocket 连接：只接受本机"
@@ -837,6 +844,27 @@ mod tests {
         }
     }
 
+    /// 只接受本机回环地址的连接；`0.0.0.0` 上的对端一律拒绝。
+    #[test]
+    fn only_loopback_peers_are_accepted() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+        for allowed in [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 40000),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 40000),
+        ] {
+            assert!(peer_allowed(allowed), "{allowed} 应当被允许");
+        }
+        for denied in [
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10)), 40000),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 40000),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 40000),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 40000),
+        ] {
+            assert!(!peer_allowed(denied), "{denied} 应当被拒绝");
+        }
+    }
+
     /// 快照比较只看会改变推送内容的字段，避免暂停期间空转。
     #[test]
     fn snapshot_equality_tracks_pushed_fields() {
@@ -929,5 +957,104 @@ mod tests {
             .max_frame_size(Some(MAX_MESSAGE_BYTES));
         assert_eq!(config.max_message_size, Some(MAX_MESSAGE_BYTES));
         assert_eq!(config.max_frame_size, Some(MAX_MESSAGE_BYTES));
+    }
+
+    /// 起一个真的服务端，返回它的端口与一个「等它开始监听」的握手地址。
+    async fn spawn_test_server() -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("绑一个临时端口");
+        let port = listener.local_addr().expect("取端口").port();
+        let (changes, changes_rx) = watch::channel(Arc::new(Snapshot::default()));
+        let (out, _) = broadcast::channel::<Arc<str>>(BROADCAST_CAPACITY);
+        let (bus, _receiver) = EventBus::new();
+        // 快照丢在测试作用域里无所谓，`serve` 只读它。
+        drop(changes);
+        tokio::spawn(async move {
+            serve(listener, changes_rx, out, bus).await;
+        });
+        port
+    }
+
+    /// 用裸 TCP 发一次握手请求，返回服务端回的状态行。
+    async fn raw_handshake(port: u16, origin: Option<&str>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("连上测试服务端");
+        let mut request = String::from(
+            "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n",
+        );
+        if let Some(origin) = origin {
+            request.push_str(&format!("Origin: {origin}\r\n"));
+        }
+        request.push_str("\r\n");
+        stream.write_all(request.as_bytes()).await.expect("发请求");
+        let mut buffer = vec![0u8; 1024];
+        let read = stream.read(&mut buffer).await.expect("读响应");
+        String::from_utf8_lossy(&buffer[..read]).to_string()
+    }
+
+    /// 跨站 `Origin` 的握手必须被真的拒掉（不是只让判定函数返回 false）。
+    #[tokio::test]
+    async fn handshake_from_a_foreign_origin_is_rejected() {
+        let port = spawn_test_server().await;
+
+        let denied = raw_handshake(port, Some("https://evil.example")).await;
+        assert!(
+            denied.starts_with("HTTP/1.1 403"),
+            "跨站 Origin 应当被拒，实际：{denied}"
+        );
+
+        let allowed = raw_handshake(port, None).await;
+        assert!(
+            allowed.starts_with("HTTP/1.1 101"),
+            "无 Origin 的本地客户端应当被接受，实际：{allowed}"
+        );
+    }
+
+    /// 超长入站消息会被断开，而不是被读进内存。
+    #[tokio::test]
+    async fn oversized_inbound_message_is_refused() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let port = spawn_test_server().await;
+        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .expect("连上测试服务端");
+        let request = format!("ws://127.0.0.1:{port}/")
+            .as_str()
+            .into_client_request()
+            .expect("构造握手请求");
+        // 用 `client_async` 而不是 `connect_async`：后者要开 `connect` feature，
+        // 而那个 feature 会把 TLS 客户端栈拖进所有平台（见 Cargo.toml 注释）。
+        let (mut socket, _) = tokio_tungstenite::client_async(request, stream)
+            .await
+            .expect("本机客户端应当连得上");
+
+        // 连接建立后服务端会先发 welcome（与当前状态），先读掉再灌超长消息，
+        // 否则会把 greeting 当成「超长消息被正常处理」。
+        let mut greeting = 0;
+        while greeting < 2 {
+            match socket.next().await {
+                Some(Ok(Message::Text(_))) => greeting += 1,
+                Some(Ok(_)) => continue,
+                other => panic!("握手后应当先收到 greeting，实际：{other:?}"),
+            }
+        }
+
+        // 超过 64 KiB 的一帧：服务端应当以错误关闭连接。
+        let huge = "a".repeat(MAX_MESSAGE_BYTES + 1024);
+        let sent = socket.send(Message::text(huge)).await;
+        if sent.is_ok() {
+            // 发送可能因为服务端已关闭而失败，两者都算「被拒」；
+            // 真正的判据是后续读不到任何正常回包。
+            match socket.next().await {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => {}
+                Some(Ok(other)) => panic!("超长消息不该被正常处理，收到：{other:?}"),
+            }
+        }
     }
 }
