@@ -12,47 +12,24 @@ use crate::api::model::Song;
 use crate::audio::engine::PlaybackState;
 use crate::ui::theme::Theme;
 
-/// 把一段文本编码成二维码，渲染成可直接显示的行。
+/// 判断**已经渲染好**的二维码行能否完整塞进 `max_width × max_rows`；装得下就返回一份。
 ///
-/// # 为什么用半块字符
+/// # 为什么收「已渲染的行」而不是「内容」
 ///
-/// 终端字符的高度约为宽度的两倍。若一个模块占一个字符，二维码会被纵向拉成两倍；
-/// 把一个二维码渲染成**能塞进给定区域**的字符行；塞不下返回 `None`。
+/// 二维码在收到时就按当前 `aspect` 渲染好并存进 `login.qr` 了（见 `Loaded::LoginQr`），
+/// 这里再编码一遍纯属浪费——实测单次编码约 0.9ms，而登录弹窗每帧都会走到这里。
 ///
-/// # 为什么需要边界
+/// # 为什么装不下返回 `None`
 ///
-/// 二维码的行数是**内容长度决定的，不能压缩**：半块字符一个字符承载上下两个
-/// 模块，所以 H 个模块恒定占 `ceil(H/2)` 行、W 列——再密就只能扭曲比例、扫不出来。
-/// 汽水的扫码地址（`bff-pc.qishui.com/ucenter_web/app/sdk-next?...`）比酷狗的
-/// 长得多，编出来的版本自然更高，在行数不多的终端上会直接撑满屏幕。
-///
-/// 所以这里不缩放（缩放等于毁掉可扫性），而是**判断装不装得下**：
-/// 装不下就返回 `None`，让界面改成给一句能照做的提示——比画一个被裁掉、
-/// 扫不出来的二维码有用。
-pub fn qr_lines_fitted(
-    content: &str,
-    aspect: f32,
-    max_width: usize,
-    max_rows: usize,
-) -> Option<Vec<String>> {
-    let modules = qr_modules(content)?;
-    let width = modules.first().map(Vec::len).unwrap_or(0);
-    let height = modules.len();
-    if width == 0 || height == 0 {
+/// 二维码的行数由内容长度决定、不能压缩：半块字符一个字符承载上下两个模块，
+/// H 个模块恒定占 `ceil(H/2)` 行、W 列，缩放等于毁掉可扫性。装不下时返回 `None`，
+/// 让界面改成给一句能照做的提示——比画一个被裁掉、扫不出来的二维码有用。
+pub fn qr_lines_fitted(lines: &[String], max_width: usize, max_rows: usize) -> Option<Vec<String>> {
+    let width = lines.first().map(|line| line.chars().count()).unwrap_or(0);
+    if width == 0 || width > max_width || lines.len() > max_rows {
         return None;
     }
-
-    // 宽字符字体（aspect < 1.5）用一字符一行；否则半块字符（一字符两行模块）。
-    let (rows, lines) = if aspect < 1.5 {
-        (height, render_full_blocks(&modules))
-    } else {
-        (height.div_ceil(2), render_half_blocks(&modules))
-    };
-
-    if width > max_width || rows > max_rows {
-        return None;
-    }
-    Some(lines)
+    Some(lines.to_vec())
 }
 
 /// 渲染二维码**所需**的行列数（用来在装不下时告诉用户差多少）。
@@ -543,8 +520,9 @@ mod tests {
     #[test]
     fn fitted_qr_renders_when_there_is_enough_room() {
         let (width, rows) = qr_needed_size(SODA_SCAN_URL, 2.0).expect("能编码");
-        // 给足空间就该画得出来，行数要与「所需尺寸」一致
-        let lines = qr_lines_fitted(SODA_SCAN_URL, 2.0, width, rows).expect("空间够时应渲染");
+        let rendered = qr_lines(SODA_SCAN_URL, 2.0).expect("能编码");
+        // 给足空间就该原样返回，行数要与「所需尺寸」一致
+        let lines = qr_lines_fitted(&rendered, width, rows).expect("空间够时应渲染");
         assert_eq!(lines.len(), rows, "渲染行数应与所需行数一致");
         assert!(lines.iter().all(|line| line.chars().count() == width));
     }
@@ -554,10 +532,13 @@ mod tests {
     #[test]
     fn fitted_qr_refuses_when_the_area_is_too_small() {
         let (width, rows) = qr_needed_size(SODA_SCAN_URL, 2.0).unwrap();
+        let rendered = qr_lines(SODA_SCAN_URL, 2.0).unwrap();
         // 少一行就不画
-        assert!(qr_lines_fitted(SODA_SCAN_URL, 2.0, width, rows - 1).is_none());
+        assert!(qr_lines_fitted(&rendered, width, rows - 1).is_none());
         // 少一列也不画
-        assert!(qr_lines_fitted(SODA_SCAN_URL, 2.0, width - 1, rows).is_none());
+        assert!(qr_lines_fitted(&rendered, width - 1, rows).is_none());
+        // 还没收到二维码（空输入）也不能当作「装得下」
+        assert!(qr_lines_fitted(&[], width, rows).is_none());
     }
 
     /// 所需尺寸要与实际渲染对得上——否则提示里的「需要多少行」会误导用户。
@@ -565,7 +546,8 @@ mod tests {
     fn needed_size_matches_what_gets_rendered() {
         for aspect in [1.0_f32, 2.0] {
             let (width, rows) = qr_needed_size("https://example.com/short", aspect).unwrap();
-            let lines = qr_lines_fitted("https://example.com/short", aspect, width, rows).unwrap();
+            let rendered = qr_lines("https://example.com/short", aspect).unwrap();
+            let lines = qr_lines_fitted(&rendered, width, rows).unwrap();
             assert_eq!(lines.len(), rows, "aspect={aspect}");
             assert_eq!(lines[0].chars().count(), width, "aspect={aspect}");
         }
@@ -588,7 +570,7 @@ mod tests {
         // 极长内容超过二维码容量上限
         let huge = "x".repeat(10_000);
         assert!(qr_needed_size(&huge, 2.0).is_none());
-        assert!(qr_lines_fitted(&huge, 2.0, 200, 100).is_none());
+        assert!(qr_lines(&huge, 2.0).is_none());
     }
 
     // ---- 尺寸回归 ----
@@ -629,5 +611,27 @@ mod tests {
             width <= 53,
             "长地址的宽度应被 L 级别压在 53 以内，实际 {width}（是否被改回 M 了？）"
         );
+    }
+
+    // ---- 基准（默认不跑：`cargo test -- --ignored --nocapture`）----
+
+    /// 量化「每帧重新编码二维码」的代价，用来决定要不要缓存渲染结果。
+    ///
+    /// 阈值 300µs：低于它就不值得为缓存引入状态字段与失效逻辑——缓存漏失效
+    /// 会画出扫不出来的旧码，比省下的几百微秒贵得多。
+    #[test]
+    #[ignore = "基准测试，靠 --ignored 手动跑"]
+    fn bench_qr_encoding_cost() {
+        const ITERATIONS: u32 = 200;
+        // 热身一次，把首次的惰性分配排除在外。
+        let _ = qr_lines(SODA_SCAN_URL, 2.0).expect("能编码");
+
+        let start = std::time::Instant::now();
+        for _ in 0..ITERATIONS {
+            let lines = qr_lines(SODA_SCAN_URL, 2.0).expect("能编码");
+            std::hint::black_box(&lines);
+        }
+        let per_call = start.elapsed() / ITERATIONS;
+        println!("二维码编码（汽水地址）：{per_call:?}/次（{ITERATIONS} 次平均）");
     }
 }

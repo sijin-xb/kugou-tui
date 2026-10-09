@@ -438,24 +438,16 @@ pub fn render_login(
     // 提示语 + 空行 + 「Esc 取消」各占一行，再留给边框
     let max_rows = usize::from(area.height.saturating_sub(7)).max(1);
 
-    let fitted =
-        crate::ui::widgets::qr_lines_fitted(&login.qr_content, aspect, max_width, max_rows)
-            // 没有原始内容时（理论上不会）退回预先渲染好的那份
-            .or_else(|| {
-                if login.qr.len() <= max_rows {
-                    Some(login.qr.clone())
-                } else {
-                    None
-                }
-            });
-
-    let (qr_lines, too_small): (Vec<String>, Option<(usize, usize)>) = match fitted {
-        Some(lines) => (lines, None),
-        None => (
-            Vec::new(),
-            crate::ui::widgets::qr_needed_size(&login.qr_content, aspect),
-        ),
-    };
+    // `login.qr` 在收到二维码时就按当前 `aspect` 渲染好了（见 `Loaded::LoginQr`），
+    // 与这里要画的是同一份：只判断装不装得下，装得下直接复用，**不再重新编码**。
+    let (qr_lines, too_small): (Vec<String>, Option<(usize, usize)>) =
+        match crate::ui::widgets::qr_lines_fitted(&login.qr, max_width, max_rows) {
+            Some(lines) => (lines, None),
+            None => (
+                Vec::new(),
+                crate::ui::widgets::qr_needed_size(&login.qr_content, aspect),
+            ),
+        };
 
     let qr_width = qr_lines
         .first()
@@ -923,6 +915,57 @@ mod tests {
                 })
                 .unwrap_or_else(|error| panic!("高度 {height} 渲染登录弹窗失败：{error}"));
         }
+    }
+
+    /// 登录弹窗每帧的渲染代价。
+    ///
+    /// 原先 `render_login` 每帧都调 `qr_lines_fitted` 把二维码**重编码**一遍
+    /// （`qr_lines` 实测约 0.9ms/次，见 widgets 的 `bench_qr_encoding_cost`）。
+    /// 改成复用 `login.qr` 后热路径上只剩「克隆已渲染行 + 排版」，这里把每帧代价
+    /// 钉在远低于 300µs，防止有人再把它改回重编码。带 `#[ignore]`，手动跑：
+    /// `cargo test --release -- --ignored --nocapture bench_login_render_cost`。
+    #[test]
+    #[ignore = "基准测试，手动运行"]
+    fn bench_login_render_cost() {
+        // 约 80 字符，与线上登录链接同一量级，二维码尺寸一致。
+        const URL: &str = "https://login-user.kugou.com/v2/qrcode?appid=1005&clientver=20000&qrcode=abcdef0123456789";
+        let qr = crate::ui::widgets::qr_lines(URL, 2.0).expect("二维码能编码");
+        let login = LoginState {
+            qr,
+            qr_content: URL.to_string(),
+            key: "abcdef".to_string(),
+            message: "等待扫码…".to_string(),
+            finished: false,
+            succeeded: false,
+        };
+        let theme = Theme::for_config(ThemeName::Default, false);
+        let aspect = Config::default().qr_aspect;
+        // 终端取「刚好装得下二维码」的大小：既保证走「复用 login.qr」的快路径，
+        // 又不让 TestBackend 的整屏缓冲区 diff 喧宾夺主（它随单元格数线性增长）。
+        let mut terminal = Terminal::new(TestBackend::new(60, 30)).expect("建测试终端");
+        let draw = |terminal: &mut Terminal<TestBackend>| {
+            terminal
+                .draw(|frame| {
+                    render_login(
+                        frame,
+                        &login,
+                        crate::source::SourceKind::Kugou,
+                        aspect,
+                        &theme,
+                    )
+                })
+                .expect("渲染登录弹窗");
+        };
+
+        draw(&mut terminal); // 热身，避免把首次分配算进去
+
+        const ROUNDS: u32 = 200;
+        let start = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            draw(&mut terminal);
+        }
+        let per_frame = start.elapsed() / ROUNDS;
+        println!("登录弹窗渲染每帧：{per_frame:?}");
     }
 
     /// 侧边栏装不下时要「**能放几行放几行**」，并在末尾说明还有什么没显示。

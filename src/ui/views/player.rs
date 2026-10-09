@@ -2131,4 +2131,66 @@ mod tests {
             println!("{round:>4} {}", rss_kib());
         }
     }
+
+    // ---- 基准（默认不跑：`cargo test -- --ignored --nocapture`）----
+
+    /// 造一份 `count` 行的歌词，隔行带译文/音译，模拟真实 KRC：
+    /// 显示单元数（原文 + 译文 + 音译）约为行数的 1.5~2 倍。
+    fn lyric_with_translations(count: usize) -> crate::api::model::Lyric {
+        let mut lyric = many_lines(count, 1_000);
+        for (index, line) in lyric.lines.iter_mut().enumerate() {
+            if index % 2 == 0 {
+                line.translation = Some("译文占位内容一二三".to_string());
+            }
+            if index % 3 == 0 {
+                line.romanization = Some("romaji placeholder line".to_string());
+            }
+        }
+        lyric
+    }
+
+    /// 量化「每帧重建歌词显示列表 + 渲染」的代价，用来决定要不要缓存显示列表。
+    ///
+    /// 阈值 300µs：低于它就不值得引入缓存字段与失效逻辑——歌词缓存的失效点是
+    /// 「换歌 / 换译文轨道」，漏一次就会显示上一首的歌词，比省下的几百微秒贵。
+    fn bench_lyric_render_cost(line_count: usize) {
+        const FRAMES: u32 = 100;
+        let theme = Theme::for_config(ThemeName::Default, false);
+        let mut state = AppState::new(crate::config::Config::default());
+        state.lyric.lyric = lyric_with_translations(line_count);
+        state.lyric.active_line = Some(line_count / 2);
+        state.position_ms = (line_count as u64 / 2) * 1_000 + 500;
+
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("测试后端可用");
+
+        // 热身一次；正式循环里每帧清掉 `display_line_index`——生产里它由
+        // `begin_frame` 每帧清空，不清会跨帧累积，把测量越拖越慢。
+        terminal
+            .draw(|frame| render_lyric(frame, Rect::new(0, 0, 80, 24), &mut state, &theme))
+            .expect("绘制成功");
+
+        let start = std::time::Instant::now();
+        for _ in 0..FRAMES {
+            state.lyric.display_line_index.clear();
+            terminal
+                .draw(|frame| render_lyric(frame, Rect::new(0, 0, 80, 24), &mut state, &theme))
+                .expect("绘制成功");
+        }
+        let per_frame = start.elapsed() / FRAMES;
+        println!("歌词渲染 {line_count} 行：{per_frame:?}/帧（{FRAMES} 帧平均）");
+    }
+
+    #[test]
+    #[ignore = "基准测试，靠 --ignored 手动跑"]
+    fn bench_lyric_render_cost_60_lines() {
+        bench_lyric_render_cost(60);
+    }
+
+    #[test]
+    #[ignore = "基准测试，靠 --ignored 手动跑"]
+    fn bench_lyric_render_cost_500_lines() {
+        bench_lyric_render_cost(500);
+    }
 }
