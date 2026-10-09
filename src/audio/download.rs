@@ -794,6 +794,12 @@ impl Downloader {
         let streams = Arc::clone(&self.streams);
 
         tokio::spawn(async move {
+            // 收尾统一交给守卫，正常/出错/panic 三条路都不会漏（见 `StreamCleanup`）。
+            let cleanup = StreamCleanup {
+                writer: writer.clone(),
+                streams: Arc::clone(&streams),
+                part_path: part_path.clone(),
+            };
             let outcome = match stream_into(&http, &url, &writer, &file).await {
                 Ok(()) if writer.is_cancelled() => {
                     // 用户在下载中途切了歌：删掉半成品，不留痕、不报错
@@ -835,14 +841,37 @@ impl Downloader {
             // 摘登记要早于回调：回调那一侧（`App::start_download`）可能立刻再起
             // 一条同目标的流——比如用户切走又切回来。摘晚了它会拿到一条已经收工的
             // 缓冲，画面卡在「缓冲中」。
-            streams
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(&part_path);
+            drop(cleanup);
             on_done(outcome);
         });
 
         Ok(buffer)
+    }
+}
+
+/// 流式下载任务的收尾守卫。
+///
+/// 正常结束、出错、取消都走显式分支，但 `stream_into` 一旦 panic，`.await` 之后
+/// 的收尾就全被跳过：缓冲永远不 `finish`，正阻塞在 `read()` 的解码线程会一直等
+/// 下去；`streams` 里也留着一条没人摘的记录，之后同目标再起流会拿到这条死缓冲。
+/// 而 `JoinHandle` 被丢弃，panic 本身也没人观察。靠 `Drop` 保证无论如何都收尾。
+struct StreamCleanup {
+    writer: StreamingBuffer,
+    streams: Arc<Mutex<HashMap<PathBuf, StreamingBuffer>>>,
+    part_path: PathBuf,
+}
+
+impl Drop for StreamCleanup {
+    fn drop(&mut self) {
+        // 只有还没收工才替它收：成功/失败/取消分支已经自己 finish 过，再 finish
+        // 会把它们的结论（尤其是成功的 `None`）覆盖成错误。
+        if !self.writer.is_finished() {
+            self.writer.finish(Some("下载任务异常终止".to_string()));
+        }
+        self.streams
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.part_path);
     }
 }
 
@@ -1383,5 +1412,57 @@ mod tests {
     fn chunk_len_counts_the_closed_interval() {
         assert_eq!(ChunkRange { start: 0, end: 0 }.len(), 1);
         assert_eq!(ChunkRange { start: 10, end: 19 }.len(), 10);
+    }
+
+    /// 任务半路 panic（收尾代码没跑到）时，守卫仍要标记结束并摘掉登记。
+    #[test]
+    fn cleanup_guard_finishes_and_deregisters_on_drop() {
+        let dir = temp_dir("stream-cleanup");
+        let part_path = dir.join("song.mp3.part");
+        let file = Arc::new(std::fs::File::create(&part_path).expect("建 .part"));
+        let buffer = StreamingBuffer::with_spill(None, Arc::clone(&file));
+        let streams: Arc<Mutex<HashMap<PathBuf, StreamingBuffer>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        streams
+            .lock()
+            .expect("锁")
+            .insert(part_path.clone(), buffer.clone());
+
+        drop(StreamCleanup {
+            writer: buffer.clone(),
+            streams: Arc::clone(&streams),
+            part_path,
+        });
+
+        assert!(
+            buffer.is_finished(),
+            "drop 后缓冲必须收工，否则读线程会永久阻塞"
+        );
+        assert!(
+            buffer.error().is_some(),
+            "异常终止要带错误，而不是假装正常结束"
+        );
+        assert!(
+            streams.lock().expect("锁").is_empty(),
+            "drop 后登记必须摘掉，否则同目标再起流会拿到死缓冲"
+        );
+    }
+
+    /// 已经正常结束的缓冲不该被守卫改写成错误。
+    #[test]
+    fn cleanup_guard_keeps_an_already_finished_buffer_untouched() {
+        let dir = temp_dir("stream-cleanup-done");
+        let part_path = dir.join("song.mp3.part");
+        let file = Arc::new(std::fs::File::create(&part_path).expect("建 .part"));
+        let buffer = StreamingBuffer::with_spill(None, Arc::clone(&file));
+        buffer.finish(None);
+
+        drop(StreamCleanup {
+            writer: buffer.clone(),
+            streams: Arc::new(Mutex::new(HashMap::new())),
+            part_path,
+        });
+
+        assert!(buffer.is_complete(), "已正常结束的缓冲不该被守卫覆盖成错误");
     }
 }

@@ -275,7 +275,15 @@ pub(crate) fn inject_decoded_lyric(root: &mut Value) {
             .and_then(|bytes| String::from_utf8(bytes).ok())
             .unwrap_or_default()
     } else {
-        crate::api::native::krc::decode(&content).unwrap_or_default()
+        // 解码失败只退化成空歌词，但必须留一条 WARN：静默吞掉会让「歌词怎么
+        // 没了」变成一个查不出来的问题。
+        crate::api::native::krc::decode(&content).unwrap_or_else(|error| {
+            crate::logger::tlog!(
+                crate::logger::LEVEL_WARN,
+                "KRC 歌词解码失败，退回空歌词：{error}"
+            );
+            String::new()
+        })
     };
 
     object.insert("decodeContent".to_string(), Value::String(decoded));

@@ -36,7 +36,7 @@ use crate::api::ApiClient;
 use crate::api::catalog::StreamUrl;
 use crate::api::model::{Lyric, Song};
 use crate::error::{AppError, Result};
-use crate::logger::{LEVEL_DEBUG, LEVEL_INFO, tlog};
+use crate::logger::{LEVEL_DEBUG, LEVEL_INFO, LEVEL_WARN, tlog};
 
 pub use client::AppCredentials;
 
@@ -331,10 +331,13 @@ pub async fn song_stream_url(
         //
         // 查询失败时退回用户设置（\`unwrap_or(true)\`）：宁可对非会员多要一档
         // （服务端会自己降级），也不要让真会员被莫名降到免费档。
-        let preference = preference_for_account(
-            libresoda::soda::account::is_vip_account(soda).unwrap_or(true),
-            preference,
-        );
+        let is_vip = libresoda::soda::account::is_vip_account(soda).unwrap_or_else(|error| {
+            // 查询失败按会员处理（服务端会自己降级），但错误不能无声无息——
+            // 否则非会员被当成会员去要高档位，日志里查不到任何线索。
+            tlog!(LEVEL_WARN, "汽水会员权益查询失败，按会员处理：{error}");
+            true
+        });
+        let preference = preference_for_account(is_vip, preference);
         soda.set_quality_preference(preference);
 
         // 时长与 VIP 标记要用于「这是不是试听片段」的判断。
@@ -522,9 +525,10 @@ pub async fn cover_url(api: &ApiClient, song: &Song) -> Result<Option<String>> {
     blocking("取封面", move || {
         match libresoda::soda::track::fetch_song_detail(soda, &track_id) {
             Ok(detail) => Ok(Some(detail.cover).filter(|url| !url.trim().is_empty())),
-            // 封面拿不到不该让整首歌失败——界面退回占位图即可。
+            // 封面拿不到不该让整首歌失败——界面退回占位图即可。但级别要与其他
+            // 音源的封面失败一致用 WARN，否则默认日志里这条永远看不到。
             Err(error) => {
-                tlog!(LEVEL_DEBUG, "汽水封面查询失败：{error}");
+                tlog!(LEVEL_WARN, "汽水封面查询失败：{error}");
                 Ok(None)
             }
         }
