@@ -1409,8 +1409,18 @@ impl MusicApi for NativeApi {
 
         // 上游把响应体当 arraybuffer 收，再 `toString('base64')` 后走
         // `playlistAesDecrypt`；这里拿到的已是原始字节，直接解密即可。
+        //
+        // 这个接口**成功时也不返回 `error_code`**，所以「解密成功」就是唯一的成功
+        // 判据；把明文落一行 DEBUG，是为了删错东西时能看出服务端到底说了什么。
         let (encrypt_key, iv) = crate::api::native::crypto::playlist_key_material(&aes_key);
-        crate::api::native::crypto::aes_cbc_decrypt(&encrypt_key, &iv, &body)?;
+        let plain = crate::api::native::crypto::aes_cbc_decrypt(&encrypt_key, &iv, &body)?;
+        crate::logger::tlog!(
+            crate::logger::LEVEL_DEBUG,
+            "playlist/del 响应 {} 字节，解密后 {} 字节：{}",
+            body.len(),
+            plain.len(),
+            String::from_utf8_lossy(&plain)
+        );
         Ok(())
     }
 
@@ -3838,5 +3848,450 @@ mod tests {
 
         // 真正的失败路径：长度不是块大小整数倍。
         assert!(crate::api::native::crypto::aes_cbc_decrypt(&key, &iv, &body[..7]).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // 云歌单写接口：真实账号端到端探针
+    //
+    // 写接口用 mock 只能证明「请求形状与签名对」，证明不了「服务端真的接受了」。
+    // 这个探针在**隔离配置**下打真实服务端，只新建一个临时歌单、只删它自己，
+    // 全程不碰任何既有歌单；任一断言失败立刻停止，并尝试只清理那一个临时歌单。
+    //
+    //   KUGOU_TUI_CONFIG_DIR=/tmp/kt-write KUGOU_TUI_DEBUG=1 \
+    //   cargo test probe_real_cloud_playlist_write -- --ignored --nocapture
+    //
+    // 出站条数取自 `Transport::send`/`send_bytes` 的 DEBUG 行，所以必须开
+    // `KUGOU_TUI_DEBUG=1`；输出只打印 listid、名称与数量。
+    // ------------------------------------------------------------------
+
+    /// 临时歌单名。带日期后缀，便于在官方客户端里认出并手动清理。
+    const PROBE_PLAYLIST_NAME: &str = "kt-native-test-20261009";
+
+    fn probe_mark(log: &std::path::Path) -> u64 {
+        std::fs::metadata(log).map(|meta| meta.len()).unwrap_or(0)
+    }
+
+    fn probe_delta(log: &std::path::Path, mark: u64) -> String {
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut file) = std::fs::File::open(log) else {
+            return String::new();
+        };
+        if file.seek(SeekFrom::Start(mark)).is_err() {
+            return String::new();
+        }
+        let mut text = String::new();
+        let _ = file.read_to_string(&mut text);
+        text
+    }
+
+    /// 四个写接口的路径。读接口不需要枚举——凡是出站行里不匹配这些的就算读。
+    fn probe_is_write(url: &str) -> bool {
+        [
+            "/cloudlist.service/v5/add_list",
+            "/cloudlist.service/v6/add_song",
+            "/v4/delete_songs",
+            "/v2/delete_list",
+        ]
+        .iter()
+        .any(|path| url.contains(path))
+    }
+
+    /// 从日志增量里数出站请求：返回（读条数，写条数，写路径）。
+    fn probe_count(text: &str) -> (usize, usize, Vec<String>) {
+        let mut reads = 0usize;
+        let mut writes = 0usize;
+        let mut write_paths = Vec::new();
+        for line in text.lines() {
+            let Some(rest) = line.split("native 出站 ").nth(1) else {
+                continue;
+            };
+            let mut parts = rest.split_whitespace();
+            let _method = parts.next();
+            let Some(url) = parts.next() else { continue };
+            if probe_is_write(url) {
+                writes += 1;
+                let tail = url.split("://").nth(1).unwrap_or(url);
+                let tail = tail.split_once('/').map(|(_, tail)| tail).unwrap_or(tail);
+                write_paths.push(format!("/{}", tail.split('?').next().unwrap_or(tail)));
+            } else {
+                reads += 1;
+            }
+        }
+        (reads, writes, write_paths)
+    }
+
+    /// 打印一步的出站条数，并锁住「写接口只发一次」。
+    fn probe_step(
+        log: &std::path::Path,
+        mark: u64,
+        label: &str,
+        expect_writes: usize,
+    ) -> std::result::Result<u64, String> {
+        let text = probe_delta(log, mark);
+        let (reads, writes, paths) = probe_count(&text);
+        println!("  [{label}] 读 {reads} 条 / 写 {writes} 条");
+        if writes != expect_writes {
+            return Err(format!(
+                "{label}：写请求 {writes} 条，期望 {expect_writes} 条（写接口不重试）"
+            ));
+        }
+        if paths.len() > 1 {
+            return Err(format!("{label}：单步出现多个写请求 {paths:?}"));
+        }
+        Ok(probe_mark(log))
+    }
+
+    async fn probe_playlists(api: &NativeApi) -> std::result::Result<Vec<Playlist>, String> {
+        api.user_playlists()
+            .await
+            .map_err(|error| format!("user_playlists 失败：{error}"))
+    }
+
+    fn probe_ids(list: &[Playlist]) -> std::collections::BTreeSet<i64> {
+        list.iter()
+            .filter_map(|playlist| playlist.list_id)
+            .collect()
+    }
+
+    /// b–g 全流程。`created` 是出参：一旦新建成功就立刻写进去，供失败时清理。
+    async fn probe_run(
+        api: &NativeApi,
+        log: &std::path::Path,
+        name: &str,
+        before: &std::collections::BTreeSet<i64>,
+        created: &mut Option<i64>,
+    ) -> std::result::Result<(), String> {
+        let source = SourceKind::KugouConcept;
+
+        // b. 新建临时歌单
+        let mut mark = probe_mark(log);
+        let id = api
+            .create_playlist(source, name)
+            .await
+            .map_err(|error| format!("create_playlist 失败：{error}"))?
+            .ok_or_else(|| "create_playlist 没有返回 listid".to_string())?;
+        *created = Some(id);
+        mark = probe_step(log, mark, "b 新建", 1)?;
+        if before.contains(&id) {
+            return Err(format!("新建返回的 listid={id} 已在测试前的集合里"));
+        }
+        println!("  [b] listid={id} name={name}");
+
+        // c. 集合必须恰好是 B ∪ {id}，且名称匹配
+        let after_create = probe_playlists(api).await?;
+        let names: std::collections::BTreeMap<i64, String> = after_create
+            .iter()
+            .filter_map(|playlist| playlist.list_id.map(|id| (id, playlist.name.clone())))
+            .collect();
+        let current: std::collections::BTreeSet<i64> = names.keys().copied().collect();
+        let mut expected = before.clone();
+        expected.insert(id);
+        if current != expected {
+            return Err(format!(
+                "新建后集合不一致：当前 {} 个，期望 {} 个",
+                current.len(),
+                expected.len()
+            ));
+        }
+        match names.get(&id) {
+            Some(actual) if actual == name => {}
+            Some(actual) => return Err(format!("listid={id} 的名称是「{actual}」，与预期不符")),
+            None => return Err(format!("listid={id} 不在歌单列表里")),
+        }
+        mark = probe_step(log, mark, "c 复核列表", 0)?;
+
+        // d. 搜一首歌，加进临时歌单，再读回来取 file_id
+        let songs = api
+            .search_songs("晴天", 1, 30)
+            .await
+            .map_err(|error| format!("search_songs 失败：{error}"))?;
+        let song = songs
+            .into_iter()
+            .next()
+            .ok_or_else(|| "搜索没有结果".to_string())?;
+        mark = probe_step(log, mark, "d0 搜索", 0)?;
+
+        let written = api
+            .add_tracks_to_playlist(source, id, std::slice::from_ref(&song))
+            .await
+            .map_err(|error| format!("add_tracks_to_playlist 失败：{error}"))?;
+        mark = probe_step(log, mark, "d 加歌", 1)?;
+        if written != 1 {
+            return Err(format!("add_tracks_to_playlist 返回 {written}，期望 1"));
+        }
+        // 云端列表有写入延迟，等一拍再读；这只是等待，不是重试写请求。
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let tracks = api
+            .user_playlist_tracks(id, 1, 100, true)
+            .await
+            .map_err(|error| format!("读歌单失败：{error}"))?;
+        mark = probe_step(log, mark, "d 复核", 0)?;
+        let entry = tracks
+            .iter()
+            .find(|track| track.hash == song.hash)
+            .ok_or_else(|| format!("加歌后歌单里没有 hash={} 的歌", song.hash))?;
+        let file_id = entry
+            .file_id
+            .ok_or_else(|| "歌单条目没有 file_id，无法执行移除".to_string())?;
+        println!("  歌单曲目 {} 首，目标条目 file_id={file_id}", tracks.len());
+
+        // e. 从临时歌单移除
+        let mut target = entry.clone();
+        target.file_id = Some(file_id);
+        let removed = api
+            .remove_tracks_from_playlist(source, id, std::slice::from_ref(&target))
+            .await
+            .map_err(|error| format!("remove_tracks_from_playlist 失败：{error}"))?;
+        mark = probe_step(log, mark, "e 移除", 1)?;
+        if removed != 1 {
+            return Err(format!(
+                "remove_tracks_from_playlist 返回 {removed}，期望 1"
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let tracks = api
+            .user_playlist_tracks(id, 1, 100, true)
+            .await
+            .map_err(|error| format!("读歌单失败：{error}"))?;
+        mark = probe_step(log, mark, "e 复核", 0)?;
+        if tracks.iter().any(|track| track.hash == song.hash) {
+            return Err("移除后歌单里仍有这首歌".to_string());
+        }
+
+        // f. 删除前再断言一次，然后只删这一个
+        let before_delete = probe_playlists(api).await?;
+        match before_delete
+            .iter()
+            .find(|playlist| playlist.list_id == Some(id))
+        {
+            Some(playlist) if playlist.name == name => {}
+            Some(playlist) => {
+                return Err(format!("待删 listid={id} 的名称是「{}」", playlist.name));
+            }
+            None => return Err(format!("待删 listid={id} 已不在歌单列表里")),
+        }
+        mark = probe_step(log, mark, "f 复核", 0)?;
+        api.delete_playlist(source, id)
+            .await
+            .map_err(|error| format!("delete_playlist 失败：{error}"))?;
+        mark = probe_step(log, mark, "f 删除", 1)?;
+
+        // g. 以云端列表为准，不看 delete 的返回值
+        let final_ids = probe_ids(&probe_playlists(api).await?);
+        probe_step(log, mark, "g 复核", 0)?;
+        if &final_ids != before {
+            return Err(format!(
+                "删除后集合没有回到测试前：当前 {} 个，测试前 {} 个",
+                final_ids.len(),
+                before.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// 失败时的清理：确认这个 id 仍是那个临时歌单，只删它，再复核集合。
+    async fn probe_cleanup(
+        api: &NativeApi,
+        log: &std::path::Path,
+        name: &str,
+        id: i64,
+        before: &std::collections::BTreeSet<i64>,
+    ) -> bool {
+        println!("  清理：只删除 listid={id}");
+        let current = match probe_playlists(api).await {
+            Ok(list) => list,
+            Err(error) => {
+                println!("  清理失败：{error}");
+                return false;
+            }
+        };
+        match current.iter().find(|playlist| playlist.list_id == Some(id)) {
+            Some(playlist) if playlist.name == name => {}
+            Some(playlist) => {
+                println!(
+                    "  清理中止：listid={id} 的名称是「{}」，不是临时歌单",
+                    playlist.name
+                );
+                return false;
+            }
+            None => println!("  清理：listid={id} 已不在列表里"),
+        }
+
+        let mark = probe_mark(log);
+        if let Err(error) = api.delete_playlist(SourceKind::KugouConcept, id).await {
+            println!("  清理失败：delete_playlist 报错：{error}");
+            return false;
+        }
+        if let Err(error) = probe_step(log, mark, "清理 删除", 1) {
+            println!("  {error}");
+            return false;
+        }
+
+        match probe_playlists(api).await {
+            Ok(list) => {
+                if probe_ids(&list) == *before {
+                    println!("  清理完成，集合已回到测试前");
+                    true
+                } else {
+                    println!(
+                        "  清理后集合仍不一致：当前 {} 个，测试前 {} 个",
+                        list.len(),
+                        before.len()
+                    );
+                    false
+                }
+            }
+            Err(error) => {
+                println!("  清理后复核失败：{error}");
+                false
+            }
+        }
+    }
+
+    /// 云歌单写接口的真实端到端验证。只在隔离配置下跑。
+    #[tokio::test]
+    #[ignore = "真实写接口：需要隔离配置（KUGOU_TUI_CONFIG_DIR）与真实登录态"]
+    async fn probe_real_cloud_playlist_write() {
+        let Ok(config_dir) = std::env::var("KUGOU_TUI_CONFIG_DIR") else {
+            eprintln!(
+                "先设 KUGOU_TUI_CONFIG_DIR=<隔离配置目录>（内含 config.toml 与 device.toml）"
+            );
+            return;
+        };
+        if config_dir.trim().is_empty() {
+            eprintln!("KUGOU_TUI_CONFIG_DIR 是空值，拒绝运行");
+            return;
+        }
+
+        let mut config = crate::config::Config::load();
+        config.switch_source(SourceKind::KugouConcept);
+        if !config.is_logged_in() {
+            eprintln!("隔离配置 {config_dir} 里没有酷狗登录态，拒绝运行");
+            return;
+        }
+
+        let log = crate::config::Config::log_path();
+        crate::logger::init(&log).expect("初始化日志");
+        println!("配置目录={config_dir}");
+        println!("日志={}", log.display());
+
+        let api = NativeApi::new(
+            SourceKind::KugouConcept,
+            config.cookie_header(),
+            config.proxy.as_deref(),
+        )
+        .expect("构造 NativeApi");
+
+        // a. 测试前的歌单 id 集合
+        let mark = probe_mark(&log);
+        let before_list = probe_playlists(&api).await.expect("读测试前歌单失败");
+        let before = probe_ids(&before_list);
+        probe_step(&log, mark, "a 测试前", 0).expect("测试前不应有写请求");
+        println!("  [a] 测试前歌单 {} 个", before.len());
+        for playlist in &before_list {
+            println!("      listid={:?} name={}", playlist.list_id, playlist.name);
+        }
+
+        let mut created: Option<i64> = None;
+        match probe_run(&api, &log, PROBE_PLAYLIST_NAME, &before, &mut created).await {
+            Ok(()) => println!("PROBE OK"),
+            Err(error) => {
+                println!("PROBE FAILED: {error}");
+                match created {
+                    Some(id) => {
+                        if probe_cleanup(&api, &log, PROBE_PLAYLIST_NAME, id, &before).await {
+                            println!("已清理临时歌单 listid={id}");
+                        } else {
+                            println!("!!! 请手动删除 listid={id}（名称 {PROBE_PLAYLIST_NAME}）!!!");
+                        }
+                    }
+                    None => println!("没有创建任何歌单，无需清理"),
+                }
+                panic!("云歌单写接口探针失败：{error}");
+            }
+        }
+    }
+
+    /// 清理一个遗留的临时歌单：只删名字等于 [`PROBE_PLAYLIST_NAME`] 的那一个。
+    ///
+    /// 探针失败时若连 listid 都没拿到，云端可能已经留下了歌单；这个入口用来
+    /// 手动收尾，名字不匹配就拒绝删除。
+    ///
+    ///   KUGOU_TUI_CONFIG_DIR=/tmp/kt-write KUGOU_TUI_DEBUG=1 \
+    ///   KUGOU_TUI_PROBE_DELETE_LISTID=5 \
+    ///   cargo test probe_delete_leftover_playlist -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "清理遗留的临时歌单：需要 KUGOU_TUI_CONFIG_DIR 与 KUGOU_TUI_PROBE_DELETE_LISTID"]
+    async fn probe_delete_leftover_playlist() {
+        let Ok(config_dir) = std::env::var("KUGOU_TUI_CONFIG_DIR") else {
+            eprintln!("先设 KUGOU_TUI_CONFIG_DIR=<隔离配置目录>");
+            return;
+        };
+        let Ok(raw_id) = std::env::var("KUGOU_TUI_PROBE_DELETE_LISTID") else {
+            eprintln!("先设 KUGOU_TUI_PROBE_DELETE_LISTID=<要删的 listid>");
+            return;
+        };
+        let Ok(id) = raw_id.trim().parse::<i64>() else {
+            eprintln!("KUGOU_TUI_PROBE_DELETE_LISTID 不是整数：{raw_id}");
+            return;
+        };
+
+        let mut config = crate::config::Config::load();
+        config.switch_source(SourceKind::KugouConcept);
+        if !config.is_logged_in() {
+            eprintln!("隔离配置 {config_dir} 里没有酷狗登录态，拒绝运行");
+            return;
+        }
+        let log = crate::config::Config::log_path();
+        crate::logger::init(&log).expect("初始化日志");
+
+        let api = NativeApi::new(
+            SourceKind::KugouConcept,
+            config.cookie_header(),
+            config.proxy.as_deref(),
+        )
+        .expect("构造 NativeApi");
+
+        let list = api.user_playlists().await.expect("读歌单失败");
+        match list.iter().find(|playlist| playlist.list_id == Some(id)) {
+            Some(playlist) if playlist.name == PROBE_PLAYLIST_NAME => {
+                println!("确认 listid={id} 是临时歌单「{}」，开始删除", playlist.name);
+            }
+            Some(playlist) => {
+                eprintln!(
+                    "拒绝删除：listid={id} 的名称是「{}」，不是 {PROBE_PLAYLIST_NAME}",
+                    playlist.name
+                );
+                return;
+            }
+            None => {
+                eprintln!("listid={id} 不在歌单列表里，无需删除");
+                return;
+            }
+        }
+
+        let before = probe_ids(&list);
+        api.delete_playlist(SourceKind::KugouConcept, id)
+            .await
+            .expect("delete_playlist 失败");
+        match api.user_playlists().await {
+            Ok(after) => {
+                let now = probe_ids(&after);
+                let mut expected = before.clone();
+                expected.remove(&id);
+                if now == expected {
+                    println!(
+                        "已删除 listid={id}，歌单数 {} → {}",
+                        before.len(),
+                        now.len()
+                    );
+                } else {
+                    println!("!!! 删除后集合不一致，请手动检查 listid={id} !!!");
+                }
+            }
+            Err(error) => println!("删除后复核失败：{error}"),
+        }
     }
 }
