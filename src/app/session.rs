@@ -96,4 +96,40 @@ mod tests {
         let back: Session = serde_json::from_str(&text).expect("反序列化不该失败");
         assert_eq!(back.vip_claimed_day.as_deref(), Some("2026-09-23"));
     }
+
+    /// 老版本写下的队列条目**没有** `source`。升级后必须仍能解析，且缺字段的
+    /// 歌回落为默认音源（酷狗）——绝不能因为旧文件缺字段而丢队列或 panic。
+    #[test]
+    fn legacy_session_queue_entries_default_to_kugou() {
+        let song = Song {
+            name: "老歌".to_string(),
+            hash: "abc".to_string(),
+            source: crate::source::SourceKind::Netease,
+            ..Song::default()
+        };
+        let mut value = serde_json::to_value(Session {
+            queue: vec![song],
+            cursor: Some(0),
+            position_ms: 1234,
+            vip_claimed_day: None,
+        })
+        .expect("序列化不该失败");
+
+        // 模拟老版本写下的文件：队列条目没有 `source`，顶层也没有 `vip_claimed_day`
+        let object = value.as_object_mut().expect("会话是对象");
+        object.remove("vip_claimed_day");
+        for entry in object
+            .get_mut("queue")
+            .and_then(|queue| queue.as_array_mut())
+            .expect("queue 是数组")
+        {
+            entry.as_object_mut().expect("歌曲是对象").remove("source");
+        }
+
+        let session: Session = serde_json::from_value(value).expect("旧队列应仍可解析");
+        assert_eq!(session.queue.len(), 1);
+        assert_eq!(session.queue[0].name, "老歌");
+        assert_eq!(session.queue[0].source, crate::source::SourceKind::Kugou);
+        assert_eq!(session.vip_claimed_day, None);
+    }
 }

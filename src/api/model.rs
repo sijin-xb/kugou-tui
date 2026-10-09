@@ -140,22 +140,36 @@ impl Song {
     }
 
     /// 缓存键：同一首歌的不同音质要分开缓存。
+    ///
+    /// **必须带 `source`**：不同音源对同一首歌给的 `hash` 未必互斥（网易云与
+    /// 汽水都用数字 id），只按 `hash-quality` 做键会让两个源的歌串用同一个
+    /// 缓存文件。带上来源后各源各存各的，键也天然不会跨源碰撞。
     pub fn cache_key(&self, quality: &str) -> String {
-        format!("{}-{}", self.hash.to_lowercase(), quality)
+        format!(
+            "{}-{}-{}",
+            self.source.as_key(),
+            self.hash.to_lowercase(),
+            quality
+        )
     }
 
     /// 试听片段专用的缓存键。
     ///
     /// # 为什么片段不能用正常缓存键
     ///
-    /// 缓存键只由 `hash-quality` 组成，不区分「完整版」和「试听片段」。若把 60 秒
+    /// 缓存键只由 `source-hash-quality` 组成，不区分「完整版」和「试听片段」。若把 60 秒
     /// 片段按正常键存下来，之后即使会员生效，播放也会命中这个旧片段——表现就是
     /// 「明明已经是会员，这首歌还是只能听几十秒」，而且很难想到是缓存问题。
     ///
     /// 用独立键之后：播放只查正常键，查不到就重新取链；能拿到完整版就存正常键，
     /// 拿不到才存片段键。会员一生效，下一次播放自然就是完整版。
     pub fn trial_cache_key(&self, quality: &str) -> String {
-        format!("{}-{}-trial", self.hash.to_lowercase(), quality)
+        format!(
+            "{}-{}-{}-trial",
+            self.source.as_key(),
+            self.hash.to_lowercase(),
+            quality
+        )
     }
 }
 
@@ -1239,5 +1253,51 @@ mod tests {
         let songs = extract_songs(&data);
         assert_eq!(songs.len(), 1);
         assert_eq!(songs[0].name, "真歌");
+    }
+
+    /// 缓存键必须带来源：两个音源对同一首歌给的 hash 未必互斥，只按
+    /// `hash-quality` 做键会让它们串用同一个缓存文件。
+    #[test]
+    fn cache_keys_are_scoped_by_source() {
+        let kugou = Song {
+            hash: "ABC123".to_string(),
+            source: crate::source::SourceKind::Kugou,
+            ..Song::default()
+        };
+        let netease = Song {
+            source: crate::source::SourceKind::Netease,
+            ..kugou.clone()
+        };
+
+        assert_ne!(kugou.cache_key("320"), netease.cache_key("320"));
+        assert_ne!(kugou.trial_cache_key("320"), netease.trial_cache_key("320"));
+
+        // 同源、同 hash（大小写归一）、同音质 → 同键
+        let same = Song {
+            hash: "abc123".to_string(),
+            source: crate::source::SourceKind::Kugou,
+            ..Song::default()
+        };
+        assert_eq!(kugou.cache_key("320"), same.cache_key("320"));
+    }
+
+    /// `source` 要能随 serde 往返；旧数据缺这个字段时回落到默认音源（酷狗），
+    /// 不能因此解析失败——否则升级一次就把整个队列丢了。
+    #[test]
+    fn song_serde_round_trips_source_and_defaults_to_kugou() {
+        let song = Song {
+            hash: "h".to_string(),
+            source: crate::source::SourceKind::Netease,
+            ..Song::default()
+        };
+        let text = serde_json::to_string(&song).expect("序列化不该失败");
+        let back: Song = serde_json::from_str(&text).expect("反序列化不该失败");
+        assert_eq!(back.source, crate::source::SourceKind::Netease);
+
+        // 模拟老版本写下的数据：序列化后把 `source` 键删掉
+        let mut legacy = serde_json::to_value(&song).expect("序列化不该失败");
+        legacy.as_object_mut().expect("歌曲是对象").remove("source");
+        let old: Song = serde_json::from_value(legacy).expect("缺 source 的旧数据应可解析");
+        assert_eq!(old.source, crate::source::SourceKind::Kugou);
     }
 }
