@@ -142,7 +142,13 @@ rubato = "=0.16.2"
 # `calculateMid` 还要把 128 位摘要当大整数转十进制。lib 名是 `md5`。
 md-5 = "0.10"
 num-bigint = "0.4"
-tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
+    # 只用**服务端**握手（`accept_hdr_async_with_config`）。刻意不开任何 TLS
+    # feature：我们只监听本机明文 ws://，TLS 是客户端 `connect_async` 才需要的。
+    # 开了会把 rustls + ring 拖进**所有平台**，包括 Windows——而 Windows 那栏
+    # 正是为了让 rustls 那坨 C 代码不参与编译才改用 SChannel 的（见下面平台段）。
+    "handshake",
+] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 
 # ======================================================================
