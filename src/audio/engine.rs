@@ -297,6 +297,22 @@ impl AudioHandle {
         self.thread.is_none()
     }
 
+    /// 仅供测试：造一个**不接音频线程**的句柄。
+    ///
+    /// 命令发出去没人收（`send` 本来就忽略失败），但状态读写的还是同一份
+    /// `Shared`，所以 `mark_loading` 这类同步写状态的方法行为不变。测试要的是
+    /// 「状态字段对不对、调用炸不炸」，没必要真的去开音频设备。
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        let (command_tx, _command_rx) = unbounded();
+        Self {
+            command_tx,
+            shared: Arc::new(Shared::new(1.0)),
+            levels: AudioLevels::new(),
+            thread: None,
+        }
+    }
+
     /// 当前播放电平（0.0 ~ 1.0 的一串格子，旧的在前）。
     pub fn levels(&self) -> Vec<f32> {
         self.levels.snapshot()

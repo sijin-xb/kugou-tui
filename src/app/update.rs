@@ -3172,4 +3172,79 @@ mod tests {
         assert_eq!(queue_removal(&dup, Some(2), "x"), Some((2, Some(2))));
         assert_eq!(queue_removal(&dup, Some(0), "x"), Some((0, Some(0))));
     }
+
+    /// 取流/装载还没成功就失败时，「缓冲中」必须被收掉——否则按 Space 没反应。
+    #[test]
+    fn abort_loading_clears_the_buffering_state() {
+        let mut app = App::for_test();
+        app.state.playback = PlaybackState::Loading;
+        app.state.busy = Some("缓冲《某首》".to_string());
+        app.state.download_progress = Some((10, Some(100)));
+
+        app.abort_loading();
+
+        assert_eq!(app.state.playback, PlaybackState::Stopped);
+        assert!(app.state.busy.is_none(), "缓冲标签要收掉");
+        assert!(app.state.download_progress.is_none(), "下载进度要收掉");
+    }
+
+    /// `Loaded::Failed` 只在**确实处于 Loading** 时收掉加载态。
+    ///
+    /// 正在播的那首不能被无关失败误停——封面/歌词之外的失败也走这条事件。
+    #[test]
+    fn load_failure_only_stops_while_loading() {
+        let mut app = App::for_test();
+
+        app.state.playback = PlaybackState::Loading;
+        app.handle_loaded(Loaded::Failed {
+            context: "获取《x》的播放地址失败".to_string(),
+            error: crate::error::AppError::Other("源不可用".to_string()),
+            target: None,
+        });
+        assert_eq!(app.state.playback, PlaybackState::Stopped);
+
+        app.state.playback = PlaybackState::Playing;
+        app.handle_loaded(Loaded::Failed {
+            context: "取封面失败".to_string(),
+            error: crate::error::AppError::Other("网络抖动".to_string()),
+            target: None,
+        });
+        assert_eq!(
+            app.state.playback,
+            PlaybackState::Playing,
+            "正在播的歌不能被误停"
+        );
+    }
+
+    /// 加载途中切到另一首歌：新歌的状态要盖掉旧的，不能串（歌名、歌词归属都跟着换）。
+    #[test]
+    fn switching_songs_mid_load_overwrites_the_previous_one() {
+        let mut app = App::for_test();
+        let song = |hash: &str, name: &str| Song {
+            hash: hash.to_string(),
+            name: name.to_string(),
+            ..Song::default()
+        };
+
+        app.start_playback(song("a", "第一首"), 0);
+        assert_eq!(
+            app.state.current.as_ref().map(|s| s.name.as_str()),
+            Some("第一首")
+        );
+        assert_eq!(app.state.playback, PlaybackState::Loading);
+        assert_eq!(app.state.lyric.hash.as_deref(), Some("a"));
+
+        app.start_playback(song("b", "第二首"), 0);
+        assert_eq!(
+            app.state.current.as_ref().map(|s| s.name.as_str()),
+            Some("第二首"),
+            "旧歌不能盖住新歌"
+        );
+        assert_eq!(app.state.playback, PlaybackState::Loading);
+        assert_eq!(
+            app.state.lyric.hash.as_deref(),
+            Some("b"),
+            "歌词归属要跟着新歌走"
+        );
+    }
 }

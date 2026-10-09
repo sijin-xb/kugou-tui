@@ -546,6 +546,66 @@ impl App {
     }
 }
 
+/// 仅供测试：造一个不碰网络、不碰音频设备、不读写用户目录的 [`App`]。
+///
+/// 生产构造路径 [`App::new`] 会建多线程运行时、连音频设备、读会话文件、发一串
+/// 启动请求，测试里既慢又有副作用。这里把依赖换成离线替身：
+///
+/// * 网络运行时用 `new_current_thread` 且**不** `block_on`——`spawn` 出去的任务
+///   永远不跑，所以不会真的发请求；
+/// * `ApiClient` 指向 `127.0.0.1:9`（discard 端口），即便有任务真跑了也是立刻
+///   连接被拒，打不到真实服务；
+/// * 音频句柄用 [`AudioHandle::detached`]，不接音频线程；
+/// * 不调 `ensure_cache_dir` / `restore_session` / 任何 `fetch_*`。
+#[cfg(test)]
+impl App {
+    pub(crate) fn for_test() -> Self {
+        let config = Config {
+            tray: false,
+            ws: false,
+            ..Config::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("测试运行时应当能建起来");
+        let (bus, receiver) = EventBus::new();
+        let api = ApiClient::for_backend(
+            crate::api::ApiBackend::Node,
+            crate::source::SourceKind::Kugou,
+            "http://127.0.0.1:9",
+            None,
+            None,
+        )
+        .expect("离线 node 客户端应当能建起来");
+        let cache = AudioCache::new(config.cache_dir.clone(), config.cache_limit_mib);
+        let downloader = Downloader::new(None).expect("离线下载器应当能建起来");
+
+        Self {
+            state: AppState::new(config),
+            bus,
+            receiver,
+            api,
+            audio: AudioHandle::detached(),
+            cache,
+            downloader,
+            runtime,
+            last_frame_at: Instant::now(),
+            last_session_save: Instant::now(),
+            last_mem_trace: Instant::now(),
+            pending_device_resume: None,
+            active_stream: None,
+            stream_retried: None,
+            pending_stream_retry: None,
+            #[cfg(unix)]
+            mpris: None,
+            #[cfg(unix)]
+            tray: None,
+            ws: None,
+        }
+    }
+}
+
 /// 启动终端输入线程。
 ///
 /// 线程阻塞在 `event::read()` 上，退出时不需要显式回收——`main` 返回会让整个
