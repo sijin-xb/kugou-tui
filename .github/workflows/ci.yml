@@ -79,6 +79,13 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+      # 关掉默认 feature 的那套组合也编一遍。它换掉整个 bootstrap 模块
+      # （走 `src/bootstrap_disabled.rs` 的替身），是最容易在后续改动里
+      # 悄悄编不过的组合——而它恰恰是「不想让二进制带 Node 引导」的人用的。
+      # 与 fmt 同理：feature 组合与平台无关，只在 Linux 这一栏查。
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo test --no-default-features
+
   windows:
     name: Windows
     runs-on: windows-latest
