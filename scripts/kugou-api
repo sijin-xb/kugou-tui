@@ -120,6 +120,7 @@ CFG_KUGOU_API_LOG_DIR=""
 CFG_KUGOU_API_HOST=""
 CFG_KUGOU_STANDARD_PORT=""
 CFG_KUGOU_LITE_PORT=""
+CFG_NETEASE_PORT=""
 CFG_KUGOU_API_BIN=""
 CFG_KUGOU_API_SKIP_BUILD=""
 
@@ -139,12 +140,16 @@ load_config() {
     value="${value%\"}"
     value="${value#\'}"
     value="${value%\'}"
+    # CFG_* 只被 `pick` 以间接展开 `${!cfg_name}` 读取，shellcheck 静态分析看不到，
+    # 会对下面每个赋值误报 SC2034，这里显式豁免（整段 case 一起）。
+    # shellcheck disable=SC2034
     case "$key" in
       KUGOU_API_DIR) CFG_KUGOU_API_DIR="$value" ;;
       KUGOU_API_LOG_DIR) CFG_KUGOU_API_LOG_DIR="$value" ;;
       KUGOU_API_HOST) CFG_KUGOU_API_HOST="$value" ;;
       KUGOU_STANDARD_PORT) CFG_KUGOU_STANDARD_PORT="$value" ;;
       KUGOU_LITE_PORT) CFG_KUGOU_LITE_PORT="$value" ;;
+      NETEASE_PORT) CFG_NETEASE_PORT="$value" ;;
       KUGOU_API_BIN) CFG_KUGOU_API_BIN="$value" ;;
       KUGOU_API_SKIP_BUILD) CFG_KUGOU_API_SKIP_BUILD="$value" ;;
       *)

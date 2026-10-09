@@ -83,7 +83,7 @@ $homeDir = Resolve-BaseDir $env:USERPROFILE 'UserProfile'
 # ==================================================================
 $knownKeys = @(
     'KUGOU_API_DIR', 'KUGOU_API_LOG_DIR', 'KUGOU_API_HOST',
-    'KUGOU_STANDARD_PORT', 'KUGOU_LITE_PORT'
+    'KUGOU_STANDARD_PORT', 'KUGOU_LITE_PORT', 'NETEASE_PORT'
 )
 
 $config = @{}
