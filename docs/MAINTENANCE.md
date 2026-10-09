@@ -602,6 +602,17 @@ let position_ms = self.last_position_ms;   // 上一帧还在播时的值
      `update_from_wakes_only_when_the_snapshot_changes`、
      `update_track_skips_metadata_rebuild_for_the_same_track`。
 
+改 `app/playback.rs` 的取流失败路径之前，这条也要守住：
+
+14. **装载失败要收掉「缓冲中」态。** `start_playback` 先 `mark_loading()` 把
+      `PlaybackState` 设成 `Loading`，但引擎在「没装载任何东西」时不会去改它
+      （`sync()` 见 `!loaded` 直接返回）。取流失败（`request_stream` 连不上目标音源，
+      或异步 `song_stream_url` 失败经 `Loaded::Failed`）如果不管，状态就永远停在
+      `Loading`——而 `toggle_playback` 恰恰忽略 `Loading`，用户按 Space 毫无反应，
+      看起来就是卡死。两条路都要收：同步错误走 `App::abort_loading`，异步失败在
+      `Loaded::Failed` 里当 `playback == Loading` 时 `audio.stop()`；只在 `Loading`
+      时动，免得误停正在播放的歌（封面/歌词之外的失败也走这条）。
+
 ---
 
 ## 5. 常见陷阱清单
