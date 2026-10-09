@@ -175,11 +175,13 @@ Linux 上跑到 `error: linker link.exe not found` 就说明 Rust 侧全部通�
 （依赖与自身都编完了，只差链接）。
 
 运行时的部分由 `.github/workflows/ci.yml` 兜住：**Linux / Windows / macOS 三栏**
-各跑一遍 `clippy -D warnings + test + build`，Windows 那栏再跑一次打包脚本，
-Linux 那栏把二进制传成 artifact（`kugou-tui-linux-x86_64`，留 14 天）。
-**别把它删了**——路径展开、配置目录、缓存文件命名这些差异只有真跑起来才露出来。
-macOS 那栏的意义也是这个：它和 Linux 共用 `cfg(unix)` 分支，但 `dirs` 给的是
-`~/Library/...`、音频走 CoreAudio、拿不到 `fc-list`，不跑就只是「理论可用」。
+各跑一遍 `clippy -D warnings + test`。**别把它删了**——路径展开、配置目录、缓存文件
+命名这些差异只有真跑起来才露出来。macOS 那栏的意义也是这个：它和 Linux 共用
+`cfg(unix)` 分支，但 `dirs` 给的是 `~/Library/...`、音频走 CoreAudio、拿不到
+`fc-list`，不跑就只是「理论可用」。
+
+这三栏**只做验证**：不跑 `cargo build --release`、不打发行包、不传 artifact。三平台
+发行资产由 `release.yml` 在推 tag 时产出，理由见 `ci.yml` 文件头的注释。
 
 ### 1.7 启动器脚本：跨平台约定
 

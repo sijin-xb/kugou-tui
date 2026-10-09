@@ -13,8 +13,8 @@
 # 已经发过的版本的资产，都得先把 Rust 工具链和一整棵依赖树重建一遍。
 #
 # 现在三平台统一由 CI 出包：推 tag 就有，产物不依赖任何一台具体的机器。
-# 本地 `scripts/release` 仍然照常上传它的那份——两边同名，靠 `upload-release-asset`
-# 的 `--clobber` 覆盖，谁后到谁生效，不会报错。
+# 本地 `scripts/release` 仍然照常上传它的那份——两边同名，靠 `--clobber` 覆盖，
+# 谁后到谁生效，不会报错。
 #
 # > **注意**：CI 的产物与本地产物的 sha256 **不一定相同**（rustc 小版本、目标
 # > 机器上的 C 工具链都会影响 aws-lc-sys 的编译结果）。如果本地发版时核对过哈希，
@@ -22,16 +22,28 @@
 # > 想让哈希只有一个来源，就把 `scripts/release` 里的 Linux 打包与上传去掉，
 # > 完全交给这里——那属于发版流程的改动，单独做。
 #
+# # 四个 job 的分工
+#
+# * `linux` / `windows` / `macos`：**只构建、只打包**，各自把发行包传成 artifact。
+#   它们**不碰 Release**，因此不需要写权限。
+# * `publish`：等三个平台都绿了，把三份 artifact 取回来，核对之后**一次性**建
+#   Release 并挂上全部资产。写权限只给这一个 job。
+#
+# 这样 Release **只在三平台全部构建成功之后**才出现。早先是 `prepare` 先建 Release、
+# 三个平台再各自往上补资产：发布页会有几分钟「Release 在、资产还没到」的空窗，
+# 而构建一旦失败，Release 已经发出去了，资产永远补不齐。
+#
 # # 触发
 #
 # * 推 `v*` tag —— 发版流程的正常路径；
 # * `workflow_dispatch` 手动指定 tag —— 给**已经发过**的版本补资产用
-#   （比如 0.4.2 发布时这个工作流还不存在）。
+#   （比如 0.4.2 发布时这个工作流还不存在）；
+# * `workflow_dispatch` + `dry_run` —— 把整条流水线（三平台构建、打包、artifact
+#   上传与取回、资产清单核对）完整跑一遍，但**不建 Release、不挂资产**。用来验证
+#   这个工作流本身改得对不对。它 checkout 的是 `main`，所以 `tag` 要给一个与 main
+#   当前版本号一致的（例如 `v0.6.0`），版本核对才过得去：
 #
-# # 时序
-#
-# 本地 `scripts/release` 的顺序是「推 tag → 建 Release」，而 tag 一推这个工作流
-# 就起来了——所以上传前必须**等 Release 出现**，不能直接 upload。见下面的重试。
+#       gh workflow run release.yml --ref <分支> -f tag=v0.6.0 -f dry_run=true
 
 name: Release assets
 
@@ -44,63 +56,34 @@ on:
         description: '要补资产的 tag（例如 v0.4.2）'
         required: true
         type: string
+      dry_run:
+        description: '只构建与核对，不创建 Release、不挂资产'
+        required: false
+        default: false
+        type: boolean
 
-# `gh release upload` 要写权限。默认的 GITHUB_TOKEN 是只读的。
+# 三个构建 job 只需要读。写权限只给 `publish`（见那个 job 自己的 `permissions`）。
 permissions:
-  contents: write
+  contents: read
 
 env:
   # 要发的 tag：tag 推送时用 `github.ref_name`，手动补资产时用它给的输入。
   TAG: ${{ inputs.tag || github.ref_name }}
-  # checkout 用哪个 ref。**故意不用 `inputs.tag || 'main'` 写进 `with.ref`**：
-  # `workflow_dispatch` 的输入在 job 的 `with:` 阶段还没展开成值，表达式会被当成
-  # 字面量字符串传下去——checkout 收到 `ref: v0.4.6` 就直接 checkout 了那个 tag，
-  # 补资产路径又回到「用当时那份代码编译」的老问题上。改用下面的
-  # "选择 checkout 的 ref" 步骤显式分支，那里表达式的上下文与普通 shell 里一致。
+  # dry-run 标志。用字符串而不是布尔：在步骤的 `if:` 里比较字符串最稳。
+  DRY_RUN: ${{ inputs.dry_run && '1' || '0' }}
+  # `publish` 要 checkout 的 ref。
+  #
+  # **故意不写成 `inputs.tag || 'main'` 直接放进 `with.ref`**：`workflow_dispatch`
+  # 的输入在那里的求值时机与普通步骤不同，写错就会 checkout 成那个 tag，于是
+  # 「补资产」变成「用当时那份代码跑脚本」。显式在 env 里分支，语义只有一处。
+  #
+  # 补资产时走 `main`：`scripts/release-notes` 只在 main 上更新，老 tag 里的那份
+  # 可能还不认识要补的版本号。
   CHECKOUT_REF: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.ref_name }}
 
 jobs:
-  # 先建 Release，再让三个平台往里挂资产。
-  #
-  # # 为什么需要它
-  #
-  # 早先 Release 由本地 `scripts/release` 建（它的顺序是「推 tag → 建 Release」），
-  # 这个工作流只负责**等**它出现。那样「只推 tag 就发版」是不成立的：tag 一推 CI
-  # 就起来了，等满 5 分钟也没有 Release，三个 job 会一起失败。
-  #
-  # 现在改成 CI 自己建，于是**推 tag 就够了**，不需要本地跑任何东西。
-  # 本地 `scripts/release` 仍然可用：它先建，这里再建会发现已存在而跳过——
-  # 两条路互不干扰，谁先到谁负责创建。
-  prepare:
-    name: 建 Release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # 手动补资产时也要用 main：`scripts/release-notes` 只在 main 上更新，
-          # 老 tag 里的那份可能还不认识要补的版本号。
-          ref: ${{ env.CHECKOUT_REF }}
-
-      - name: 建 Release（已存在则跳过）
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          tag="$TAG"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag 已存在，跳过创建。"
-            exit 0
-          fi
-          # 正文取 CHANGELOG 里这一节的正文——与本地发版同一份来源，
-          # 共用 `scripts/release-notes`，两边不会漂移。
-          # 取不到就让它失败：发行说明是发布页的门面，空着比没有更糟。
-          notes=$(./scripts/release-notes "$tag")
-          gh release create "$tag" --title "$tag" --notes "$notes"
-          echo "已创建 Release $tag"
-
   linux:
     name: Linux 包
-    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -140,14 +123,18 @@ jobs:
       - name: 打包
         run: ./scripts/make-release-tarball
 
-      - name: 挂到 Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./scripts/upload-release-asset "$TAG" 'dist/*.tar.gz'
+      # `if-no-files-found: error` 是刻意的：默认的 `warn` 会让「一个文件都没匹配到」
+      # 也一路绿到底，最后 Release 上什么都没有。publish 里还有第二道核对。
+      - name: 传成 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
 
   windows:
     name: Windows 包
-    needs: prepare
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -176,17 +163,16 @@ jobs:
         shell: pwsh
         run: ./scripts/build-windows.ps1 -SkipBuild
 
-      # 用 bash 而不是 pwsh：两个平台共用同一个上传脚本，逻辑只有一份
-      # （Windows runner 上的 `shell: bash` 就是 Git Bash）。
-      - name: 挂到 Release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: ./scripts/upload-release-asset "$TAG" 'dist/*.zip'
+      - name: 传成 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
 
   macos:
     name: macOS 包
-    needs: prepare
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -216,7 +202,95 @@ jobs:
       - name: 打包
         run: ./scripts/make-release-tarball
 
-      - name: 挂到 Release
+      - name: 传成 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-aarch64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # 三平台全绿之后才建 Release。写权限只在这一步。
+  publish:
+    name: 建 Release 并挂资产
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      # 建 Release 与传资产要写。
+      contents: write
+      # 取回本 run 的 artifact。`download-artifact` 在同一个 run 里走的是运行时
+      # 令牌，通常不需要这条；写出来是因为工作流级的 `contents: read` 被这里整个
+      # 覆盖掉了，把默认权限集里本来就有的一项显式补回去，免得依赖实现细节。
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 见文件开头 `CHECKOUT_REF` 的说明。
+          ref: ${{ env.CHECKOUT_REF }}
+
+      - name: 取回三个平台的发行包
+        uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          path: dist
+          merge-multiple: true
+
+      # 先核对数量再动手。三个构建 job 都设了 `if-no-files-found: error`，但
+      # 「artifact 名撞了」或「某个 job 被跳过」这类问题只会在合并之后显形。
+      - name: 核对资产清单
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tarballs=( dist/*.tar.gz )
+          zips=( dist/*.zip )
+          shopt -u nullglob
+          echo "取回 $(( ${#tarballs[@]} + ${#zips[@]} )) 个发行包："
+          ls -l dist
+          sha256sum dist/*
+          [ "${#tarballs[@]}" -eq 2 ] ||
+            { echo "期望 2 个 tarball（Linux + macOS），实际 ${#tarballs[@]} 个" >&2; exit 1; }
+          [ "${#zips[@]}" -eq 1 ] ||
+            { echo "期望 1 个 zip（Windows），实际 ${#zips[@]} 个" >&2; exit 1; }
+
+      # 幂等：本地 `scripts/release` 可能已经建过 Release 并传了它那份 Linux 包。
+      # 已存在就跳过创建，随后上传时 `--clobber` 会覆盖同名资产。
+      - name: 建 Release（已存在则跳过）
+        if: env.DRY_RUN != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="$TAG"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag 已存在，跳过创建。"
+            exit 0
+          fi
+          # 正文取 CHANGELOG 里这一节的正文——与本地发版同一份来源，
+          # 共用 `scripts/release-notes`，两边不会漂移。
+          # 取不到就让它失败：发行说明是发布页的门面，空着比没有更糟。
+          notes=$(./scripts/release-notes "$tag")
+          gh release create "$tag" --title "$tag" --notes "$notes"
+          echo "已创建 Release $tag"
+
+      # 复用那个脚本而不是在这里写 `gh release upload`：它带 glob 展开与
+      # 「一个都没匹配到就报错」的守卫，逻辑只有一份。
+      #
+      # 分两次调用而不是把两个 glob 拼进一个参数：那个脚本按「模式里不会有空格」
+      # 来展开参数，拼进去会依赖分词，是它注释里明确排除掉的前提。
+      - name: 挂资产（tar.gz）
+        if: env.DRY_RUN != '1'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: ./scripts/upload-release-asset "$TAG" 'dist/*.tar.gz'
+
+      - name: 挂资产（zip）
+        if: env.DRY_RUN != '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: ./scripts/upload-release-asset "$TAG" 'dist/*.zip'
+
+      - name: dry-run：到此为止
+        if: env.DRY_RUN == '1'
+        run: |
+          echo "dry-run：三个平台都构建、打包、传取 artifact 成功，资产清单已核对。"
+          echo "按 dry_run=true 跳过建 Release 与挂资产，远端什么都没写。"

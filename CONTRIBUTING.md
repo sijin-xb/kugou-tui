@@ -37,11 +37,14 @@ cargo test
 ```
 
 **clippy 是 `-D warnings` 的**，任何告警都会让构建失败。CI（`.github/workflows/ci.yml`）在
-Linux / Windows / macOS 三个平台各跑一遍 clippy + test + build（`cargo fmt --check` 只在
-Linux 那一栏，格式化与平台无关）。Windows 与 macOS 两栏不是摆设：路径展开、配置目录、缓存
-文件命名、音频后端这些差异只有真跑起来才露出来，而开发机通常是 Linux。Linux 那一栏还会把
-二进制传成 artifact（`kugou-tui-linux-x86_64`，保留 14 天）——想拿一份能跑的二进制不必等
-发版，也不必在本机重编（`lto = "fat"` + `codegen-units = 1` 要跑好几分钟）。
+Linux / Windows / macOS 三个平台各跑一遍 clippy + test（`cargo fmt --check` 与关掉默认
+feature 的那套组合只在 Linux 那一栏，两者都与平台无关）。Windows 与 macOS 两栏不是摆设：
+路径展开、配置目录、缓存文件命名、音频后端这些差异只有真跑起来才露出来，而开发机通常是
+Linux。
+
+**CI 只做验证，不产出任何二进制**——三栏都不跑 `cargo build --release`、不打发行包、
+不传 artifact。想拿一份能跑的二进制有两条路：Releases 页（由 `release.yml` 在推 tag 时
+产出），或本机 `cargo build --release`。理由写在 `ci.yml` 的文件头。
 
 改到平台相关代码时，另外确认 Windows 目标能编：
 

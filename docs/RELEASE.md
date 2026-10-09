@@ -77,41 +77,67 @@ macOS 的二进制要 Apple SDK。
 > 机器上跑不了。要补的话得在同一个 runner 上 `--target x86_64-apple-darwin` 交叉编一份
 > ——那是另一个包名（`x86_64-apple-darwin`），加一个 job 即可，目前没做。
 
-### 打包脚本在普通 CI 里也跑一遍
+### 打包脚本在推 tag 之前就能验证
 
 `release.yml` 是 tag 推出去之后才跑的，而 **tag 不可撤销**——打包脚本要是漏了文件，
 那时只能发一个坏包或者认了。这个项目真踩过：0.3.7 那版发行包里漏了三个脚本，
 非 Arch 用户解压后配不起接口服务。
 
-所以 `ci.yml` 里 Linux 与 macOS 两栏**也各跑一次 `make-release-tarball`** 并把
-`dist/*.tar.gz` 传成 artifact：任何一次 push 都能提前发现打包脚本的问题，
-顺带让「任意一次 push 都有可下载的发行版」。macOS 那一栏尤其不能省——
-脚本里为 BSD 工具（`readlink`、`shasum`）写的分支只有在那边才会被执行到。
-Windows 那一栏本来就在跑 `build-windows.ps1`，三平台因此对称。
+所以打包脚本在推 tag 之前有两个验证点，**都在 `release.yml` 之外**：
 
-时序上有个坑：本地 `scripts/release` 的顺序是「推 tag → 建 Release」，而 tag 一推 CI 就
-起来了——**上传前必须等 Release 出现**。这件事连同幂等（`--clobber`）都收在
-`scripts/upload-release-asset` 里，三个平台共用同一个脚本（Windows runner 上的
-`shell: bash` 就是 Git Bash）。三个 job 都会先核对二进制的 `--version` 与 tag 一致，
-checkout 错 ref 时能拦住。
+1. `scripts/release` 的**阶段一**——它本来就会在本机跑完 `make-release-tarball`、
+   逐项核对内容清单，然后停下来等确认。推 tag 之前一样看得见打包结果；
+2. `release.yml` 自己的 **dry-run**（见下）——把三个平台的构建、打包、artifact
+   传递完整跑一遍，只是不建 Release、不挂资产。平台特有的分支（macOS 上的 BSD
+   工具、Windows 上的 PowerShell 打包脚本）只有真跑才验证得到。
 
-### 只推 tag 就能发版
+> `ci.yml` **不做这些**：三栏只跑 `clippy + test`，不构建 release、不打发行包、
+> 不传 artifact。这是有意的——release 构建带 `lto = "fat"` 与 `codegen-units = 1`，
+> 每次推送为三个平台各跑一遍要好几倍时间，而产物没人用（要下载二进制的人应该去
+> Releases 页）。理由写在 `ci.yml` 文件头。
 
-**Release 本身现在也是 CI 建的。** `release.yml` 的第一个 job `prepare` 会调用
-`scripts/release-notes` 从 `CHANGELOG.md` 取出该版本的正文，建好 Release；三个平台
-job 都 `needs: prepare`，于是**推一个 tag 就够了**，不需要在本地跑任何东西：
+### dry-run：不推 tag 也能把流水线跑完
+
+改 `release.yml` 本身没法靠「推一个 tag 试试」来验证——tag 不可撤销。所以
+`workflow_dispatch` 多了一个 `dry_run` 输入：整条流水线照跑（三平台构建、打包、
+传 artifact、取回、核对资产清单），**只跳过最后建 Release 与挂资产那两步**，
+远端一个字节都不写。
+
+它 checkout 的是 `main`，而版本核对会拿 `TAG` 去比二进制的 `--version`，所以给的
+tag 要与 `main` 当前的版本号一致：
 
 ```bash
-git tag -a v0.5.0 -m "…" && git push origin v0.5.0
+gh workflow run release.yml --ref <分支> -f tag=v0.6.0 -f dry_run=true
 ```
 
-> 早先 `prepare` 不存在，Release 由本地 `scripts/release` 创建，工作流只负责**等**
-> 它出现。那样「只推 tag」是不成立的：等满 5 分钟也没有 Release，三个 job 会一起失败。
-> 这个 job 就是为补上这一点而加的。
+### 补资产（`workflow_dispatch`）
+
+给**已经发过**的版本补资产，手动指定 tag 即可，例如 0.4.2 发布时这个工作流还不存在：
+
+```bash
+gh workflow run release.yml -f tag=v0.4.2
+```
+
+补资产路径 checkout 的是 `main`（`scripts/release-notes` 只在 main 上更新，老 tag 里
+的那份可能还不认识要补的版本号）。`publish` 会先看 Release 在不在：在就跳过创建、
+直接传资产（`--clobber` 覆盖同名），不在就建。
+
+### 时序：Release 只出现在三平台全绿之后
+
+三个构建 job（`linux` / `windows` / `macos`）**只构建、只打包**，各自把发行包传成
+artifact，都不碰 Release。第四个 job `publish` `needs` 这三个，把 artifact 取回来、
+核对清单（2 个 tarball + 1 个 zip），然后**一次性**建 Release 并挂上全部资产。
+工作流级权限是 `contents: read`，写权限只给 `publish`。
+
+于是发布页不会出现「Release 在、资产还没到」的空窗；构建失败时 Release 根本不会建。
+
+> 早先是反过来的：第一个 job `prepare` 先建 Release，三个平台再各自往上补资产。
+> 那样一旦某个平台构建失败，Release 已经发出去了，资产永远补不齐。
 
 本地 `scripts/release` 仍然可用，它做的事更多（校验 CHANGELOG 有对应版本节、更新并
-推送 AUR、把资产下载回来核对）。它先建 Release，`prepare` 再建会发现已存在而跳过——
-两条路互不干扰，谁先到谁负责创建。
+推送 AUR、把资产下载回来核对）。它的顺序是「推 tag → 建 Release → 传资产」，与
+`publish` 会撞上：两边都是幂等的，`publish` 见 Release 已存在就跳过创建、
+`upload-release-asset` 用 `--clobber` 覆盖——**谁先到谁负责创建，不会互相报错**。
 
 > **只推 tag 的代价**：AUR 的 `PKGBUILD` / `.SRCINFO` 不会更新，`CHANGELOG.md` 也不会
 > 被校验。要同时发 AUR 就得跑 `scripts/release`，或者事后手动更新 `~/aur/kugou-tui`。
@@ -143,7 +169,8 @@ AUR 上**还没有 `kugou-tui` 这个包**（`aur.archlinux.org/packages/kugou-t
 gh workflow run release.yml -f tag=v0.4.2
 ```
 
-> 手动触发时若 Release 已存在，`prepare` 会跳过创建，三个平台照常往上补资产。
+> 手动触发时若 Release 已存在，`publish` 会跳过创建，直接往上补资产。详见上面的
+> 「补资产（`workflow_dispatch`）」一节。
 
 zip 里同时带着三个 **bash** 脚本（Git Bash / WSL 下仍然用得着），macOS 的 tarball
 同理——包里带的是「另一套平台下也用得上的东西」，而不是「本平台的原生脚本」，
