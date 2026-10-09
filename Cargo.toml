@@ -24,6 +24,16 @@ categories = ["command-line-utilities", "multimedia"]
 name = "kugou-tui"
 path = "src/main.rs"
 
+[features]
+# 默认带上 Node 接口服务的引导能力（探测 3000/3001、下载 KuGouMusicApi、
+# npm install、spawn `node app.js`）。**默认值与历史行为完全一致**。
+#
+# `--no-default-features` 能编出一个彻底不含这段代码的二进制：没有下载器、没有
+# `npm` 调用、没有 `Command::new("node")`。想验证「这个二进制永远不可能拉起
+# Node」时可以这么编（见 README「构建」一节）。
+default = ["node-bootstrap"]
+node-bootstrap = []
+
 # 随包内置的汽水 SDK（见 crates/libresoda/Cargo.toml 顶部的说明）。
 [workspace]
 members = ["crates/libresoda"]

@@ -893,9 +893,13 @@ mod tests {
         ] {
             assert!(!kind.is_remote(), "{kind:?} 是本机服务，不该标成 remote");
         }
-        // manages_service 为假时 bootstrap 才会跳过（见 bootstrap.rs）
+        // manages_service 为假时 bootstrap 才会跳过（见 bootstrap.rs）。
+        // 关掉 `node-bootstrap` 时引导能力整个不在，任何音源都为假。
         assert!(!crate::bootstrap::manages_service(SourceKind::Sodam));
-        assert!(crate::bootstrap::manages_service(SourceKind::Kugou));
+        assert_eq!(
+            crate::bootstrap::manages_service(SourceKind::Kugou),
+            cfg!(feature = "node-bootstrap")
+        );
     }
 
     /// 汽水的凭据与 dfid 不能和酷狗串台。

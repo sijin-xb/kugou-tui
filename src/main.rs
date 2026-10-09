@@ -46,6 +46,12 @@
 mod api;
 mod app;
 mod audio;
+// 关掉 `node-bootstrap` 时换成同名函数的替身，调用点（`main.rs`、`app/cloud.rs`）
+// 因此不需要各自再包一层 `#[cfg]`——少一处 cfg 就少一处两边行为漂移的机会。
+#[cfg(feature = "node-bootstrap")]
+mod bootstrap;
+#[cfg(not(feature = "node-bootstrap"))]
+#[path = "bootstrap_disabled.rs"]
 mod bootstrap;
 mod cli;
 mod config;
