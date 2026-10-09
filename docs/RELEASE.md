@@ -34,7 +34,7 @@
 
 | 内容 | 为什么必须有 |
 |---|---|
-| `kugou-tui`（二进制，约 7.0 MiB，已 strip） | 主程序 |
+| `kugou-tui`（二进制，约 11.7 MiB，已 strip） | 主程序 |
 | `scripts/kugou-api` | 启停接口服务 |
 | `scripts/kugou-api-install` | **拉取并配置服务**——少了它，用户配不起服务，流程直接断 |
 | `scripts/kugou-tui` | 启动器（按需拉起服务） |

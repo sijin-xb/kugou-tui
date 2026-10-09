@@ -14,7 +14,7 @@ edition = "2024"
 # 也别为了压低它去退依赖：ratatui-image 8.x 只认 ratatui 0.29，会和这里的 0.30
 # 编出两份 ratatui（不兼容，渲染不进同一个 Frame）。
 rust-version = "1.90"
-description = "轻量级酷狗音乐命令行 TUI 播放器（首次运行自动准备接口服务，需 Node.js）"
+description = "轻量级酷狗音乐命令行 TUI 播放器（接口内嵌，无需 Node.js；保留 Node 服务回退）"
 license = "MIT"
 repository = "https://github.com/sijin-xb/kugou-tui"
 keywords = ["tui", "music", "kugou", "player", "cli"]
