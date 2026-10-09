@@ -613,6 +613,32 @@ let position_ms = self.last_position_ms;   // 上一帧还在播时的值
       `Loaded::Failed` 里当 `playback == Loading` 时 `audio.stop()`；只在 `Loading`
       时动，免得误停正在播放的歌（封面/歌词之外的失败也走这条）。
 
+改 `app/playback.rs` 的取流失败跳歌、或 `app/cloud.rs` 的云歌单写入之前，这两条也要守住：
+
+15. **源级取流失败才自动跳歌，单曲级失败不跳。** 取流地址解析失败分两类：源级
+    （连不上、未登录、本地服务未启动——`is_connectivity` / `is_auth_related` /
+    `Service` / `NonJsonBody`）与单曲级（版权受限、VIP 试听无权限等）。只有源级才走
+    `Loaded::StreamFailed` → `App::handle_stream_failed` → 自动跳到队列里下一首可播放的歌；
+    单曲级仍只报错、`abort_loading`。规则都在纯函数 `auto_skip_next` 里：单曲循环
+    （`RepeatOne`）不跳；同一轮里已确认失败的源直接跳过，不再对它的后续歌重发必然失败的
+    请求；一次连续跳过最多 `min(队列长度, MAX_AUTO_SKIP = 5)` 次；只往后找、不绕回；全部
+    失败停在 `Stopped` 并给一条汇总提示。**任何用户手动操作（切歌、暂停、播放新歌）都会
+    `reset_auto_skip()` 清零计数**——`play_from` / `play_from_queue` / `toggle_playback` /
+    `next_track` / `previous_track` / `stop_playback` 入口都调了它。播放取链失败单独用
+    `Loaded::StreamFailed`（不是 `Loaded::Failed`），因为预取取链失败的文案与播放完全一样，
+    靠文案分不开。守护测试：`auto_skip_*`（纯函数）与 `stream_failure_*` /
+    `single_song_failure_does_not_skip` / `manual_track_change_clears_the_auto_skip_state`。
+
+16. **云歌单的增删/同步只接受与歌单同源的歌。** 歌单接口按「歌单所属源」
+    （`active_source_kind()`）选客户端；把另一个源的歌喂过去，酷狗侧按 fileid、网易云侧按
+    hash 都会定位到不存在（甚至别人的）条目，把歌单写坏。所以
+    `remove_focused_song_from_cloud` / `add_focused_song_to_cloud` / `sync_queue_to_cloud`
+    都先过 `playlist_accepts_song`（`song.source == 歌单所属源`）：跨源直接拒绝并提示、不发
+    任何请求；批量用 `partition_by_playlist_source` 逐首分拣，只发同源的、提示里写明跳过
+    数量。**不做源间转换**（把酷狗的歌在网易云里找同名歌）——那是另一个功能。守护测试：
+    `playlist_guard_*` / `partition_*` / `adding_a_cross_source_song_is_refused_before_any_request` /
+    `syncing_a_mixed_queue_only_sends_matching_songs`。
+
 ---
 
 ## 5. 常见陷阱清单
