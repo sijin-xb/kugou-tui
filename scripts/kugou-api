@@ -277,12 +277,17 @@ pid_of() {
   local pid _port
   [ -s "$1" ] || return 0
   read -r pid _port <"$1" 2>/dev/null || true
+  # PowerShell 5.1 的 Set-Content 写 PID 文件会带 UTF-8 BOM。BOM 只出现在文件开头，
+  # 于是黏在第一个字段上，`kill -0 $pid` 拿到一个非法 PID，status/stop 全部失灵。
+  pid="${pid#$'\xef\xbb\xbf'}"
   printf '%s' "${pid:-}"
 }
 port_of() {
   local _pid port
   [ -s "$1" ] || return 0
   read -r _pid port <"$1" 2>/dev/null || true
+  # 端口是第二个字段，BOM 黏不到它；同样清一遍只是让两处口径一致。
+  port="${port#$'\xef\xbb\xbf'}"
   printf '%s' "${port:-}"
 }
 
