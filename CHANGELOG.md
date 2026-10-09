@@ -4,6 +4,58 @@
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.0] - 2026-10-09
+
+### 新增
+
+- **内嵌的纯 Rust 接口层**。此前搜索、取流、歌词、登录这些接口都由一个本机的
+  Node.js 服务（KuGouMusicApi）提供，本程序只负责把它拉起来；现在客户端实际调用
+  的 26 条路由都在进程内实现，**不再需要 Node.js**。签名、设备指纹、KRC 解密这类
+  「算错也不报错」的部分照上游逐函数移植，每个函数在注释里标明来源文件与函数名，
+  并用同一组固定输入与上游 JS 逐字节对拍（KAT）。
+
+  这解决的是安装门槛：`cargo install` 只放一个二进制到 `~/.cargo/bin`，此前用户
+  还得自己准备 Node 运行时，否则「装完了却不能用」。
+
+- **内嵌 WebSocket 服务**。推送 `lyrics`（当前歌词与播放位置）与 `playerState`
+  （播放状态），接收 `control` 命令（`toggle` / `next` / `prev`）。默认开启，只监听
+  `127.0.0.1:6520`——**不接受非本机连接**，并校验 `Origin`、限制单条消息大小。
+  `--no-ws` 关闭，`--ws-port` 改端口。
+
+- **`node-bootstrap` feature**（默认开启）。关掉后引导代码（探测端口、下载
+  KuGouMusicApi、`npm install`、spawn `node app.js`）整段不参与编译，
+  `cargo build --release --no-default-features` 编出的二进制里不存在这段代码，
+  体积小约 0.06 MiB。此时 `--api node` 会明确报错说构建时关掉了这个 feature，
+  而不是含糊地连不上。
+
+### 变更
+
+- **`--api` 默认值由 `node` 改为 `native`**。启动后不再拉起 Node 服务，`ps` 里也
+  不会多出一个 `node app.js` 进程。Node 后端**保留**为回退路径，`--api node` 可
+  切回（环境变量 `KUGOU_API_BACKEND`），用于对比排查。
+
+- **WebSocket 默认开启**。不配置任何东西就会在本机 `127.0.0.1:6520` 多出一个监听
+  端口。这是有意为之，但它确实是行为改变：不想要的话用 `--no-ws` 关掉。
+
+- **`--api-start` 在 native 下改为提示 + 退出码 0**。native 没有「常驻服务」这个
+  东西，此前它往 stdout 打印一句说明，而 stdout 上那句「接口服务已就绪：<地址>」是
+  给脚本抓地址用的——格式类似却没有地址，按地址解析的脚本会拿到垃圾。现在改走
+  stderr，退出码仍是 0（这不是错误，只是无事可做）。
+
+### 修复
+
+- **新建云端歌单不再恒报失败**。服务端把新歌单的 `listid` 放在 `data.info.listid`，
+  而解析只扫了 `data` 顶层，于是「歌单建出来了，程序却说没建出来」。native 与 Node
+  两条路径都有这个问题，一并修掉。
+
+- **日志里的凭据一律脱敏**。`token` / `userid` / `dfid` / `mid` 写进日志前替换成
+  `<redacted>`，覆盖三种此前会漏的形态：出站请求的完整 URL、`reqwest::Error` 的
+  Display（它会把 URL 拼进去）、以及非 JSON 响应体的前若干字符。
+
+- **移除主包未使用的 `ctr` 依赖**。唯一使用点是 `crates/libresoda` 的
+  `src/soda/crypto.rs`，而那个 crate 自己已经声明了 `ctr`——主包这一行是汽水实现
+  搬走时留下的。
+
 ## [0.5.0] - 2026-10-03
 
 ### 新增
