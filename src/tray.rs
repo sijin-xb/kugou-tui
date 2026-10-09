@@ -1505,4 +1505,96 @@ mod tests {
         assert_eq!(info.title, "新");
         assert_eq!(info.track_id, "h2");
     }
+
+    /// 私有总线下 mock 一个 `org.kde.StatusNotifierWatcher`，验证第 7 项的重连逻辑：
+    /// 宿主消失后 `is_connected()` 转 false 并记 WARN，宿主回来后重新注册。
+    ///
+    /// 默认忽略（需要私有会话总线）。运行：
+    /// `dbus-run-session -- cargo test --lib tray::tests::reconnects_after_the_watcher_disappears -- --ignored --nocapture`
+    #[ignore = "需要 dbus-run-session 私有会话总线"]
+    #[test]
+    fn reconnects_after_the_watcher_disappears() {
+        if !environment_supports_tray() {
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("建 runtime");
+        runtime.block_on(async {
+            let watcher = serve_mock_watcher().await;
+            let (bus, _receiver) = EventBus::new();
+            let Some(handle) = spawn(bus) else {
+                return;
+            };
+            assert!(
+                wait_for_connected(&handle, true, Duration::from_secs(10)).await,
+                "托盘应先注册成功"
+            );
+
+            // 宿主消失：连接一断，总线名就没了，下一次自愈周期（5s）会注册失败。
+            drop(watcher);
+            assert!(
+                wait_for_connected(&handle, false, Duration::from_secs(15)).await,
+                "宿主消失后 is_connected 应变 false"
+            );
+
+            // 宿主回来：下一次自愈周期应重新注册。
+            let _watcher = serve_mock_watcher().await;
+            assert!(
+                wait_for_connected(&handle, true, Duration::from_secs(15)).await,
+                "宿主回来后应重新注册"
+            );
+        });
+    }
+
+    /// mock 的 `org.kde.StatusNotifierWatcher`：只实现托盘用到的属性与方法。
+    struct MockWatcher {
+        items: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[interface(name = "org.kde.StatusNotifierWatcher")]
+    impl MockWatcher {
+        #[zbus(property)]
+        fn registered_status_notifier_items(&self) -> Vec<String> {
+            self.items.lock().expect("锁没中毒").clone()
+        }
+
+        fn register_status_notifier_item(&self, service: &str) {
+            let mut items = self.items.lock().expect("锁没中毒");
+            if !items.iter().any(|item| item == service) {
+                items.push(service.to_string());
+            }
+        }
+    }
+
+    /// 在会话总线上占住 watcher 名并挂上 mock 对象；返回的连接一 drop 名就释放。
+    async fn serve_mock_watcher() -> zbus::Connection {
+        ConnectionBuilder::session()
+            .expect("连会话总线")
+            .name(WATCHER_DEST)
+            .expect("占住 watcher 名")
+            .serve_at(
+                WATCHER_PATH,
+                MockWatcher {
+                    items: std::sync::Mutex::new(Vec::new()),
+                },
+            )
+            .expect("挂 watcher 对象")
+            .build()
+            .await
+            .expect("建 watcher 连接")
+    }
+
+    /// 等 `is_connected()` 变成 `want`；超时返回 false。
+    async fn wait_for_connected(handle: &TrayHandle, want: bool, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if handle.is_connected() == want {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
 }
