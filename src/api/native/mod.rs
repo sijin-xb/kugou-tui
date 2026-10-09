@@ -1425,7 +1425,7 @@ impl MusicApi for NativeApi {
         let root = self.transport.get_json_mutating(&endpoint, false).await?;
         crate::api::node::NodeApi::check_write_result("/playlist/add", &root)?;
 
-        Ok(pick_i64(data_of(&root), &["listid", "list_id", "id"]))
+        Ok(crate::api::cloud::created_listid(&root))
     }
 }
 

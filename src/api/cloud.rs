@@ -11,9 +11,9 @@
 
 use serde_json::Value;
 
-use crate::api::node::NodeApi;
 use crate::api::data_of;
 use crate::api::model::{Song, pick_i64, pick_string};
+use crate::api::node::NodeApi;
 use crate::error::{AppError, Result};
 
 /// 会员形态。
@@ -386,7 +386,12 @@ impl NodeApi {
         // 网易云走的是另一套接口（`/playlist/track/add` 的 `pid` + `ids`），
         // 与酷狗的「歌名|hash|专辑id」完全不通，必须按音源分派。
         if let crate::source::SourceKind::Netease = source {
-            return crate::source::netease::add_tracks_to_playlist(&crate::api::ApiClient::Node(self.clone()), list_id, songs).await;
+            return crate::source::netease::add_tracks_to_playlist(
+                &crate::api::ApiClient::Node(self.clone()),
+                list_id,
+                songs,
+            )
+            .await;
         }
 
         // 服务端按逗号分隔多首、按竖线分隔字段，单次提交太多会被截断
@@ -432,7 +437,12 @@ impl NodeApi {
         }
 
         if let crate::source::SourceKind::Netease = source {
-            return crate::source::netease::remove_tracks_from_playlist(&crate::api::ApiClient::Node(self.clone()), list_id, songs).await;
+            return crate::source::netease::remove_tracks_from_playlist(
+                &crate::api::ApiClient::Node(self.clone()),
+                list_id,
+                songs,
+            )
+            .await;
         }
 
         let file_ids: Vec<i64> = songs.iter().filter_map(|song| song.file_id).collect();
@@ -465,7 +475,11 @@ impl NodeApi {
         list_id: i64,
     ) -> Result<()> {
         if let crate::source::SourceKind::Netease = source {
-            return crate::source::netease::delete_playlist(&crate::api::ApiClient::Node(self.clone()), list_id).await;
+            return crate::source::netease::delete_playlist(
+                &crate::api::ApiClient::Node(self.clone()),
+                list_id,
+            )
+            .await;
         }
         self.get_json_uncached_mutating("/playlist/del", &[("listid", list_id.to_string())])
             .await?;
@@ -482,7 +496,11 @@ impl NodeApi {
         name: &str,
     ) -> Result<Option<i64>> {
         if let crate::source::SourceKind::Netease = source {
-            return crate::source::netease::create_playlist(&crate::api::ApiClient::Node(self.clone()), name).await;
+            return crate::source::netease::create_playlist(
+                &crate::api::ApiClient::Node(self.clone()),
+                name,
+            )
+            .await;
         }
         let root = self
             .get_json_uncached_mutating(
@@ -492,6 +510,19 @@ impl NodeApi {
             .await?;
         Ok(pick_i64(data_of(&root), &["listid", "list_id", "id"]))
     }
+}
+
+/// 从 `/playlist/add` 的响应里取新建歌单的 listid。
+///
+/// 服务端把结果埋在 `data.info` 下（`data` 顶层**没有** `listid`），只扫顶层会恒
+/// 返回 `None`：调用方只能显示「已新建」却拿不到 id，后续加歌也就没有目标。
+/// 真实响应形如 `{"data":{"info":{"listid":5,…},"list_count":5},"status":1,"error_code":0}`。
+pub(crate) fn created_listid(root: &Value) -> Option<i64> {
+    let data = data_of(root);
+    pick_i64(data, &["listid", "list_id", "id"]).or_else(|| {
+        data.get("info")
+            .and_then(|info| pick_i64(info, &["listid", "list_id", "id"]))
+    })
 }
 
 /// 拼 `/playlist/tracks/add` 的 `data` 参数：`歌名|hash|专辑id|album_audio_id`。
@@ -577,6 +608,29 @@ mod tests {
     fn write_result_tolerates_missing_error_code() {
         let root = json!({"data": {"status": 1}});
         NodeApi::check_write_result("/playlist/tracks/del", &root).expect("缺字段视为成功");
+    }
+
+    #[test]
+    fn created_listid_reads_the_nested_info_object() {
+        // 真实响应形状：listid 在 data.info 里，data 顶层没有。
+        let root = json!({
+            "data": {"info": {"listid": 5, "name": "x"}, "list_count": 5},
+            "status": 1,
+            "error_code": 0
+        });
+        assert_eq!(created_listid(&root), Some(5));
+    }
+
+    #[test]
+    fn created_listid_still_accepts_a_flat_data_object() {
+        let root = json!({"data": {"listid": 7}, "status": 1});
+        assert_eq!(created_listid(&root), Some(7));
+    }
+
+    #[test]
+    fn created_listid_is_none_when_the_server_omits_it() {
+        let root = json!({"data": {"info": {"name": "x"}}, "status": 1, "error_code": 0});
+        assert_eq!(created_listid(&root), None);
     }
 
     #[test]
