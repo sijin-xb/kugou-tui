@@ -968,6 +968,261 @@ mod tests {
         println!("登录弹窗渲染每帧：{per_frame:?}");
     }
 
+    // ---- 登录弹窗的尺寸回归（第 6 项把「装不装得下」改成同时看宽高，这里锁死行为） ----
+
+    /// 三种规模的二维码地址：小、中、大（大的比常见 80 列终端还宽，专门覆盖降级分支）。
+    fn login_urls() -> Vec<String> {
+        let mut large = String::from(
+            "https://bff-pc.qishui.com/ucenter_web/app/sdk-next?aid=386088&uc_sdk=scan-auth",
+        );
+        for index in 0..20 {
+            large.push_str(&format!("&p{index}=0123456789abcdef"));
+        }
+        vec![
+            "https://m.kugou.com/qr?key=abc123def456".to_string(),
+            "https://bff-pc.qishui.com/ucenter_web/app/sdk-next?aid=386088&token=0123456789abcdef0123456789abcdef&uc_sdk=scan-auth".to_string(),
+            large,
+        ]
+    }
+
+    fn login_state(content: &str, aspect: f32) -> LoginState {
+        LoginState {
+            qr: crate::ui::widgets::qr_lines(content, aspect).expect("二维码能编码"),
+            qr_content: content.to_string(),
+            key: "abcdef".to_string(),
+            message: "等待扫码…".to_string(),
+            finished: false,
+            succeeded: false,
+        }
+    }
+
+    /// 复刻 `render_login` 的几何，返回弹窗矩形与这一尺寸下实际会画出的二维码行。
+    ///
+    /// 故意把公式抄一遍：它一变、这里就得跟着变，正好逼着改动者回来核对
+    /// 「装得下 / 装不下」的边界；断言本身只看渲染结果，不看过程。
+    fn login_layout(area: Rect, login: &LoginState) -> (Rect, Vec<String>) {
+        let max_width = usize::from(area.width.saturating_sub(4));
+        let max_rows = usize::from(area.height.saturating_sub(7)).max(1);
+        let qr_lines =
+            crate::ui::widgets::qr_lines_fitted(&login.qr, max_width, max_rows).unwrap_or_default();
+        let qr_width = qr_lines
+            .first()
+            .map(|line| line.chars().count())
+            .unwrap_or(0) as u16;
+        let popup_width = (qr_width + 4).max(30);
+        let popup_height = (qr_lines.len() as u16 + 5).max(7).min(area.height);
+        let popup = crate::ui::widgets::centered_rect(area, popup_width, popup_height);
+        (popup, qr_lines)
+    }
+
+    fn is_qr_block(symbol: &str) -> bool {
+        matches!(symbol, "█" | "▀" | "▄")
+    }
+
+    fn render_login_buffer(
+        login: &LoginState,
+        aspect: f32,
+        theme: &Theme,
+        width: u16,
+        height: u16,
+    ) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("建测试终端");
+        terminal
+            .draw(|frame| {
+                render_login(
+                    frame,
+                    login,
+                    crate::source::SourceKind::Kugou,
+                    aspect,
+                    theme,
+                )
+            })
+            .expect("渲染登录弹窗");
+        terminal.backend().buffer().clone()
+    }
+
+    fn count_qr_blocks(buffer: &ratatui::buffer::Buffer) -> usize {
+        let area = buffer.area();
+        (area.y..area.y + area.height)
+            .flat_map(|y| (area.x..area.x + area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| is_qr_block(buffer[(x, y)].symbol()))
+            .count()
+    }
+
+    fn blocks_in(lines: &[String]) -> usize {
+        lines
+            .iter()
+            .map(|line| {
+                line.chars()
+                    .filter(|c| matches!(c, '█' | '▀' | '▄'))
+                    .count()
+            })
+            .sum()
+    }
+
+    /// 把整个缓冲区拼成一段文字，用于在提示文案里找关键词。
+    ///
+    /// 必须丢掉空白：宽字符（中文）占两格，后一格是 `Cell::EMPTY`（符号为空格），
+    /// 不丢的话「终端太小」会被拆成「终 端 太 小」而匹配不上。
+    fn compact_text(buffer: &ratatui::buffer::Buffer) -> String {
+        let area = buffer.area();
+        (area.y..area.y + area.height)
+            .flat_map(|y| (area.x..area.x + area.width).map(move |x| (x, y)))
+            .map(|(x, y)| buffer[(x, y)].symbol())
+            .filter(|symbol| !symbol.trim().is_empty())
+            .collect()
+    }
+
+    /// 三种规模的二维码确实依次变大，且「大」这一档比常见 80 列终端还宽，否则测不到降级分支。
+    #[test]
+    fn login_url_scales_span_small_to_bigger_than_a_common_terminal() {
+        let aspect = Config::default().qr_aspect;
+        let widths: Vec<usize> = login_urls()
+            .iter()
+            .map(|url| {
+                crate::ui::widgets::qr_needed_size(url, aspect)
+                    .expect("能编码")
+                    .0
+            })
+            .collect();
+        assert!(
+            widths[0] < widths[1] && widths[1] < widths[2],
+            "三档规模应依次变大：{widths:?}"
+        );
+        assert!(
+            widths[2] > 76,
+            "最大的二维码应比 80 列终端（可用 76 列）还宽：{widths:?}"
+        );
+    }
+
+    /// 任意终端尺寸、任意二维码规模下都不得 panic，也不得把二维码画到弹窗外。
+    #[test]
+    fn login_modal_never_panics_or_overflows() {
+        let theme = Theme::for_config(ThemeName::Default, false);
+        let aspect = Config::default().qr_aspect;
+        let widths = [
+            1u16, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30, 31, 32, 33, 34, 35, 36, 37, 40,
+            45, 50, 51, 52, 53, 54, 55, 56, 57, 60, 70, 80, 90, 100, 120,
+        ];
+        let heights = [
+            1u16, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+            40, 50, 60,
+        ];
+
+        for url in login_urls() {
+            let login = login_state(&url, aspect);
+            for &width in &widths {
+                for &height in &heights {
+                    let (popup, _qr_lines) = login_layout(Rect::new(0, 0, width, height), &login);
+                    let buffer = render_login_buffer(&login, aspect, &theme, width, height);
+                    for y in 0..height {
+                        for x in 0..width {
+                            if is_qr_block(buffer[(x, y)].symbol()) {
+                                assert!(
+                                    x >= popup.x
+                                        && x < popup.x + popup.width
+                                        && y >= popup.y
+                                        && y < popup.y + popup.height,
+                                    "{url} 在 {width}x{height} 把二维码画到了弹窗外 ({x},{y})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 装得下就必须完整画出；差一格就转降级提示，且降级提示本身不越界（无块字符）。
+    #[test]
+    fn login_qr_appears_exactly_when_it_fits() {
+        let theme = Theme::for_config(ThemeName::Default, false);
+        let aspect = Config::default().qr_aspect;
+
+        for url in login_urls() {
+            let login = login_state(&url, aspect);
+            let (needed_width, needed_rows) =
+                crate::ui::widgets::qr_needed_size(&url, aspect).expect("能算出所需尺寸");
+            // 临界尺寸：宽 = 二维码宽 + 4（弹窗左右各 2 列），高 = 行数 + 7（正文 5 行 + 上下边框）。
+            let fit_width = needed_width as u16 + 4;
+            let fit_height = needed_rows as u16 + 7;
+
+            let (_, qr_lines) = login_layout(Rect::new(0, 0, fit_width, fit_height), &login);
+            assert_eq!(qr_lines.len(), needed_rows, "{url}: 临界高度应判为装得下");
+            let full = render_login_buffer(&login, aspect, &theme, fit_width, fit_height);
+            assert_eq!(
+                count_qr_blocks(&full),
+                blocks_in(&qr_lines),
+                "{url} 在 {fit_width}x{fit_height} 没把二维码画全"
+            );
+
+            let narrow = render_login_buffer(&login, aspect, &theme, fit_width - 1, fit_height);
+            assert_eq!(
+                count_qr_blocks(&narrow),
+                0,
+                "{url} 宽度差一格时不该再画二维码"
+            );
+            assert!(
+                compact_text(&narrow).contains("终端太小"),
+                "{url} 宽度差一格时缺降级提示"
+            );
+
+            let short = render_login_buffer(&login, aspect, &theme, fit_width, fit_height - 1);
+            assert_eq!(
+                count_qr_blocks(&short),
+                0,
+                "{url} 高度差一格时不该再画二维码"
+            );
+            assert!(
+                compact_text(&short).contains("终端太小"),
+                "{url} 高度差一格时缺降级提示"
+            );
+        }
+    }
+
+    /// 同一个终端上「缩小 → 放大 → 再缩小」，每一步只由当前尺寸决定，不残留上一步状态。
+    #[test]
+    fn login_modal_leaves_no_state_across_resizes() {
+        let theme = Theme::for_config(ThemeName::Default, false);
+        let aspect = Config::default().qr_aspect;
+        let login = login_state(&login_urls()[1], aspect);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 60)).expect("建测试终端");
+        let draw = |terminal: &mut Terminal<TestBackend>| {
+            terminal
+                .draw(|frame| {
+                    render_login(
+                        frame,
+                        &login,
+                        crate::source::SourceKind::Kugou,
+                        aspect,
+                        &theme,
+                    )
+                })
+                .expect("渲染登录弹窗");
+        };
+
+        draw(&mut terminal);
+        let big_first = terminal.backend().buffer().clone();
+        assert!(count_qr_blocks(&big_first) > 0, "大终端下二维码没画出来");
+
+        terminal.backend_mut().resize(20, 8);
+        draw(&mut terminal);
+        assert_eq!(
+            count_qr_blocks(terminal.backend().buffer()),
+            0,
+            "缩小后仍残留二维码"
+        );
+
+        terminal.backend_mut().resize(120, 60);
+        draw(&mut terminal);
+        assert_eq!(
+            &big_first,
+            terminal.backend().buffer(),
+            "放大后结果与首次不一致（残留了上一步状态）"
+        );
+    }
+
     /// 侧边栏装不下时要「**能放几行放几行**」，并在末尾说明还有什么没显示。
     ///
     /// 早先是「一块放不下就整块丢掉」：108×30 的终端里第一块（当时的标题是
