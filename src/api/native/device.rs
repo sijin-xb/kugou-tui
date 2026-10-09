@@ -245,16 +245,10 @@ mod tests {
     #[test]
     fn get_guid_matches_upstream() {
         let mut a = sequence(&SEQ_A);
-        assert_eq!(
-            get_guid(&mut a),
-            "00001999-3333-4ccc-6666-80009999b333"
-        );
+        assert_eq!(get_guid(&mut a), "00001999-3333-4ccc-6666-80009999b333");
 
         let mut b = sequence(&SEQ_B);
-        assert_eq!(
-            get_guid(&mut b),
-            "00000000-8000-4000-c000-1f9afcd60000"
-        );
+        assert_eq!(get_guid(&mut b), "00000000-8000-4000-c000-1f9afcd60000");
     }
 
     #[test]
@@ -367,11 +361,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&path)
-                .expect("stat")
-                .permissions()
-                .mode()
-                & 0o777;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "设备标识文件权限应为 0600");
         }
 

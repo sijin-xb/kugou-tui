@@ -287,18 +287,7 @@ fn is_escaped_quote(bytes: &[u8], index: usize) -> bool {
 fn is_value_terminator(byte: u8) -> bool {
     matches!(
         byte,
-        b'&' | b' '
-            | b'\t'
-            | b'"'
-            | b'\''
-            | b')'
-            | b']'
-            | b'}'
-            | b','
-            | b';'
-            | b'\n'
-            | b'/'
-            | b'?'
+        b'&' | b' ' | b'\t' | b'"' | b'\'' | b')' | b']' | b'}' | b',' | b';' | b'\n' | b'/' | b'?'
     )
 }
 
@@ -548,7 +537,10 @@ mod tests {
     /// 空值也要遮成 `<redacted>`，不能因为「没值」就留下 `token=`。
     #[test]
     fn redacts_empty_values() {
-        assert_eq!(redact("token=&userid=5"), "token=<redacted>&userid=<redacted>");
+        assert_eq!(
+            redact("token=&userid=5"),
+            "token=<redacted>&userid=<redacted>"
+        );
     }
 
     /// 一次日志里同一个键出现多次（URL 一份、请求头一份）要全部遮掉。

@@ -38,9 +38,9 @@ pub mod sodam;
 use serde::{Deserialize, Serialize};
 
 use crate::api::ApiClient;
-use crate::api::traits::MusicApi;
 use crate::api::cloud::UserInfo;
 use crate::api::model::{Artist, Lyric, Playlist, RankBoard, Song};
+use crate::api::traits::MusicApi;
 use crate::error::Result;
 
 /// 音源种类。

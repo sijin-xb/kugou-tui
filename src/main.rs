@@ -173,7 +173,9 @@ fn main() -> anyhow::Result<()> {
         // 输出。stdout 上那句「接口服务已就绪：<地址>」是给脚本抓地址用的，
         // native 下不该往同一个流里塞一句格式类似但没有地址的话。退出码仍是 0
         // ——这不是错误，只是无事可做。
-        if config.api_backend.effective_for(config.active_source_kind())
+        if config
+            .api_backend
+            .effective_for(config.active_source_kind())
             == crate::api::ApiBackend::Native
         {
             eprintln!(

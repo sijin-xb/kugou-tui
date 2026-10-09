@@ -71,7 +71,8 @@ pub fn decode_bytes(bytes: &[u8]) -> Result<String> {
         .read_to_end(&mut plain)
         .map_err(|error| AppError::Other(format!("KRC zlib 解压失败：{error}")))?;
 
-    String::from_utf8(plain).map_err(|error| AppError::Other(format!("KRC 明文不是 UTF-8：{error}")))
+    String::from_utf8(plain)
+        .map_err(|error| AppError::Other(format!("KRC 明文不是 UTF-8：{error}")))
 }
 
 #[cfg(test)]
@@ -96,7 +97,9 @@ mod tests {
     fn xor_key_matches_upstream() {
         assert_eq!(
             XOR_KEY,
-            [64, 71, 97, 119, 94, 50, 116, 71, 81, 54, 49, 45, 206, 210, 110, 105]
+            [
+                64, 71, 97, 119, 94, 50, 116, 71, 81, 54, 49, 45, 206, 210, 110, 105
+            ]
         );
     }
 

@@ -69,9 +69,7 @@ fn modulus(kind: SourceKind) -> &'static BigUint {
         SourceKind::KugouConcept => (&LITE, LITE_MODULUS),
         _ => (&STANDARD, STANDARD_MODULUS),
     };
-    cell.get_or_init(|| {
-        BigUint::parse_bytes(hex.as_bytes(), 16).expect("内联模数是合法 hex")
-    })
+    cell.get_or_init(|| BigUint::parse_bytes(hex.as_bytes(), 16).expect("内联模数是合法 hex"))
 }
 
 /// 大整数 → 左侧补零到 `KEY_BYTES` 字节的 hex（256 字符）。
@@ -193,9 +191,9 @@ pub fn playlist_key_material(key: &str) -> ([u8; 16], [u8; 16]) {
 /// 每块先与前一块密文异或再送进 `Aes128::encrypt_block`。块数很少
 /// （`/register/dev` 的明文约 1.2 KB），不需要分块并行。
 pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plain: &[u8]) -> Result<String> {
-    use aes::cipher::{BlockEncrypt, KeyInit};
-    use aes::cipher::generic_array::GenericArray;
     use aes::Aes128;
+    use aes::cipher::generic_array::GenericArray;
+    use aes::cipher::{BlockEncrypt, KeyInit};
 
     if key.len() != 16 || iv.len() != 16 {
         return Err(AppError::Other(format!(
@@ -236,9 +234,9 @@ pub fn aes_cbc_encrypt(key: &[u8], iv: &[u8], plain: &[u8]) -> Result<String> {
 /// 它给出的是垃圾而不是报错。这里行为一致：不校验填充内容，只按最后一字节截断，
 /// 剩下的字节原样返回给调用方去 `JSON.parse` 或当文本用。
 pub fn aes_cbc_decrypt(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-    use aes::cipher::{BlockDecrypt, KeyInit};
-    use aes::cipher::generic_array::GenericArray;
     use aes::Aes128;
+    use aes::cipher::generic_array::GenericArray;
+    use aes::cipher::{BlockDecrypt, KeyInit};
 
     if key.len() != 16 || iv.len() != 16 {
         return Err(AppError::Other(format!(
@@ -339,8 +337,7 @@ mod tests {
     #[test]
     fn pkcs1_v15_matches_upstream_standard() {
         // 上游：rsaEncrypt2('hello world')，注入固定填充
-        let got =
-            pkcs1_v15_encrypt(SourceKind::Kugou, b"hello world", &FIXED_FILL).expect("加密");
+        let got = pkcs1_v15_encrypt(SourceKind::Kugou, b"hello world", &FIXED_FILL).expect("加密");
         assert_eq!(
             got,
             "9ef27492776b149d3ca343a230accf28f7dc3b21de0928c050b4c12c603514f1eef968eef76fdfb42c6b5a93f0f0d4b0dfe373885fa81225c887848a61ec25abef50c13b5f443c0d883532ee92a101c0425f4d0d989b346a9131769c455d3dcfefa3eed92bfacac8a6b4a4eb70e7f158810ed1d83136a77cf58d64f6439247ab"
@@ -349,8 +346,8 @@ mod tests {
 
     #[test]
     fn pkcs1_v15_matches_upstream_lite() {
-        let got = pkcs1_v15_encrypt(SourceKind::KugouConcept, b"hello world", &FIXED_FILL)
-            .expect("加密");
+        let got =
+            pkcs1_v15_encrypt(SourceKind::KugouConcept, b"hello world", &FIXED_FILL).expect("加密");
         assert_eq!(
             got,
             "9025398f6f9b6f61887303d23c62cc46c63125377042927bd6040648b524ffd663fdfd0088fc0ff3a73eff65d96aa7b3730e442c5729ca291170b6c81646b66a4991e6a693251cfdacd35fe96ca46b82ad6ab6e01bb83a18ddec0149df4a6b34ae6c774e5f4e016ec64135de0239f1b01420807b86343d7bc7967b5ad49654c4"
@@ -375,7 +372,8 @@ mod tests {
             got,
             "65ccf0fc76dfd3a63dbc3c773fa006595350a2f04c4405e93ad809b9ff6cc756380eb2f695e68798a6c915a20bd21387bfb49f6bd4f85c4d78be806a65f3db9caaa8418a62cc8043eda7f3cf65189298a39dbcbfdab5241cf73c04f4568ed16e55d4b5d112f4418f513cc4e1538ec388f1b1373498bda5ae9516e414b492fdfb"
         );
-        let lite = pkcs1_v15_encrypt(SourceKind::KugouConcept, &message, &FIXED_FILL).expect("加密");
+        let lite =
+            pkcs1_v15_encrypt(SourceKind::KugouConcept, &message, &FIXED_FILL).expect("加密");
         assert_eq!(
             lite,
             "02b5c5edf96118ad9f25ac65de18f19e383b27f2a196a09382096dc6c3ef7d3a0512012015a4ab852df4f735d5c7afaf6439fde0fbcb99339f9d04416015b904e47c49a8ec35cac86009adbf0a2ae021f198f9ffae17454c491cc52ef754a17ae7fcb48568e9e692be017996e22dce54fa8e4a01237f1be3359fd847286df6fd"
@@ -397,10 +395,7 @@ mod tests {
     #[test]
     fn pkcs1_fill_skips_zero_bytes() {
         // 填充源含零：应当跳过，结果与不含零的等价序列一致。
-        let with_zeros: Vec<u8> = FIXED_FILL
-            .iter()
-            .flat_map(|byte| [0u8, *byte])
-            .collect();
+        let with_zeros: Vec<u8> = FIXED_FILL.iter().flat_map(|byte| [0u8, *byte]).collect();
         let got = pkcs1_v15_encrypt(SourceKind::Kugou, b"hello world", &with_zeros).expect("加密");
         let expected =
             pkcs1_v15_encrypt(SourceKind::Kugou, b"hello world", &FIXED_FILL).expect("加密");

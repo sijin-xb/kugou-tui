@@ -347,10 +347,7 @@ async fn serve(
             }
             Err(error) => {
                 // 接受失败通常是 fd 耗尽之类的暂时性问题，退一步再试，别把线程打死。
-                crate::logger::tlog!(
-                    crate::logger::LEVEL_WARN,
-                    "WebSocket 接受连接失败：{error}"
-                );
+                crate::logger::tlog!(crate::logger::LEVEL_WARN, "WebSocket 接受连接失败：{error}");
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
@@ -381,8 +378,8 @@ async fn broadcast_loop(
 /// `handle_client` 单独补发，不在这个差分里。
 fn diff_messages(previous: &Snapshot, current: &Snapshot) -> Vec<Arc<str>> {
     let mut messages = Vec::new();
-    let lyrics_changed = previous.song_hash() != current.song_hash()
-        || previous.lyric_text != current.lyric_text;
+    let lyrics_changed =
+        previous.song_hash() != current.song_hash() || previous.lyric_text != current.lyric_text;
     let time_changed = previous.position_ms != current.position_ms;
 
     if let Some(data) = current.lyrics_data()
@@ -441,8 +438,8 @@ async fn handle_client(
         Err(deny)
     };
 
-    let socket = tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(config))
-        .await?;
+    let socket =
+        tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(config)).await?;
     let (mut write, mut read) = socket.split();
 
     // 补发当前状态：welcome → 歌词（有才发）→ 播放状态，顺序与上游一致。

@@ -354,7 +354,9 @@ mod tests {
 
         let secret = "TOKENFIXTURE";
         let url = format!("http://127.0.0.1:{port}/download?token={secret}&userid=10001");
-        let error = reqwest::get(&url).await.expect_err("端口已关闭，应当连不上");
+        let error = reqwest::get(&url)
+            .await
+            .expect_err("端口已关闭，应当连不上");
 
         // 前提：reqwest 原样保留 URL（否则这条测试就恒真了，证明不了什么）。
         assert!(
@@ -365,8 +367,14 @@ mod tests {
         let converted = AppError::from(error);
         let text = converted.to_string();
         assert!(!text.contains(secret), "token 不该进错误文案：{text}");
-        assert!(!text.contains("10001"), "userid 不该进错误文案：{text}");
-        assert!(!text.contains(&port.to_string()), "URL 整体都该被摘掉：{text}");
+        assert!(
+            !text.contains("10001"),
+            "userid 不该进错误文案：{text}"
+        );
+        assert!(
+            !text.contains(&port.to_string()),
+            "URL 整体都该被摘掉：{text}"
+        );
         // 错误种类要留着——诊断「是连不上还是超时」全靠它。
         assert!(converted.is_transient(), "连接被拒属于瞬时故障：{text}");
     }

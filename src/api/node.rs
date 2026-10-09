@@ -17,11 +17,11 @@
 
 use serde_json::Value;
 
-use crate::api::client::HttpClient;
-use crate::api::traits::MusicApi;
 use crate::api::catalog::StreamUrl;
+use crate::api::client::HttpClient;
 use crate::api::cloud::{QrCheck, UserInfo, VipInfo};
 use crate::api::model::{Artist, Lyric, Playlist, RankBoard, Song};
+use crate::api::traits::MusicApi;
 use crate::error::Result;
 use crate::source::SourceKind;
 
