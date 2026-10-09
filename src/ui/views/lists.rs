@@ -237,11 +237,28 @@ fn render_entry_list<T: EntryTitle>(
         return;
     }
     let width = inner.width.saturating_sub(1) as usize;
+    // 可见行数（供 `row_is_visible` 判断哪些行值得真正构造）
+    let visible_rows = inner.height as usize;
+
+    // `offset`/`selected` 是 ratatui 在 `render_stateful_widget` **内部**才钳位的，这里读到
+    // 的是上一帧的旧值。列表刚缩短（换分类、删条目）而光标还没来得及 clamp 时，旧下标
+    // 可能越界，会把**全部**真实行判成窗口外、整屏占位（闪烁一帧）。先按当前长度钳一遍，
+    // 让占位判定与 ratatui 内部口径一致。
+    let last = list.entries.len().saturating_sub(1);
+    let offset = list.cursor.offset().min(last);
+    let selected = list.cursor.selected().map(|index| index.min(last));
     let items: Vec<_> = list
         .entries
         .iter()
         .enumerate()
-        .map(|(index, entry)| entry_row(index, entry.title(), &subtitle(entry), None, width, theme))
+        .map(|(index, entry)| {
+            // 窗口外的行只放等高占位：`List` 需要等长的 items 才能算滚动偏移，
+            // 但没必要为看不见的行跑副标题闭包（每行都有 `format!`/`join`）。
+            if !row_is_visible(index, offset, selected, visible_rows) {
+                return ListItem::from("");
+            }
+            entry_row(index, entry.title(), &subtitle(entry), None, width, theme)
+        })
         .collect();
 
     let widget = selection_list(items, theme);
@@ -477,5 +494,139 @@ mod tests {
                 );
             })
             .expect("渲染空列表");
+    }
+
+    /// 造一个含 `count` 条「歌单N」的条目列表。
+    fn entry_list_of(count: usize) -> EntryList<Playlist> {
+        let mut list = EntryList::default();
+        list.replace(
+            (0..count)
+                .map(|index| Playlist {
+                    name: format!("歌单{index}"),
+                    ..Playlist::default()
+                })
+                .collect(),
+        );
+        list
+    }
+
+    fn draw_entry_list(list: &mut EntryList<Playlist>, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("建测试终端");
+        terminal
+            .draw(|frame| {
+                render_entry_list(
+                    frame,
+                    Rect::new(0, 0, width, height),
+                    list,
+                    "歌单广场",
+                    true,
+                    &Theme::for_config(ThemeName::Default, false),
+                    playlist_subtitle,
+                );
+            })
+            .expect("渲染条目列表");
+        rendered_text(terminal.backend().buffer())
+    }
+
+    /// 条目列表从底部缩短后，旧的滚动下标可能越界；渲染必须按当前长度钳位，
+    /// 否则整屏都会被判成「窗口外」而空白（闪烁一帧）。
+    #[test]
+    fn entry_list_renders_real_rows_after_shrinking_from_the_bottom() {
+        let mut list = entry_list_of(40);
+        // 模拟「滚到底」：选中并滚到最后一条。
+        list.cursor.select(Some(39));
+        *list.cursor.offset_mut() = 39;
+        draw_entry_list(&mut list, 40, 8);
+
+        // 模拟「删到很少」：光标还停在旧下标 39，但列表只剩 3 条。
+        list.entries.truncate(3);
+        let text = draw_entry_list(&mut list, 40, 8);
+        assert!(text.contains("歌单0"), "缩短后仍要渲染真实行：{text:?}");
+        assert!(text.contains("歌单2"), "缩短后仍要渲染真实行：{text:?}");
+
+        // 删到空也不能 panic。
+        list.entries.clear();
+        draw_entry_list(&mut list, 40, 8);
+    }
+
+    /// 选中项落在窗口上/下边缘时，它自己必须仍然被真正画出来（而不是退化成占位空行）。
+    #[test]
+    fn entry_list_keeps_the_selected_row_visible_at_the_window_edge() {
+        let mut top = entry_list_of(200);
+        top.cursor.select(Some(100));
+        *top.cursor.offset_mut() = 100;
+        let text = draw_entry_list(&mut top, 40, 8);
+        assert!(
+            text.contains("歌单100"),
+            "选中项在窗口顶部时必须画出：{text:?}"
+        );
+
+        let mut bottom = entry_list_of(200);
+        bottom.cursor.select(Some(105));
+        *bottom.cursor.offset_mut() = 100;
+        let text = draw_entry_list(&mut bottom, 40, 8);
+        assert!(
+            text.contains("歌单105"),
+            "选中项在窗口底部时必须画出：{text:?}"
+        );
+    }
+
+    // ---- 基准（默认不跑：`cargo test -- --ignored --nocapture`）----
+
+    /// 量化「每帧为整份条目列表构造行」的代价，用来决定要不要像歌曲列表那样只建可见窗口。
+    ///
+    /// 阈值 300µs：条目列表的副标题闭包每行都要 `format!`/`join`，条目上千时是纯浪费；
+    /// 但窗口化要引入占位行与钳位逻辑，低于阈值就不值得。
+    fn bench_entry_list_render_cost(entry_count: usize) {
+        const FRAMES: u32 = 100;
+        let theme = Theme::for_config(ThemeName::Default, false);
+        let mut list = EntryList::default();
+        list.replace(
+            (0..entry_count)
+                .map(|index| Playlist {
+                    name: format!("歌单{index}"),
+                    ..Playlist::default()
+                })
+                .collect(),
+        );
+        list.cursor.select(Some(entry_count / 2));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("建测试终端");
+        let area = Rect::new(0, 0, 80, 24);
+        let mut draw = |terminal: &mut Terminal<TestBackend>| {
+            terminal
+                .draw(|frame| {
+                    render_entry_list(
+                        frame,
+                        area,
+                        &mut list,
+                        "歌单广场",
+                        true,
+                        &theme,
+                        playlist_subtitle,
+                    )
+                })
+                .expect("绘制成功");
+        };
+
+        draw(&mut terminal); // 热身，避免把首次分配算进去
+        let start = std::time::Instant::now();
+        for _ in 0..FRAMES {
+            draw(&mut terminal);
+        }
+        let per_frame = start.elapsed() / FRAMES;
+        println!("条目列表渲染 {entry_count} 条：{per_frame:?}/帧（{FRAMES} 帧平均）");
+    }
+
+    #[test]
+    #[ignore = "基准测试，靠 --ignored 手动跑"]
+    fn bench_entry_list_render_cost_100() {
+        bench_entry_list_render_cost(100);
+    }
+
+    #[test]
+    #[ignore = "基准测试，靠 --ignored 手动跑"]
+    fn bench_entry_list_render_cost_2000() {
+        bench_entry_list_render_cost(2000);
     }
 }
