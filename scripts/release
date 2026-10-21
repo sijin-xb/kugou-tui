@@ -155,6 +155,19 @@ built_version=$(./target/release/kugou-tui --version | awk '{print $2}')
   die "构建出来的二进制报 $built_version，与 Cargo.toml 的 $version 不一致"
 ok "二进制自报版本 $version"
 
+# 构建会把 Cargo.lock 写脏：改 `Cargo.toml` 的 version 之后，锁文件里主包那一条
+# 要等到下次 cargo 运行才更新。前置检查在构建**之前**，拦不到这个。
+#
+# 后果实测过：0.7.1 就是这么发出去的——tag 里的 Cargo.lock 还写着 0.7.0，
+# crates.io 的 `cargo publish --locked` 直接失败（它认为锁文件需要更新，
+# 而 --locked 禁止更新），版本号卡在那里发不出去。
+if [ -n "$(git status --porcelain)" ]; then
+  git status --short >&2
+  die "构建过程改动了工作区（多半是 Cargo.lock 的版本号）。把这些改动提交后再发版——
+      否则打出来的 tag 里锁文件与 Cargo.toml 对不上，crates.io 的 --locked 发布会失败。"
+fi
+ok "构建未改动工作区"
+
 step "打发行包"
 ./scripts/make-release-tarball | tail -3
 tarball="dist/$pkgname-$version-x86_64-unknown-linux-gnu.tar.gz"
