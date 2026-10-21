@@ -617,7 +617,7 @@ fn parse_krc_words(text: &str, line_start_ms: u64) -> (String, Vec<LyricWord>) {
     // 整行没有任何 `<…>`（普通 LRC）：原样返回文本、逐字信息留空。
     // 少了这一步会把纯 LRC 的歌词清成空字符串——歌词直接消失。
     if !text.contains('<') {
-        return (text.trim().to_string(), Vec::new());
+        return (decode_html_entities(text.trim()), Vec::new());
     }
 
     // 逐字单元写作 `<本行内偏移,持续,0>文本`——**标记在文本前面**（KRC 标准写法，
@@ -634,7 +634,8 @@ fn parse_krc_words(text: &str, line_start_ms: u64) -> (String, Vec<LyricWord>) {
         //
         // 这些字没有逐字时间（标记缺失），所以下面那条「字数与标记数必须一致」的
         // 检查会把 `words` 清空，退回整行高亮。这正是想要的行为。
-        for character in rest[..open].chars() {
+        let prefix = decode_html_entities(&rest[..open]);
+        for character in prefix.chars() {
             output.push(character);
         }
 
@@ -659,6 +660,10 @@ fn parse_krc_words(text: &str, line_start_ms: u64) -> (String, Vec<LyricWord>) {
 
         let start_ms = line_start_ms + offset;
         let end_ms = start_ms + duration;
+        // 实体解码会改变字符数（`&apos;` 一个变一个、`&#39;` 四个变一个），
+        // 所以逐字时间按**解码后**的字符分配。字数对不上时下面会把 `words` 清空、
+        // 退回整行高亮——宁可少个效果，也不能让高亮和声音错位。
+        let segment = decode_html_entities(segment);
         for character in segment.chars() {
             output.push(character);
             words.push(LyricWord { start_ms, end_ms });
@@ -694,7 +699,13 @@ fn has_lyric_content(remainder: &str) -> bool {
     !clean_krc_markup(remainder).is_empty()
 }
 
-/// 去掉 KRC 的内联标记 `<起始偏移,持续时长,0>`。
+/// 去掉 KRC 的内联标记 `<起始偏移,持续时长,0>`，并把残留的 HTML 实体还原。
+///
+/// # 顺序不能换
+///
+/// 必须先剥标记、再解实体。反过来的话，`&lt;` 解出的 `<` 会被当成标记起点，
+/// 之后整行文字都会被当成标记吞掉——歌词直接消失。服务端下发的 `&lt;` 是
+/// 真实字符（歌里写了「<3」），不是标记。
 fn clean_krc_markup(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut depth = 0usize;
@@ -708,7 +719,70 @@ fn clean_krc_markup(text: &str) -> String {
         }
     }
 
-    output.trim().to_string()
+    decode_html_entities(output.trim())
+}
+
+/// 还原服务端下发的 HTML 实体。
+///
+/// 酷狗歌词接口把 `'` 写成 `&apos;`（截图里 `I&apos;m sorry 我不是坏男孩`），
+/// 客户端不解码就会把实体原样显示出来。
+///
+/// `&amp;` 必须**最后**处理：先解它的话，`&amp;lt;` 会变成 `&lt;`，再被后续规则
+/// 解成 `<`，把一个转义过的实体凭空变成真字符。
+fn decode_html_entities(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_string();
+    }
+
+    const NAMED: &[(&str, &str)] = &[
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&quot;", "\""),
+        ("&apos;", "'"),
+        ("&#39;", "'"),
+        ("&#x27;", "'"),
+        ("&nbsp;", " "),
+    ];
+
+    let mut output = text.to_string();
+    for (entity, replacement) in NAMED {
+        if output.contains(entity) {
+            output = output.replace(entity, replacement);
+        }
+    }
+    // 数值实体 `&#NNN;` / `&#xHH;`：只处理十进制与十六进制两种写法
+    output = decode_numeric_entities(&output);
+    // 必须最后
+    output.replace("&amp;", "&")
+}
+
+/// 还原 `&#123;` / `&#x1F600;` 形式的数值实体。非法的原样保留。
+fn decode_numeric_entities(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(start) = rest.find("&#") {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find(';') else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let body = &after[..end];
+        let code = if let Some(hex) = body.strip_prefix('x').or_else(|| body.strip_prefix('X')) {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            body.parse::<u32>().ok()
+        };
+        match code.and_then(char::from_u32) {
+            Some(character) => output.push(character),
+            None => output.push_str(&rest[start..start + 2 + end + 1]),
+        }
+        rest = &after[end + 1..];
+    }
+
+    output.push_str(rest);
+    output
 }
 
 /// 从 KRC 的 `[language:base64]` 标签里取出译文，按行挂到歌词上。
@@ -879,12 +953,12 @@ fn attach_translations(lyric: &mut Lyric, krc_text: &str) {
         if let Some(text) = translation_lines.get(source)
             && !text.trim().is_empty()
         {
-            line.translation = Some((*text).to_string());
+            line.translation = Some(decode_html_entities(text.trim()));
         }
         if let Some(text) = romanization_lines.get(source)
             && !text.trim().is_empty()
         {
-            line.romanization = Some((*text).to_string());
+            line.romanization = Some(decode_html_entities(text.trim()));
         }
     }
 }
@@ -1102,6 +1176,70 @@ mod tests {
         // 真实 KRC：标记在**字前面**
         let lyric = parse_lrc("[1000,500]<100,200,0>海<300,200,0>阔天空\n");
         assert_eq!(lyric.lines[0].text, "海阔天空");
+    }
+
+    #[test]
+    fn decodes_html_entities_in_plain_lrc() {
+        // 服务端把 `'` 下发成 `&apos;`，截图里就是 `I&apos;m sorry 我不是坏男孩`
+        let lyric = parse_lrc("[00:01.00]I&apos;m sorry 我不是坏男孩\n");
+        assert_eq!(lyric.lines[0].text, "I'm sorry 我不是坏男孩");
+    }
+
+    #[test]
+    fn decodes_html_entities_in_krc_markup() {
+        let lyric = parse_lrc("[1000,500]<100,200,0>I&apos;m<300,200,0> sorry\n");
+        assert_eq!(lyric.lines[0].text, "I'm sorry");
+        // 逐字时间按解码后的字符分配：`&apos;` 六个字符解成一个
+        assert_eq!(lyric.lines[0].words.len(), 9);
+    }
+
+    #[test]
+    fn escaped_angle_brackets_survive_markup_stripping() {
+        // `&lt;` 是真实字符（歌里写了「<3」），不是 KRC 标记。
+        // 若先解实体再剥标记，这个 `<` 会开启深度计数、把后面的字全吞掉。
+        let lyric = parse_lrc("[1000,500]<100,200,0>&lt;3 你\n");
+        assert_eq!(lyric.lines[0].text, "<3 你");
+    }
+
+    #[test]
+    fn amp_is_decoded_last() {
+        // `&amp;lt;` 是「字面的 &lt;」，只该解一层。先解 `&amp;` 会连锁解成 `<`。
+        assert_eq!(decode_html_entities("&amp;lt;"), "&lt;");
+        assert_eq!(decode_html_entities("&amp;amp;"), "&amp;");
+        // 单独的 `&` 原样保留，不能被吃掉
+        assert_eq!(decode_html_entities("A & B"), "A & B");
+    }
+
+    #[test]
+    fn decodes_numeric_entities() {
+        assert_eq!(decode_html_entities("&#39;"), "'");
+        assert_eq!(decode_html_entities("&#x27;"), "'");
+        assert_eq!(decode_html_entities("&#20320;"), "你");
+        // 非法数值原样保留，不能吞字符
+        assert_eq!(decode_html_entities("&#xZZ;"), "&#xZZ;");
+        assert_eq!(decode_html_entities("&#999999999;"), "&#999999999;");
+        // 没有分号的裸 `&#` 原样保留
+        assert_eq!(decode_html_entities("&#"), "&#");
+    }
+
+    #[test]
+    fn decodes_entities_in_translation_track() {
+        use base64::Engine;
+
+        let payload = r#"{"content":[
+            {"language":0,"type":1,"lyricContent":[["","他&apos;说没关系"]]}
+        ]}"#;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(payload);
+        let krc = format!("[id:1]\n[language:{encoded}]\n[0,1000]hello\n");
+
+        let mut lyric = parse_lrc(&krc);
+        attach_translations(&mut lyric, &krc);
+
+        assert_eq!(
+            lyric.lines[0].translation.as_deref(),
+            Some("他'说没关系"),
+            "译文轨也要解实体"
+        );
     }
 
     #[test]
