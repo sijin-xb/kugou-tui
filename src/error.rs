@@ -109,6 +109,15 @@ impl AppError {
         }
     }
 
+    /// 错误码本身是否属于「需要登录」类。
+    ///
+    /// 与 [`Self::is_auth_related`] 共用同一张码表。取流路径需要**在构造
+    /// `AppError` 之前**判断（服务端把 `20028` 塞在 `error` 字段里，得先知道
+    /// 该不该原样抛出去），所以单独暴露一个按码查询的入口，避免两处各写一份。
+    pub fn is_auth_code(code: i64) -> bool {
+        matches!(code, 152 | 20005 | 20010 | 20017 | 20018 | 20028 | 40004)
+    }
+
     /// 是否属于「需要登录」类错误。UI 层据此弹出登录引导而不是普通报错。
     ///
     /// 已知码（都是实测出来的，上游不公开语义）：
@@ -120,9 +129,12 @@ impl AppError {
     /// * `20017` —— token 本身无效或已过期：`/user/playlist` 只在带了 token 时才
     ///   返回它，不带 token 时返回 `20010`。服务端不附带任何错误描述，所以只认
     ///   这个码，界面才能提示「重新扫码」而不是甩一句 `code=20017`。
+    /// * `20018` —— `/v3/get_my_info` 的 token 失效。实测同一个 cookie 交给上游
+    ///   Node 服务（`/user/detail`）也返回它，所以不是请求构造的问题：它与 `20017`
+    ///   是同一件事在不同端点上的表现，必须一起归入登录类。
     pub fn is_auth_related(&self) -> bool {
         match self {
-            Self::Api { code, .. } => matches!(code, 152 | 20005 | 20010 | 20017 | 20028 | 40004),
+            Self::Api { code, .. } => Self::is_auth_code(*code),
             _ => false,
         }
     }
@@ -133,7 +145,7 @@ impl AppError {
     /// 用户不用先怀疑是不是自己没扫过码。
     pub fn is_login_expired(&self) -> bool {
         match self {
-            Self::Api { code, .. } => matches!(code, 20005 | 20017 | 40004),
+            Self::Api { code, .. } => matches!(code, 20005 | 20017 | 20018 | 40004),
             _ => false,
         }
     }
@@ -224,13 +236,26 @@ mod tests {
 
     /// `/user/playlist` 实测：不带认证信息返回 20010，带了失效 token 返回 20017。
     /// 两个都必须归入「需要登录」，否则界面只会甩一句 `code=20017`。
+    ///
+    /// 20018 来自 `/v3/get_my_info`：同一个 cookie 交给上游 Node 服务也返回它，
+    /// 说明它和 20017 是同一件事（token 失效）在不同端点上的表现。
     #[test]
     fn auth_codes_are_recognized() {
-        for code in [152, 20005, 20010, 20017, 20028, 40004] {
+        for code in [152, 20005, 20010, 20017, 20018, 20028, 40004] {
             assert!(api(code).is_auth_related(), "code={code} 应属于登录类");
         }
         assert!(!api(149).is_auth_related(), "页码越界不是登录问题");
         assert!(api(149).is_page_out_of_range());
+    }
+
+    /// 20018 必须被认成「失效」而不是「没登录」：界面上「按 L 重新扫码」和
+    /// 「去配置 cookie」是两条不同的动作，认错会把用户引到错误的方向。
+    #[test]
+    fn profile_20018_is_reported_as_expired_login() {
+        let hint = api(20018).user_hint();
+        assert!(hint.contains("失效"), "20018 应说明是失效：{hint}");
+        assert!(hint.contains("L"), "应提示重新扫码：{hint}");
+        assert!(!hint.contains("20018"), "不该把原始错误码甩给用户：{hint}");
     }
 
     fn non_json(preview: &str) -> AppError {

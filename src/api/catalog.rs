@@ -601,38 +601,53 @@ pub(crate) async fn resolve_stream_url<S: StreamSource>(
 
     // 两次都没有。优先把服务端给的原因透出去，比笼统的「可能需要 VIP」有用得多。
     for root in last_full.iter().chain(std::iter::once(&trial)) {
-        // KuGouMusicApi 的 `/song/url` 把真正的失败信息放在 `data` 嵌套层里，
-        // 顶层只有元数据——所以读两层。
-        let data = root.get("data").unwrap_or(root);
-        if let Some(message) = pick_string(data, &["error", "error_msg", "msg", "errmsg"]) {
-            let status = pick_i64(data, &["status"]).unwrap_or(0);
-            let reason = status_reason(status).unwrap_or(message);
-            return Err(AppError::Api {
-                path: "/song/url".to_string(),
-                code: pick_i64(data, &["errcode", "error_code"]).unwrap_or(status),
-                message: reason,
-            });
-        }
-
-        // `fail_process` 会说明卡在哪一步，实测见过 ["pkg","buy"]（需购买/开通）
-        if let Some(process) = data.get("fail_process").and_then(Value::as_array)
-            && !process.is_empty()
-        {
-            let steps = process
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join("/");
-            return Err(AppError::NotFound(format!(
-                "《{}》需要开通或购买（{}）",
-                song.name, steps
-            )));
+        if let Some(error) = stream_failure(root, &song.name) {
+            return Err(error);
         }
     }
 
     Err(AppError::NotFound(format!(
         "《{}》没有可用的播放地址（可能需要 VIP、已下架或版权受限）",
         song.name
+    )))
+}
+
+/// 从 `/song/url` 的响应里读出失败原因。
+///
+/// KuGouMusicApi 把真正的失败信息放在 `data` 嵌套层里，顶层只有元数据——所以读两层。
+fn stream_failure(root: &Value, song_name: &str) -> Option<AppError> {
+    let data = root.get("data").unwrap_or(root);
+    if let Some(message) = pick_string(data, &["error", "error_msg", "msg", "errmsg"]) {
+        let status = pick_i64(data, &["status"]).unwrap_or(0);
+        let code = pick_i64(data, &["errcode", "error_code"]).unwrap_or(status);
+        // 登录类错误码必须原样抛成 `Api`，不能包成 `NotFound`：`NotFound` 不带
+        // code，上层 `is_login_expired()` 认不出来，界面就只能照着「VIP / 已下架」
+        // 去猜——而真正该做的是按 L 重新扫码。实测 `20028`（本次请求需要验证）
+        // 就走在 `error` 字段里。
+        let reason = if AppError::is_auth_code(code) {
+            message
+        } else {
+            status_reason(status).unwrap_or(message)
+        };
+        return Some(AppError::Api {
+            path: "/song/url".to_string(),
+            code,
+            message: reason,
+        });
+    }
+
+    // `fail_process` 会说明卡在哪一步，实测见过 ["pkg","buy"]（需购买/开通）
+    let process = data.get("fail_process").and_then(Value::as_array)?;
+    if process.is_empty() {
+        return None;
+    }
+    let steps = process
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("/");
+    Some(AppError::NotFound(format!(
+        "《{song_name}》需要开通或购买（{steps}）"
     )))
 }
 
@@ -1556,6 +1571,63 @@ mod tests {
             "url": ["https://fsmobile.kugou.com/a.mp3"]
         });
         assert_eq!(extract_stream_url(&root), None);
+    }
+
+    /// 实测的 `20028` 响应形状：错误信息在 `data.error` 里，`errcode` 与
+    /// `status` 都在 `data` 层。
+    ///
+    /// 这条走的是**登录类**分支：必须原样抛 `Api`，让上层 `is_login_expired()`
+    /// 认出是 token 问题。包成 `NotFound` 的话界面只会说「可能需要 VIP」，
+    /// 把用户引到错误的方向（真正该做的是按 L 重新扫码）。
+    #[test]
+    fn auth_failure_keeps_its_code() {
+        let root = json!({
+            "status": 0,
+            "data": {"errcode": 20028, "status": 0, "error": "本次请求需要验证"}
+        });
+        let error = stream_failure(&root, "某首歌").expect("应当识别出失败原因");
+        assert!(error.is_auth_related(), "20028 必须被认成登录类");
+        match error {
+            AppError::Api { code, message, .. } => {
+                assert_eq!(code, 20028);
+                assert_eq!(message, "本次请求需要验证", "登录类错误要保留服务端原文");
+            }
+            other => panic!("登录类错误不能包成 {other:?}"),
+        }
+    }
+
+    /// 非登录类的失败照旧走 `status_reason`，给「该歌曲暂无版权」这类具体文案。
+    #[test]
+    fn copyright_failure_is_translated() {
+        let root = json!({
+            "status": 0,
+            "data": {"status": 3, "error": "未获取到歌曲信息"}
+        });
+        match stream_failure(&root, "某首歌").expect("应当识别出失败原因") {
+            AppError::Api { message, .. } => {
+                assert!(!message.is_empty());
+            }
+            other => panic!("应当抛 Api 错误，实际 {other:?}"),
+        }
+    }
+
+    /// `fail_process` 说明卡在哪一步，实测见过 ["pkg","buy"]（需购买/开通）。
+    #[test]
+    fn purchase_steps_are_reported() {
+        let root = json!({
+            "status": 0,
+            "data": {"fail_process": ["pkg", "buy"]}
+        });
+        let error = stream_failure(&root, "某首歌").expect("应当识别出失败原因");
+        let text = format!("{error:?}");
+        assert!(text.contains("pkg/buy"), "应带出卡住的步骤：{text}");
+    }
+
+    /// 什么都没有时返回 `None`，交给调用方落通用文案。
+    #[test]
+    fn no_reason_returns_none() {
+        assert!(stream_failure(&json!({"status": 0, "data": {}}), "某首歌").is_none());
+        assert!(stream_failure(&json!({"status": 0}), "某首歌").is_none());
     }
 
     /// 没有 status 字段就当老接口看待（旧版服务端不返回 status）。
