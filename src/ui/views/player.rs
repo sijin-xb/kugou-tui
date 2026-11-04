@@ -87,12 +87,13 @@ fn render_song_info(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
         None => ("未在播放（在列表里按 Enter 播放）".to_string(), theme.dim()),
     };
 
-    // 右侧：循环模式 + 音量 + 下一首。**按优先级分段**，放不下的整段丢掉，
-    // 而不是把拼好的整串一刀截断——那样被切掉的总是排在最后的那段。
+    // 右侧：循环模式 + 音量 + 睡眠定时 + 下一首。**按优先级分段**，放不下的
+    // 整段丢掉，而不是把拼好的整串一刀截断——那样被切掉的总是排在最后的那段。
     //
     // 模式排在最后（最右）也最重要：它**只在这里显示**，别处（队列标题、状态栏）
-    // 都看不到；音量次之；「下一首」最次——队列面板本来就列着它。于是无论终端多
-    // 窄，循环模式都一定留在播放条上，这正是「窄终端里模式凭空消失」的修复。
+    // 都看不到；音量次之；「定时」是激活中的倒计时，比「下一首」要紧；「下一首」
+    // 最次——队列面板本来就列着它。于是无论终端多窄，循环模式都一定留在播放条上，
+    // 这正是「窄终端里模式凭空消失」的修复。
     //
     // 宽度必须按**显示宽度**算，不能按字符数：`下一首 <歌名>` 里歌名常是中文，
     // 一个字符占两列，按字符数算出来的宽度会明显偏小。
@@ -102,6 +103,9 @@ fn render_song_info(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
     } else {
         format!("音量 {:.0}%", state.volume * 100.0)
     };
+    let timer = state
+        .sleep_timer
+        .map(|timer| sleep_timer_label(timer.remaining));
     let next = state
         .queue
         .peek_next()
@@ -112,16 +116,26 @@ fn render_song_info(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
     let max_right = (area.width / 2).max(mode_width);
 
     // 从低优先级往高优先级逐段尝试：先带上「下一首」，放不下就丢它；再放不下就
-    // 丢音量。模式永不丢。整段取舍而不是截半句，所以不会出现「音量 80…」这种
-    // 两半都被切坏的残句。
-    let with_next = match next.as_deref() {
-        Some(next) => format!("{next} · {volume} · {mode}"),
-        None => format!("{volume} · {mode}"),
+    // 丢定时；再放不下丢音量。模式永不丢。整段取舍而不是截半句，所以不会出现
+    // 「音量 80…」这种两半都被切坏的残句。没有定时时该分支自动退化成原来的
+    // 「下一首 · 音量 · 模式」链。
+    let join = |parts: &[Option<&String>]| -> String {
+        parts
+            .iter()
+            .flatten()
+            .map(|part| part.as_str())
+            .collect::<Vec<_>>()
+            .join(" · ")
     };
-    let right_text = if display_width(&with_next) as u16 <= max_right {
-        with_next
-    } else if display_width(&volume) as u16 + 3 + mode_width <= max_right {
-        format!("{volume} · {mode}")
+    let full = join(&[next.as_ref(), timer.as_ref(), Some(&volume), Some(&mode)]);
+    let without_next = join(&[timer.as_ref(), Some(&volume), Some(&mode)]);
+    let without_timer = join(&[Some(&volume), Some(&mode)]);
+    let right_text = if display_width(&full) as u16 <= max_right {
+        full
+    } else if display_width(&without_next) as u16 <= max_right {
+        without_next
+    } else if display_width(&without_timer) as u16 <= max_right {
+        without_timer
     } else {
         mode.clone()
     };
@@ -186,6 +200,9 @@ fn render_song_info(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
         if next.is_some() {
             register_right_hit(state, "下一首", HitTarget::NextTrack);
         }
+        if let Some(timer) = timer.as_deref() {
+            register_right_hit(state, timer, HitTarget::SleepTimer);
+        }
         register_right_hit(state, &volume, HitTarget::Volume);
         register_right_hit(state, &mode, HitTarget::PlayMode);
 
@@ -196,6 +213,13 @@ fn render_song_info(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
             HitTarget::PlayPause,
         );
     }
+}
+
+/// 睡眠定时的倒计时显示。分钟数封顶两位（最高档 120 分钟），秒位让倒计时
+/// 看得见在走。
+fn sleep_timer_label(remaining: std::time::Duration) -> String {
+    let seconds = remaining.as_secs();
+    format!("定时 {:02}:{:02}", seconds / 60, seconds % 60)
 }
 
 /// 第 3 行：进度条。自带居中标签，把时间放在条上。
@@ -1291,6 +1315,31 @@ mod tests {
         for needle in ["下一首", "音量", "列表循环"] {
             assert!(text.contains(needle), "宽终端下应显示「{needle}」：{text}");
         }
+    }
+
+    /// 睡眠定时激活时右侧出现倒计时（分:秒），未激活时不出现。
+    #[test]
+    fn sleep_timer_countdown_shows_only_when_active() {
+        let build = |timer: Option<crate::app::state::SleepTimer>| {
+            let mut state = AppState::new(crate::config::Config::default());
+            state.current = Some(crate::api::model::Song::default());
+            state.sleep_timer = timer;
+            let mut terminal = Terminal::new(TestBackend::new(120, 4)).expect("建测试终端");
+            let theme = Theme::for_config(ThemeName::Default, false);
+            terminal
+                .draw(|frame| render_player(frame, Rect::new(0, 0, 120, 4), &mut state, &theme))
+                .expect("渲染播放条");
+            buffer_text(&terminal)
+        };
+
+        let active = build(Some(crate::app::state::SleepTimer {
+            remaining: std::time::Duration::from_secs(15 * 60 - 30),
+            step: 0,
+        }));
+        assert!(active.contains("定时14:30"), "应显示倒计时：{active}");
+
+        let off = build(None);
+        assert!(!off.contains("定时"), "未定时不应出现倒计时：{off}");
     }
 
     /// 缩略图区是「列 = 行 × 2」的方形（字符宽高比 1:2），并水平居中。

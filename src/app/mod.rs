@@ -202,6 +202,13 @@ pub struct App {
     ///
     /// 同一个源失败一次就够了：后面同源的歌直接跳过，不再逐个发必然失败的请求。
     failed_sources: Vec<crate::source::SourceKind>,
+
+    /// 画面是否脏（自上次渲染以来状态有没有变）。
+    ///
+    /// 挂着听歌的大部分时间界面是静止的，静止时按 5fps 重画一模一样的整帧
+    /// 是纯浪费。置位规则集中在 [`App::handle_event`]：非 Tick 事件一律置脏；
+    /// Tick 只在「真的有东西在动」时置脏（见 [`tick_needs_redraw`]）。
+    dirty: bool,
 }
 
 /// 动画帧间隔（约 30fps）。终端里再往上（60fps）看不出差别，但重绘成本是线性的，
@@ -231,6 +238,17 @@ fn frame_delay(config: &Config, visualizer_animating: bool, lyric_visible: bool)
         return Duration::from_millis(ANIMATED_TICK_MS);
     }
     Duration::from_millis(base)
+}
+
+/// 一次 Tick 心跳之后有没有必要重绘一帧。
+///
+/// 一直在变的只有三类：播放/缓冲中（进度条、频谱、迷你频谱逐帧推进）、忙碌
+/// 转轮、还没演完的歌词换行过渡。其余的画面变化全部由事件驱动（按键、鼠标、
+/// 异步结果都会置脏标记），不依赖心跳——所以静止时心跳可以直接跳过渲染。
+fn tick_needs_redraw(playback: PlaybackState, busy: bool, lyric_transitioning: bool) -> bool {
+    matches!(playback, PlaybackState::Playing | PlaybackState::Loading)
+        || busy
+        || lyric_transitioning
 }
 
 impl App {
@@ -311,6 +329,7 @@ impl App {
             pending_stream_retry: None,
             auto_skip_count: 0,
             failed_sources: Vec::new(),
+            dirty: true,
             #[cfg(unix)]
             mpris,
             #[cfg(unix)]
@@ -469,9 +488,14 @@ impl App {
         // 不走、歌词不动，表现就是「动一下鼠标可视化页就卡住」。
         let mut next_tick = Instant::now() + self.frame_interval();
         loop {
-            terminal
-                .draw(|frame| crate::ui::render(frame, &mut self.state))
-                .context("渲染失败")?;
+            // 渲染按需：静止（暂停/停止、无忙碌、无动画）时跳过整帧重绘。
+            // 要不要重绘由 `handle_event` 置脏标记决定，这里只看标记。
+            if self.dirty {
+                terminal
+                    .draw(|frame| crate::ui::render(frame, &mut self.state))
+                    .context("渲染失败")?;
+                self.dirty = false;
+            }
 
             let now = Instant::now();
             if now >= next_tick {
@@ -722,6 +746,7 @@ impl App {
             pending_stream_retry: None,
             auto_skip_count: 0,
             failed_sources: Vec::new(),
+            dirty: true,
             #[cfg(unix)]
             mpris: None,
             #[cfg(unix)]
@@ -821,5 +846,35 @@ mod tests {
         assert_eq!(millis(frame_delay(&cfg, false, false)), LITE_TICK_MS);
         // 用户配得比下限还慢时以用户为准
         assert_eq!(millis(frame_delay(&config(1000, true), true, true)), 1000);
+    }
+
+    /// 心跳后是否需要重绘：只有「真的有东西在动」时才值得画一帧。
+    ///
+    /// 播放/缓冲中进度条与频谱逐帧推进；忙碌转轮、歌词过渡动画也是每帧变的。
+    /// 暂停与停止是静止的——进度条不走、频谱已清空，重画一模一样的整帧纯属
+    /// 浪费；那些状态下的画面变化全部由事件（按键/鼠标/异步结果）驱动。
+    #[test]
+    fn ticks_only_redraw_when_something_is_actually_moving() {
+        use crate::audio::engine::PlaybackState;
+        for moving in [PlaybackState::Playing, PlaybackState::Loading] {
+            assert!(
+                tick_needs_redraw(moving, false, false),
+                "{moving:?} 一定在动"
+            );
+        }
+        assert!(
+            tick_needs_redraw(PlaybackState::Stopped, true, false),
+            "忙碌转轮"
+        );
+        assert!(
+            tick_needs_redraw(PlaybackState::Paused, false, true),
+            "歌词过渡还没演完"
+        );
+        for still in [PlaybackState::Paused, PlaybackState::Stopped] {
+            assert!(
+                !tick_needs_redraw(still, false, false),
+                "{still:?} 是静止的，心跳不该触发重绘"
+            );
+        }
     }
 }

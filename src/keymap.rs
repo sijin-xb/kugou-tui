@@ -155,6 +155,10 @@ pub enum Action {
     LowerSourcePriority,
     /// 搜索页：循环切换搜索类型（单曲 / 歌手 / 歌单）。
     CycleSearchKind,
+    /// 睡眠定时：在 关 → 15 → 30 → 60 → 120 分钟 之间循环。
+    ///
+    /// 倒计时只在播放中走表（暂停即冻结），到点音量渐弱后暂停播放。
+    CycleSleepTimer,
     /// 可视化页局部键：打开 cava 调参面板。
     ///
     /// 不进 `resolve_normal`，也不在 CHEATSHEET / REBINDABLE 里——`e`/`v`/`V`/`E`
@@ -289,6 +293,7 @@ const REBINDABLE: &[(&str, Action)] = &[
     ("toggle_lyric_panel", Action::ToggleLyricPanel),
     ("lyric_delay", Action::LyricDelay),
     ("lyric_advance", Action::LyricAdvance),
+    ("sleep_timer", Action::CycleSleepTimer),
     // ---- 业务 ----
     ("open_search", Action::OpenSearch),
     ("open_settings", Action::OpenSettings),
@@ -647,6 +652,8 @@ fn resolve_normal(key: KeyEvent) -> Action {
         // 歌词微调：方括号在键盘上紧邻，符合直觉
         KeyCode::Char(']') => Action::LyricAdvance,
         KeyCode::Char('[') => Action::LyricDelay,
+        // 睡眠定时：z 就是最直观的 zZz
+        KeyCode::Char('z') => Action::CycleSleepTimer,
 
         // ---- 业务 ----
         KeyCode::Char('/') => Action::OpenSearch,
@@ -762,6 +769,11 @@ pub const CHEATSHEET: &[(&str, &str, &str)] = &[
     ("l", "歌词面板开关", "播放"),
     ("[ / ]", "歌词延后 / 提前 100ms", "播放"),
     ("W", "下载当前播放歌曲到设置里的目录", "播放"),
+    (
+        "z",
+        "睡眠定时：关 → 15/30/60/120 分钟循环（到点渐弱暂停）",
+        "播放",
+    ),
 ];
 
 #[cfg(test)]

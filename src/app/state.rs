@@ -226,6 +226,8 @@ pub enum HitTarget {
     Volume,
     /// 播放条的循环模式按钮：点一次换一种模式。
     PlayMode,
+    /// 播放条上的睡眠定时倒计时：点一次切到下一档（同 `z` 键）。
+    SleepTimer,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1072,6 +1074,12 @@ pub(crate) fn lyric_display_cache_key(lyric: &Lyric) -> u64 {
 }
 
 impl LyricPane {
+    /// 换行过渡是否还在演（还没到稳态）。空闲渲染跳过（`tick_needs_redraw`）
+    /// 要靠它区分「静止」和「正在淡入淡出」。
+    pub fn is_transitioning(&self) -> bool {
+        self.transition_total_ms > 0.0 && self.transition_ms < self.transition_total_ms
+    }
+
     /// 换行过渡的进度 `t ∈ [0, 1]`，`1.0` 表示稳态（没有过渡在进行）。
     ///
     /// 用 ease-out cubic：前 1/3 时间走完约 2/3 的视觉变化，之后缓慢收敛。
@@ -1192,6 +1200,16 @@ impl CavaSetting {
     ];
 }
 
+/// 睡眠定时的运行时状态：剩余时长 + 设定的档位下标。
+///
+/// 档位表是 `app::playback::SLEEP_STEPS_MIN`，这里只存下标。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SleepTimer {
+    pub remaining: std::time::Duration,
+    /// 当前档位在 `SLEEP_STEPS_MIN` 里的下标。
+    pub step: usize,
+}
+
 /// cava 调参面板的 UI 状态。目前只用一个存在标记，后续要加编辑缓冲再说。
 #[derive(Debug, Default)]
 pub struct CavaPanelState;
@@ -1267,6 +1285,13 @@ pub struct AppState {
     pub visualizer_mode: VisualizerMode,
     pub cava_setting: usize,
     pub cava_panel: Option<CavaPanelState>,
+    /// 睡眠定时；`None` 表示没有定时。
+    ///
+    /// `remaining` 只在**播放中**走表（暂停即冻结），由 `App::tick` 每拍递减；
+    /// 到点渐弱 15 秒后暂停。切档靠 `step`（档位下标）而不是从剩余时长反推——
+    /// 渐弱尾段剩余不足一分钟，反推会把 120 分钟档误认成 15 分钟档。运行时
+    /// 状态，不落配置。
+    pub sleep_timer: Option<SleepTimer>,
     /// 平滑后的频谱。原始频谱每帧跳一次，直接画会明显抖动；这里做
     /// 「快起慢落」的缓动后，柱子才跟手又不抖。
     pub smooth_spectrum: Vec<f32>,
@@ -1667,6 +1692,7 @@ impl AppState {
             visualizer_mode: VisualizerMode::Bars,
             cava_setting: 0,
             cava_panel: None,
+            sleep_timer: None,
             smooth_spectrum: Vec::new(),
             peak_spectrum: Vec::new(),
             duration_ms: 0,

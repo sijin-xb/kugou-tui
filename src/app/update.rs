@@ -142,6 +142,15 @@ impl App {
     // ==================================================================
 
     pub fn handle_event(&mut self, event: Event) {
+        // 渲染按需。非 Tick 事件几乎必然改变画面（按键、鼠标、异步结果、音频
+        // 状态），一律置脏；Tick 只在「真的有东西在动」时值得重画——静止时
+        // 心跳不触发渲染，见 `tick_needs_redraw`。
+        self.dirty = !matches!(event, Event::Tick)
+            || super::tick_needs_redraw(
+                self.state.playback,
+                self.state.busy.is_some(),
+                self.state.lyric.is_transitioning(),
+            );
         match event {
             Event::Key(key) => {
                 let mode = if self.state.is_editing() {
@@ -386,6 +395,7 @@ impl App {
             HitTarget::NextTrack => self.handle_action(Action::Next),
             HitTarget::PlayMode => self.handle_action(Action::CyclePlaybackMode),
             HitTarget::Volume => self.drag_volume(zone, mouse),
+            HitTarget::SleepTimer => self.cycle_sleep_timer(),
         }
     }
 
@@ -432,7 +442,8 @@ impl App {
             | HitTarget::PlayPause
             | HitTarget::NextTrack
             | HitTarget::PlayMode
-            | HitTarget::Volume => {
+            | HitTarget::Volume
+            | HitTarget::SleepTimer => {
                 return;
             }
         }
@@ -470,7 +481,8 @@ impl App {
             | HitTarget::PlayPause
             | HitTarget::NextTrack
             | HitTarget::PlayMode
-            | HitTarget::Volume => {
+            | HitTarget::Volume
+            | HitTarget::SleepTimer => {
                 return;
             }
         }
@@ -593,7 +605,8 @@ impl App {
             | HitTarget::PlayPause
             | HitTarget::NextTrack
             | HitTarget::PlayMode
-            | HitTarget::Volume => return,
+            | HitTarget::Volume
+            | HitTarget::SleepTimer => return,
         };
 
         if self.state.focus == Focus::Primary && focus != Focus::Primary {
@@ -1219,6 +1232,7 @@ impl App {
             Action::PlayPause => self.toggle_playback(),
             Action::Next => self.next_track(true),
             Action::Prev => self.previous_track(),
+            Action::CycleSleepTimer => self.cycle_sleep_timer(),
             // 焦点在侧边栏时，左右方向键用来在导航与列表之间移动焦点；
             // 只有焦点已经落在列表/队列里，它们才是快进快退。
             Action::SeekForward => {
@@ -3253,6 +3267,28 @@ impl App {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_frame_at);
         self.last_frame_at = now;
+
+        // 睡眠定时：只在播放中走表（暂停即冻结）。到点把音量还原、暂停播放；
+        // 尾段 15 秒按剩余比例渐弱，到点正好归零。
+        let playing = self.state.playback == PlaybackState::Playing;
+        let sleep_expired = self.state.sleep_timer.as_mut().is_some_and(|timer| {
+            crate::app::playback::advance_sleep_timer(timer, elapsed, playing)
+        });
+        if sleep_expired {
+            self.state.sleep_timer = None;
+            self.audio.set_volume(self.state.volume);
+            self.toggle_playback();
+            self.state.info("睡眠定时到点，已暂停");
+        } else if playing
+            && let Some(timer) = self.state.sleep_timer
+            && timer.remaining < crate::app::playback::SLEEP_FADE
+        {
+            self.audio
+                .set_volume(crate::app::playback::sleep_fade_volume(
+                    self.state.volume,
+                    timer.remaining,
+                ));
+        }
 
         // 电平每帧刷新（audio 那一侧只是读原子量，开销可忽略）
         self.state.levels = self.audio.levels();

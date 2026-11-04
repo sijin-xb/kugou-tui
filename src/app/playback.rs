@@ -28,11 +28,12 @@
 
 use crate::api::model::Song;
 use crate::app::App;
-use crate::app::state::CoverArt;
+use crate::app::state::{CoverArt, SleepTimer};
 use crate::app::update::describe_song;
 use crate::audio::engine::{AudioSource, PlaybackState};
 use crate::event::Loaded;
 use crate::logger::tlog;
+use std::time::Duration;
 
 /// 「上一首」在播放超过这个时长后，先回到本曲开头而不是切歌。
 ///
@@ -227,6 +228,40 @@ impl App {
         self.state.info(format!("歌词偏移 {offset:+} ms"));
     }
 
+    /// 睡眠定时：在 关 → 15 → 30 → 60 → 120 分钟 之间循环。
+    ///
+    /// 切档按**档位下标**走（渐弱尾段剩余不足一分钟，从剩余时长反推会算错档），
+    /// 所以从活动状态切档永远是「下一档」，不存在跳变。
+    pub(super) fn cycle_sleep_timer(&mut self) {
+        let next = match self.state.sleep_timer {
+            None => Some(SleepTimer {
+                remaining: Duration::from_secs(SLEEP_STEPS_MIN[0] * 60),
+                step: 0,
+            }),
+            Some(current) => {
+                let step = current.step + 1;
+                SLEEP_STEPS_MIN.get(step).map(|&minutes| SleepTimer {
+                    remaining: Duration::from_secs(minutes * 60),
+                    step,
+                })
+            }
+        };
+
+        match next {
+            Some(timer) => {
+                self.state.sleep_timer = Some(timer);
+                self.state
+                    .info(format!("睡眠定时：{} 分钟", SLEEP_STEPS_MIN[timer.step]));
+            }
+            None => {
+                self.state.sleep_timer = None;
+                // 取消时把可能还在渐弱的音量还原
+                self.audio.set_volume(self.state.volume);
+                self.state.info("睡眠定时已取消");
+            }
+        }
+    }
+
     /// 把「当前这首听到哪儿了」记进 `state.resume`，供非正常收场之后续播。
     ///
     /// 断流、下载失败都会让歌停下来，但听到的位置是有效的：用户按播放
@@ -365,5 +400,127 @@ impl App {
                 }),
             }
         });
+    }
+}
+
+/// 睡眠定时的档位表（分钟）。`z` 在 关 → 各档 → 关 之间循环。
+pub(super) const SLEEP_STEPS_MIN: [u64; 4] = [15, 30, 60, 120];
+
+/// 睡眠定时尾段的渐弱时长。剩余不足这个量时音量按比例往下压。
+pub(super) const SLEEP_FADE: Duration = Duration::from_secs(15);
+
+/// 睡眠定时倒计时：只在播放中走表（暂停即冻结），返回 true 表示**这一次**到点。
+///
+/// 到点时把剩余清零，由调用方把整个定时消费掉并暂停播放——若留着零值不清，
+/// 下一拍又会报告一次「到点」，播放/暂停就会来回抖。
+pub(super) fn advance_sleep_timer(
+    timer: &mut SleepTimer,
+    elapsed: Duration,
+    playing: bool,
+) -> bool {
+    if !playing || timer.remaining.is_zero() {
+        return false;
+    }
+    match timer.remaining.checked_sub(elapsed) {
+        Some(rest) if !rest.is_zero() => {
+            timer.remaining = rest;
+            false
+        }
+        _ => {
+            timer.remaining = Duration::ZERO;
+            true
+        }
+    }
+}
+
+/// 渐弱期的有效音量：剩余越少声音越小，到点正好归零。剩余充足时原样返回。
+pub(super) fn sleep_fade_volume(volume: f32, remaining: Duration) -> f32 {
+    volume * (remaining.as_secs_f32() / SLEEP_FADE.as_secs_f32()).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::state::SleepTimer;
+
+    /// 倒计时只在播放中走表：暂停冻结、恢复续走、到点报告一次。
+    #[test]
+    fn sleep_timer_only_counts_down_while_playing() {
+        let mut timer = SleepTimer {
+            remaining: Duration::from_secs(60),
+            step: 0,
+        };
+        assert!(!advance_sleep_timer(
+            &mut timer,
+            Duration::from_secs(10),
+            false
+        ));
+        assert_eq!(timer.remaining, Duration::from_secs(60), "暂停时不走表");
+
+        assert!(!advance_sleep_timer(
+            &mut timer,
+            Duration::from_secs(10),
+            true
+        ));
+        assert_eq!(timer.remaining, Duration::from_secs(50));
+
+        assert!(advance_sleep_timer(
+            &mut timer,
+            Duration::from_secs(60),
+            true
+        ));
+        assert_eq!(timer.remaining, Duration::ZERO, "到点清零");
+        // 到点之后不能再重复报
+        assert!(!advance_sleep_timer(
+            &mut timer,
+            Duration::from_secs(1),
+            true
+        ));
+    }
+
+    /// 渐弱只作用于尾段：剩余充足时音量原样，尾段线性压低，到点归零。
+    #[test]
+    fn fade_applies_only_in_the_tail() {
+        let volume = 0.8;
+        assert_eq!(sleep_fade_volume(volume, Duration::from_secs(60)), volume);
+        let half = sleep_fade_volume(volume, Duration::from_secs_f32(7.5));
+        assert!((half - 0.4).abs() < 1e-6, "剩余一半时音量减半，实际 {half}");
+        assert_eq!(sleep_fade_volume(volume, Duration::ZERO), 0.0);
+    }
+
+    /// 档位循环：关 → 15 → 30 → 60 → 120 → 关。切档按档位下标走，
+    /// 渐弱尾段剩余不足一分钟也照样推进到正确的下一档。
+    #[test]
+    fn sleep_timer_cycles_through_the_steps() {
+        let mut app = App::for_test();
+        assert_eq!(app.state.sleep_timer, None);
+
+        app.cycle_sleep_timer();
+        assert_eq!(
+            app.state.sleep_timer.map(|timer| timer.remaining),
+            Some(Duration::from_secs(15 * 60)),
+            "关 → 15 分钟"
+        );
+
+        // 走掉一段时间后按下一档：剩余 25 分钟说明当前在「30 分钟」档
+        // （step 1），推到下一档 60，而不是从剩余时间重新起算
+        app.state.sleep_timer = Some(SleepTimer {
+            remaining: Duration::from_secs(25 * 60),
+            step: 1,
+        });
+        app.cycle_sleep_timer();
+        assert_eq!(
+            app.state.sleep_timer.map(|timer| timer.remaining),
+            Some(Duration::from_secs(60 * 60))
+        );
+
+        // 120 档（渐弱尾段只剩 3 秒）再按，循环回关，并把渐弱中的音量还原
+        app.state.sleep_timer = Some(SleepTimer {
+            remaining: Duration::from_secs(3),
+            step: 3,
+        });
+        app.state.volume = 0.7;
+        app.cycle_sleep_timer();
+        assert_eq!(app.state.sleep_timer, None);
     }
 }
