@@ -394,6 +394,27 @@ impl Cava {
             }
         }
 
+        // 开局定标：autosens 从 sens=1 出发按每帧 ~+9% 几何爬升，音量正常的
+        // 信号要 2~3 秒才能爬到可用增益——表现为「切到可视化页要等几秒柱子
+        // 才动」。上游 cavacore 也这样（sens_init 只是把爬速加倍），CLI 用户
+        // 不在意，但切页即看的体验等不起。
+        //
+        // 这里在 sens_init 窗口内用**本帧 autosens 前的原始峰值**直接把 sens
+        // 解析定标到「峰值略超 1」的位置：等于把几何爬升的极限一步算出来。
+        // 只在 sens_init 期间生效（第一个 overshoot 就关掉它），之后的动态
+        // 与上游完全一致——顶格压低、安静抬高都不受影响。前几帧仍按上游
+        // 原样输出（memory/peak 等平滑历史在积累），只是增益提前到位。
+        if self.autosens && self.sens_init {
+            let raw_peak = self.out.iter().cloned().fold(0.0f32, f32::max);
+            if raw_peak > 1e-9 {
+                // 目标：定标后峰值落在 1.2（略顶格，下一帧 autosens 自然接管）。
+                // 增益限到 4000 倍：极弱信号（如暂停后的残余噪声）不该被拉满，
+                // 那种场景交给上游式的缓慢爬升更稳。
+                let target_sens = (1.2 / raw_peak).min(4_000.0);
+                self.sens = self.sens.max(target_sens);
+            }
+        }
+
         let framerate_mod = 66.0 / self.framerate.max(1.0);
         let gravity_mod = framerate_mod.powf(2.5) * 2.0 / self.noise_reduction.max(0.01);
         let integral_mod = framerate_mod.powf(0.1);
