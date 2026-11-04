@@ -266,6 +266,19 @@ pub enum StatusLevel {
     Error,
 }
 
+/// 状态栏消息的保鲜期（按级别）。
+///
+/// 提示类的命最短——「已加入队列」这种看一眼就没用了；告警与错误给得长，
+/// 用户可能晚几秒才低头看状态栏。
+fn status_ttl(level: StatusLevel) -> std::time::Duration {
+    use std::time::Duration;
+    match level {
+        StatusLevel::Info | StatusLevel::Success => Duration::from_secs(8),
+        StatusLevel::Warning => Duration::from_secs(30),
+        StatusLevel::Error => Duration::from_secs(60),
+    }
+}
+
 // ============================================================================
 // 通用控件状态
 // ============================================================================
@@ -1325,6 +1338,10 @@ pub struct AppState {
     // ---- 状态栏 ----
     pub status: String,
     pub status_level: StatusLevel,
+    /// 当前消息的落款时刻。消息过了 [`status_ttl`] 就在心跳里清掉——
+    /// 「正在解析播放地址：xxx」这类提示一直挂在状态栏上，读的人早不在意了，
+    /// 而新消息把真正重要的告警顶掉之前，它还一直占着位置。
+    pub status_at: Option<std::time::Instant>,
     /// 正在进行的后台任务描述，非空时状态栏显示进度指示。
     pub busy: Option<String>,
     /// 下载进度 `(已下载, 总大小)`。
@@ -1711,6 +1728,7 @@ impl AppState {
             sync_target: None,
             status: "按 / 搜索，或按 2-5 浏览歌单/歌手/排行榜/云端".to_string(),
             status_level: StatusLevel::Info,
+            status_at: None,
             busy: None,
             download_progress: None,
             cache_bytes: 0,
@@ -1863,6 +1881,26 @@ impl AppState {
     pub fn notify(&mut self, level: StatusLevel, message: impl Into<String>) {
         self.status = message.into();
         self.status_level = level;
+        self.status_at = Some(std::time::Instant::now());
+    }
+
+    /// 当前消息是否已经过了保鲜期。
+    pub fn status_expired(&self) -> bool {
+        !self.status.is_empty()
+            && self
+                .status_at
+                .is_some_and(|at| at.elapsed() >= status_ttl(self.status_level))
+    }
+
+    /// 心跳里清掉过期消息，返回是否清了（供渲染脏标记）。
+    pub fn clear_expired_status(&mut self) -> bool {
+        if self.status_expired() {
+            self.status.clear();
+            self.status_at = None;
+            true
+        } else {
+            false
+        }
     }
 
     pub fn info(&mut self, message: impl Into<String>) {

@@ -174,6 +174,15 @@ impl App {
             position_ms
         };
 
+        // **停止态**（引擎里还没装载曲目）的 seek 是空操作：只改乐观位置的话，
+        // 进度条跳过去了、Space 却从 0 开始——停止态下点歌词跳转「怎么点都没反应」
+        // 就是这条。把目标记成续播点，Space 按下去从点击处接着放。
+        if self.state.playback == PlaybackState::Stopped
+            && let Some(song) = self.state.current.as_ref()
+        {
+            self.state.resume = Some((song.hash.clone(), target));
+        }
+
         self.audio.seek_to(target);
         // 乐观更新，让进度条立刻响应；音频线程随后给出真实位置
         self.state.position_ms = target;

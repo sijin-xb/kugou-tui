@@ -204,6 +204,9 @@ pub struct App {
     /// 同一个源失败一次就够了：后面同源的歌直接跳过，不再逐个发必然失败的请求。
     failed_sources: Vec<crate::source::SourceKind>,
 
+    /// 上一次拖拽进度条时真正发给音频线程的 seek 时刻（节流用）。
+    drag_seek_at: Option<Instant>,
+
     /// 画面是否脏（自上次渲染以来状态有没有变）。
     ///
     /// 挂着听歌的大部分时间界面是静止的，静止时按 5fps 重画一模一样的整帧
@@ -330,6 +333,7 @@ impl App {
             pending_stream_retry: None,
             auto_skip_count: 0,
             failed_sources: Vec::new(),
+            drag_seek_at: None,
             dirty: true,
             #[cfg(unix)]
             mpris,
@@ -752,6 +756,7 @@ impl App {
             pending_stream_retry: None,
             auto_skip_count: 0,
             failed_sources: Vec::new(),
+            drag_seek_at: None,
             dirty: true,
             #[cfg(unix)]
             mpris: None,

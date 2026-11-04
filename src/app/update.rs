@@ -29,9 +29,10 @@
 //! 回去找那个「按 Tab 分派」的函数。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::MouseEvent;
+use ratatui::layout::Rect;
 
 use crate::api::catalog::PAGE_LIMIT;
 use crate::api::model::{Artist, Playlist, RankBoard, Song, format_duration_ms};
@@ -59,6 +60,24 @@ const PROGRESS_STEP_BYTES: u64 = 256 * 1024;
 
 /// 每帧最多处理的事件数，防止事件洪水导致画面完全停止刷新。
 const MAX_EVENTS_PER_FRAME: usize = 64;
+
+/// 拖动进度条期间两次真正 seek 的最小间隔。
+///
+/// 每次 seek 都要让解码器重置定位；鼠标移动事件 60Hz 起步，不节流就是每秒
+/// 几十次重置，声音断续。间隔内界面照常跟手（乐观位置），间隔外的最终位置
+/// 在松开时落实（见 `left_up_at`）。
+const DRAG_SEEK_INTERVAL: Duration = Duration::from_millis(200);
+
+/// 距上次拖拽 seek 是否已经到了下一次的间隔。
+///
+/// 抽成自由函数是为了能直接测——节流窗口的边界（恰好等于间隔）算「到了」，
+/// 这种差一帧的语义靠肉眼盯不出来。
+fn drag_seek_due(last: Option<Instant>, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some(at) => now.duration_since(at) >= DRAG_SEEK_INTERVAL,
+    }
+}
 
 /// 每隔多少拍测量一次缓存占用。
 ///
@@ -182,7 +201,9 @@ impl App {
                 self.state.playback,
                 self.state.busy.is_some(),
                 self.state.lyric.is_transitioning(),
-            );
+            )
+            // 过期的状态栏消息在这次心跳里会被清掉，画面得跟着刷一次
+            || self.state.status_expired();
         match event {
             Event::Key(key) => {
                 let mode = if self.state.is_editing() {
@@ -270,14 +291,15 @@ impl App {
             zone.index_at(mouse.row),
             ratatui::crossterm::event::MouseButton::Left,
             (mouse.column, mouse.row),
+            zone.rect,
         );
         self.click_at(mouse);
     }
 
     /// 左键拖拽：按下时命中的目标决定拖动什么。
     ///
-    /// 只处理三类可以「连续跟随」的东西：进度条、歌词行、列表行。别的一律忽略
-    /// ——把侧边栏标签做成可拖拽没有意义，反而会在斜着拖的时候误切换标签页。
+    /// 只处理四类可以「连续跟随」的东西：进度条、音量、歌词行、列表行。别的一律
+    /// 忽略——把侧边栏标签做成可拖拽没有意义，反而会在斜着拖的时候误切换标签页。
     fn left_drag_at(&mut self, mouse: &MouseEvent) {
         if self.state.interaction.press.is_none() {
             return;
@@ -288,36 +310,47 @@ impl App {
             return;
         };
         match press.target {
-            HitTarget::Progress => self.drag_progress(mouse),
+            HitTarget::Progress => self.drag_progress(mouse, press.rect),
             // 歌词行拖动等同「拖到哪句就从哪句开始放」——与单击同一套换算，
-            // 但会在每一格都 seek 一次。节流交给音频线程的 seek 去重。
+            // 但只在换到新的一行时才 seek 一次。
             HitTarget::LyricLine => self.drag_lyric(mouse),
             HitTarget::Songs | HitTarget::Entries | HitTarget::Queue => self.drag_list_row(mouse),
-            HitTarget::Volume => {
-                if let Some(zone) = self.state.hit_test(mouse.column, mouse.row) {
-                    self.drag_volume(zone, mouse);
-                }
-            }
+            // 音量区只有几列宽，按住后稍微拖出去就离开它了——以**按下时的
+            // 区域**为基准连续跟随，而不是每次重新命中。
+            HitTarget::Volume => self.drag_volume_from(press.rect, mouse),
             _ => {}
         }
     }
 
-    /// 左键松开：清掉 press。当前所有动作都在拖动过程中即时生效，
-    /// 松开不需要再结算什么——留着这个钩子是为了将来加「拖完才提交」的控件。
+    /// 左键松开：清掉 press，并给「拖完才落实」的控件收尾。
+    ///
+    /// 进度条拖拽期间的 seek 是节流的（见 [`Self::drag_progress`]），最后一次
+    /// 移动的位置可能还没真正发给音频线程——松开时把乐观位置落实一次，
+    /// 进度条才不会在松手后弹回节流前的旧位置。
     fn left_up_at(&mut self, _mouse: &MouseEvent) {
-        self.state.interaction.end_press();
+        if let Some(press) = self.state.interaction.end_press()
+            && press.target == HitTarget::Progress
+            && press.dragging
+        {
+            // 走 seek_to 而不是直接发音频命令：停止态下它会把目标记成续播点，
+            // 位置钳制也和其它 seek 路径保持一致。
+            self.seek_to(self.state.position_ms);
+            self.drag_seek_at = None;
+        }
     }
 
-    /// 点 / 拖音量条：按 x 比例设置音量。
+    /// 点 / 拖音量条：按 `bar` 区域的 x 比例设置音量。
     ///
     /// 拖动时**不弹状态栏消息**——每挪一格刷一条「音量 73%」会闪成一片。
     /// 音量百分比就画在同一个控件上，看得到。
-    fn drag_volume(&mut self, zone: HitZone, mouse: &MouseEvent) {
-        if zone.rect.width == 0 {
+    ///
+    /// `bar` 是**按下时**命中的区域：拖出它之后仍按同一套比例换算（拖到左侧
+    /// 之外 = 0，右侧之外 = 1），而不是命中失败就卡住。
+    fn drag_volume_from(&mut self, bar: Rect, mouse: &MouseEvent) {
+        if bar.width == 0 {
             return;
         }
-        let ratio =
-            f64::from(mouse.column.saturating_sub(zone.rect.left())) / f64::from(zone.rect.width);
+        let ratio = f64::from(mouse.column.saturating_sub(bar.left())) / f64::from(bar.width);
         let volume = (ratio as f32).clamp(0.0, 1.0);
         // 从静音里调音量 = 解除静音，与键盘 `+`/`-` 的行为一致
         self.state.volume_before_mute = None;
@@ -325,18 +358,36 @@ impl App {
         self.audio.set_volume(volume);
     }
 
-    /// 拖动进度条：按 x 比例连续跳转。
-    fn drag_progress(&mut self, mouse: &MouseEvent) {
-        // 拖出进度条范围时直接停下，不做边缘吸附：进度条只占播放条中间那一段，
-        // 按边缘算会让「拖到屏幕最右边」变成跳到 100%，而用户很可能只是想
-        // 把指针移出这个控件。
-        let Some(zone) = self.state.hit_test(mouse.column, mouse.row) else {
-            return;
-        };
-        if zone.target != HitTarget::Progress {
+    /// 拖动进度条：以**按下时**命中的进度条区域为基准，按 x 比例连续跳转。
+    ///
+    /// 基准必须是按下时的区域而不是「指针现在命中了什么」：进度条只有 1 行高，
+    /// 按住后鼠标纵移一格就离开了它，重新 `hit_test` 只会命中失败——表现就是
+    /// 「拖一下就卡住，动不了」。
+    ///
+    /// 两层节流：
+    ///
+    /// * **界面上**每次移动都乐观更新 `position_ms`，进度条跟手；
+    /// * **音频上**seek 按 [`DRAG_SEEK_INTERVAL`] 节流——每次 seek 都要重置
+    ///   解码器，鼠标 60Hz 移动下不节流就是每秒几十次重置，声音断续成锯齿。
+    ///   松开时（[`Self::left_up_at`]）把最后的位置落实一次。
+    fn drag_progress(&mut self, mouse: &MouseEvent, bar: Rect) {
+        let duration_ms = self.state.duration_ms;
+        if duration_ms == 0 || bar.width == 0 {
             return;
         }
-        self.seek_progress_to(zone, mouse);
+        // 按比例换算，拖出区域两侧时钳回 0 / 末尾（进度条语义就是「拖到头」）
+        let ratio = f64::from(mouse.column.saturating_sub(bar.left())) / f64::from(bar.width);
+        let target = ((ratio.clamp(0.0, 1.0) * duration_ms as f64) as u64)
+            .min(duration_ms.saturating_sub(1));
+
+        // 界面无条件跟手
+        self.state.position_ms = target;
+        // 音频按节流间隔落实
+        let now = Instant::now();
+        if drag_seek_due(self.drag_seek_at, now) {
+            self.audio.seek_to(target);
+            self.drag_seek_at = Some(now);
+        }
     }
 
     /// 拖动歌词：与点击歌词同一套换算，但只在换行时才真的 seek。
@@ -426,7 +477,7 @@ impl App {
             HitTarget::PlayPause => self.handle_action(Action::PlayPause),
             HitTarget::NextTrack => self.handle_action(Action::Next),
             HitTarget::PlayMode => self.handle_action(Action::CyclePlaybackMode),
-            HitTarget::Volume => self.drag_volume(zone, mouse),
+            HitTarget::Volume => self.drag_volume_from(zone.rect, mouse),
             HitTarget::SleepTimer => self.cycle_sleep_timer(),
         }
     }
@@ -546,6 +597,9 @@ impl App {
         self.audio.seek_to(target);
         // 乐观更新，让进度条立刻响应
         self.state.position_ms = target;
+        // 这次 seek 也占用拖拽节流窗口：按下即 seek，随后的第一次拖拽若落在
+        // 窗口内就不该连发两次。
+        self.drag_seek_at = Some(Instant::now());
     }
 
     /// 点击歌词行：跳到这一句的起始时间。
@@ -3310,6 +3364,8 @@ impl App {
     fn tick(&mut self) {
         self.state.ticks = self.state.ticks.wrapping_add(1);
         self.state.playback = self.audio.state();
+        // 状态栏消息过保鲜期就清掉（脏标记在 handle_event 里已按到期时间置位）
+        self.state.clear_expired_status();
 
         // 定期落盘会话。只在正常退出时存是不够的——关机、断电、进程被杀时
         // `shutdown()` 根本不会执行，上次进度就丢了（用户实测「重启就没了」）。
@@ -3886,6 +3942,326 @@ mod tests {
         assert_eq!(one, vec![1]);
     }
 
+    /// 拖动进度条时指针**离开那 1 行高的条**也要继续跟随。
+    ///
+    /// 此前每次 Drag 事件都重新 `hit_test` 并要求仍命中进度条——条只有 1 行高，
+    /// 按住后纵移一格就离开它，命中失败、拖拽冻结，用户看到的就是「拖不动」。
+    #[test]
+    fn dragging_the_progress_bar_follows_even_off_the_bar() {
+        let mut app = App::for_test();
+        app.state.duration_ms = 200_000;
+        app.state.current = Some(crate::api::model::Song::default());
+        let area = ratatui::layout::Rect::new(2, 30, 100, 1);
+        app.state.begin_frame();
+        app.state.hit_map.insert_flat(area, HitTarget::Progress);
+
+        // 按在 x=12（10%）
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            12,
+            30,
+        )));
+        assert_eq!(app.state.position_ms, 20_000);
+
+        // 往右下拖：离开了进度条所在的那一行，x 落在 50%
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            52,
+            34,
+        )));
+        assert_eq!(
+            app.state.position_ms, 100_000,
+            "离开条后应仍按按下时的条形区域换算"
+        );
+
+        // 拖出左边缘：钳到 0；拖出右边缘：钳到末尾
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            0,
+            34,
+        )));
+        assert_eq!(app.state.position_ms, 0, "拖出左缘应钳到 0");
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            200,
+            34,
+        )));
+        assert_eq!(app.state.position_ms, 199_999, "拖出右缘应钳到最后一毫秒");
+    }
+
+    /// 拖动进度条期间音频 seek 按间隔节流，松开时把最后位置落实。
+    ///
+    /// 每次 seek 都要重置解码器；鼠标 60Hz 移动下不节流就是每秒几十次重置，
+    /// 声音断续。界面上位置照常跟手（乐观更新），音频只按间隔落实。
+    #[test]
+    fn progress_drag_seeks_are_throttled_and_finalized_on_release() {
+        let mut app = App::for_test();
+        app.state.duration_ms = 200_000;
+        app.state.current = Some(crate::api::model::Song::default());
+        let area = ratatui::layout::Rect::new(2, 30, 100, 1);
+        app.state.begin_frame();
+        app.state.hit_map.insert_flat(area, HitTarget::Progress);
+
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            12,
+            30,
+        )));
+        // 第一次拖拽：没有上次记录，立即 seek
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            52,
+            30,
+        )));
+        assert_eq!(app.state.position_ms, 100_000);
+        let first_seek_at = app.drag_seek_at.expect("首次拖拽应当记录 seek 时刻");
+
+        // 间隔内的第二次移动：位置乐观更新，但不重复 seek（时刻不变）
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            62,
+            30,
+        )));
+        assert_eq!(app.state.position_ms, 120_000, "界面照常跟手");
+        assert_eq!(
+            app.drag_seek_at,
+            Some(first_seek_at),
+            "节流窗口内不该再次 seek"
+        );
+
+        // 松开：把乐观位置落实一次
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            62,
+            30,
+        )));
+        assert_eq!(app.drag_seek_at, None, "收尾后清空节流记录");
+        assert!(app.state.interaction.press.is_none());
+    }
+
+    /// 拖动音量时指针离开那几列宽的音量区也要继续跟随（以按下时的区域为基准）。
+    #[test]
+    fn dragging_volume_follows_off_the_zone() {
+        let mut app = App::for_test();
+        let area = ratatui::layout::Rect::new(90, 30, 8, 1);
+        app.state.begin_frame();
+        app.state.hit_map.insert_flat(area, HitTarget::Volume);
+
+        // 按在音量区最左（0%），拖到右下方（离开区域）
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            90,
+            30,
+        )));
+        assert_eq!(app.state.volume, 0.0);
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            98,
+            34,
+        )));
+        assert_eq!(app.state.volume, 1.0, "离开音量区后应仍按按下时的区域换算");
+    }
+
+    /// 点歌词的第 N 行，就该跳到第 N 句的起点——这是行号映射的端到端钉子。
+    ///
+    /// 歌词面板把当前行垂直居中，命中区的行号换算（滚动偏移 + 命中区上沿）
+    /// 一旦错位，点的就是别的句子。渲染一帧后逐行扫描，点中「第 20 行」，
+    /// 断言位置正好落在它的起始时间上。
+    #[test]
+    fn clicking_a_lyric_row_seeks_to_that_line() {
+        let mut app = App::for_test();
+        app.state.tab = Tab::Home;
+        app.state.playback = PlaybackState::Playing;
+        app.state.current = Some(crate::api::model::Song {
+            name: "歌".to_string(),
+            hash: "h".to_string(),
+            duration_ms: 300_000,
+            ..Default::default()
+        });
+        app.state.duration_ms = 300_000;
+        app.state.position_ms = 100_000;
+        app.state.lyric.hash = Some("h".to_string());
+        app.state.lyric.load.succeed();
+        app.state.lyric.lyric = crate::api::model::Lyric {
+            text: String::new(),
+            lines: (0..30)
+                .map(|index| crate::api::model::LyricLine {
+                    time_ms: index as u64 * 5_000,
+                    text: format!("第{index}行"),
+                    ..Default::default()
+                })
+                .collect(),
+        };
+        app.state.lyric.active_line = Some(20);
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))
+            .expect("建测试终端");
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app.state))
+            .expect("渲染整帧");
+
+        // 在歌词面板里找到「第 20 行」所在的屏幕行
+        let mut target_row = None;
+        for row in 0..30u16 {
+            let Some(zone) = app.state.hit_test(80, row) else {
+                continue;
+            };
+            if zone.target != HitTarget::LyricLine {
+                continue;
+            }
+            let Some(display) = zone.index_at(row) else {
+                continue;
+            };
+            if app
+                .state
+                .lyric
+                .display_cache
+                .get(display)
+                .is_some_and(|(_, _, text)| text == "第20行")
+            {
+                target_row = Some(row);
+                break;
+            }
+        }
+        let row = target_row.expect("「第20行」应当显示在屏幕上并可点击");
+
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            80,
+            row,
+        )));
+        assert_eq!(
+            app.state.position_ms, 100_000,
+            "点「第20行」应跳到它的起始时间（20 × 5s）"
+        );
+    }
+
+    /// 停止态下点歌词：引擎里没有曲目，seek 本来是空操作——位置要乐观更新，
+    /// 并且把目标记成续播点，按 Space 才能从点击处接着放。
+    #[test]
+    fn clicking_a_lyric_row_while_stopped_arms_the_resume_point() {
+        let mut app = App::for_test();
+        app.state.playback = PlaybackState::Stopped;
+        app.state.current = Some(crate::api::model::Song {
+            name: "歌".to_string(),
+            hash: "h".to_string(),
+            duration_ms: 300_000,
+            ..Default::default()
+        });
+        app.state.duration_ms = 300_000;
+        app.state.lyric.hash = Some("h".to_string());
+        app.state.lyric.load.succeed();
+        app.state.lyric.lyric = crate::api::model::Lyric {
+            text: String::new(),
+            lines: (0..10)
+                .map(|index| crate::api::model::LyricLine {
+                    time_ms: index as u64 * 5_000,
+                    text: format!("第{index}行"),
+                    ..Default::default()
+                })
+                .collect(),
+        };
+
+        // 命中区与显示映射都由渲染层回填，所以要真实渲染一帧再点
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 24)).expect("建测试终端");
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app.state))
+            .expect("渲染整帧");
+
+        // 找到「第 4 行」所在的屏幕行（点击坐标必须落在真实渲染的命中区里）
+        let mut target_row = None;
+        for row in 0..24u16 {
+            let Some(zone) = app.state.hit_test(40, row) else {
+                continue;
+            };
+            if zone.target != HitTarget::LyricLine {
+                continue;
+            }
+            let Some(display) = zone.index_at(row) else {
+                continue;
+            };
+            if app
+                .state
+                .lyric
+                .display_cache
+                .get(display)
+                .is_some_and(|(_, _, text)| text == "第4行")
+            {
+                target_row = Some(row);
+                break;
+            }
+        }
+        let row = target_row.expect("「第4行」应当显示在屏幕上并可点击");
+
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            40,
+            row,
+        )));
+        assert_eq!(app.state.position_ms, 20_000, "位置乐观更新");
+        assert_eq!(
+            app.state.resume,
+            Some(("h".to_string(), 20_000)),
+            "停止态的 seek 要记成续播点，Space 才能从点击处接着放"
+        );
+    }
+
+    /// 节流窗口的边界语义：恰好等于间隔算「到了」，没有上次记录立即算到。
+    #[test]
+    fn drag_seek_throttle_boundary() {
+        let now = Instant::now();
+        assert!(drag_seek_due(None, now), "没有上次记录应立即 seek");
+        assert!(!drag_seek_due(Some(now), now), "窗口内不该 seek");
+        assert!(
+            drag_seek_due(Some(now - DRAG_SEEK_INTERVAL), now),
+            "恰好等于间隔就算到了"
+        );
+        assert!(!drag_seek_due(
+            Some(now - DRAG_SEEK_INTERVAL + Duration::from_millis(1)),
+            now
+        ));
+    }
+
+    /// 状态栏消息按级别过期：提示 8 秒、告警 30 秒、错误 60 秒。
+    #[test]
+    fn status_messages_expire_by_level() {
+        let mut state = crate::app::AppState::new(crate::config::Config::default());
+        state.info("正在解析播放地址：xxx");
+        assert!(!state.status_expired(), "刚发的消息不过期");
+        state.status_at = Some(Instant::now() - Duration::from_secs(9));
+        assert!(state.status_expired(), "info 8 秒后过期");
+        assert!(state.clear_expired_status(), "过期消息被清掉");
+        assert!(state.status.is_empty());
+        assert!(!state.status_expired());
+
+        // 告警与错误给得长：9 秒都还在保鲜期内
+        state.warn("缓存清理失败");
+        state.status_at = Some(Instant::now() - Duration::from_secs(9));
+        assert!(!state.status_expired(), "warn 30 秒内不过期");
+        state.error("下载失败");
+        state.status_at = Some(Instant::now() - Duration::from_secs(9));
+        assert!(!state.status_expired(), "error 60 秒内不过期");
+    }
+
+    /// 清过期消息的那一拍要触发重绘；静止之后恢复不重绘。
+    #[test]
+    fn expiring_the_status_marks_the_frame_dirty_once() {
+        let mut app = App::for_test();
+        app.state.info("hello");
+        app.handle_event(Event::Tick);
+        assert!(!app.dirty, "静止且未过期的心跳不重绘");
+
+        app.state.status_at = Some(Instant::now() - Duration::from_secs(9));
+        app.handle_event(Event::Tick);
+        assert!(app.state.status.is_empty(), "过期消息被清掉");
+        assert!(app.dirty, "清消息的那一拍要重绘，不然屏上还挂着旧字");
+
+        app.dirty = false;
+        app.handle_event(Event::Tick);
+        assert!(!app.dirty, "清完就恢复静止");
+    }
+
     /// 指针移动要更新 hover，且松开鼠标后 hover 仍然保留（终端不上报离开）。
     #[test]
     fn pointer_movement_updates_hover() {
@@ -3956,7 +4332,13 @@ mod tests {
         use crate::app::interaction::Interaction;
 
         let mut interaction = Interaction::default();
-        interaction.begin_press(HitTarget::Progress, None, MouseButton::Left, (10, 5));
+        interaction.begin_press(
+            HitTarget::Progress,
+            None,
+            MouseButton::Left,
+            (10, 5),
+            ratatui::layout::Rect::new(0, 5, 100, 1),
+        );
 
         assert!(!interaction.drag_to((11, 5)), "一格是抖动，不算拖");
         assert!(interaction.drag_to((12, 5)), "两格才算拖");

@@ -13,6 +13,7 @@
 //! 「按住进度条拖到一半又拖回来」这种状态。
 
 use ratatui::crossterm::event::MouseButton;
+use ratatui::layout::Rect;
 
 use crate::app::state::HitTarget;
 
@@ -25,6 +26,12 @@ pub struct Press {
     pub button: MouseButton,
     /// 按下时的屏幕坐标，拖拽判定要靠它算位移。
     pub origin: (u16, u16),
+    /// 按下时命中的区域。
+    ///
+    /// 连续跟随的控件（进度条、音量）拖拽期间以它为基准——进度条只有 1 行高，
+    /// 按住后鼠标纵移一格就离开了它，重新 `hit_test` 只会命中失败、拖拽冻结。
+    /// 列表行的拖拽不走这里：它们要的就是「指针现在落在哪一行」。
+    pub rect: Rect,
     /// 指针是否已经离开过原点足够远（超过 `DRAG_THRESHOLD`）。
     ///
     /// 单纯按住不动再松开是「点击」，按住移动过才是「拖拽」——两者的结算
@@ -62,6 +69,7 @@ impl Interaction {
         index: Option<usize>,
         button: MouseButton,
         origin: (u16, u16),
+        rect: Rect,
     ) {
         if let Some(existing) = self.press
             && existing.target == target
@@ -75,6 +83,7 @@ impl Interaction {
             index,
             button,
             origin,
+            rect,
             dragging: false,
         });
     }
@@ -127,7 +136,13 @@ mod tests {
     #[test]
     fn a_press_starts_undragged_and_crosses_the_threshold_once() {
         let mut interaction = Interaction::default();
-        interaction.begin_press(HitTarget::Progress, None, MouseButton::Left, (10, 5));
+        interaction.begin_press(
+            HitTarget::Progress,
+            None,
+            MouseButton::Left,
+            (10, 5),
+            Rect::new(0, 5, 100, 1),
+        );
 
         assert!(!interaction.drag_to((11, 5)), "同一格不该算拖拽");
         assert!(interaction.drag_to((12, 5)), "跨过阈值应当返回 true");
@@ -141,9 +156,21 @@ mod tests {
     #[test]
     fn a_repeat_press_on_the_same_target_keeps_the_original_origin() {
         let mut interaction = Interaction::default();
-        interaction.begin_press(HitTarget::Progress, None, MouseButton::Left, (10, 5));
+        interaction.begin_press(
+            HitTarget::Progress,
+            None,
+            MouseButton::Left,
+            (10, 5),
+            Rect::new(0, 5, 100, 1),
+        );
         // 终端重复上报同一格的按下：不能把原点改成当前位置
-        interaction.begin_press(HitTarget::Progress, None, MouseButton::Left, (14, 5));
+        interaction.begin_press(
+            HitTarget::Progress,
+            None,
+            MouseButton::Left,
+            (14, 5),
+            Rect::new(0, 5, 100, 1),
+        );
 
         assert_eq!(interaction.press.unwrap().origin, (10, 5));
     }
@@ -151,8 +178,20 @@ mod tests {
     #[test]
     fn pressing_a_different_target_replaces_the_press() {
         let mut interaction = Interaction::default();
-        interaction.begin_press(HitTarget::Songs, Some(3), MouseButton::Left, (10, 5));
-        interaction.begin_press(HitTarget::Progress, None, MouseButton::Left, (20, 5));
+        interaction.begin_press(
+            HitTarget::Songs,
+            Some(3),
+            MouseButton::Left,
+            (10, 5),
+            Rect::new(0, 5, 40, 8),
+        );
+        interaction.begin_press(
+            HitTarget::Progress,
+            None,
+            MouseButton::Left,
+            (20, 5),
+            Rect::new(0, 5, 100, 1),
+        );
 
         let press = interaction.press.unwrap();
         assert_eq!(press.target, HitTarget::Progress);
@@ -162,7 +201,13 @@ mod tests {
     #[test]
     fn releasing_clears_the_press() {
         let mut interaction = Interaction::default();
-        interaction.begin_press(HitTarget::Queue, Some(2), MouseButton::Right, (4, 4));
+        interaction.begin_press(
+            HitTarget::Queue,
+            Some(2),
+            MouseButton::Right,
+            (4, 4),
+            Rect::new(0, 4, 40, 8),
+        );
 
         let press = interaction.end_press().expect("应当拿到 press");
         assert_eq!(press.target, HitTarget::Queue);
