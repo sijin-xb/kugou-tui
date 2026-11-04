@@ -155,6 +155,16 @@ pub enum Action {
     LowerSourcePriority,
     /// 搜索页：循环切换搜索类型（单曲 / 歌手 / 歌单）。
     CycleSearchKind,
+    /// 可视化页局部键：打开 cava 调参面板。
+    ///
+    /// 不进 `resolve_normal`，也不在 CHEATSHEET / REBINDABLE 里——`e`/`v`/`V`/`E`
+    /// 在全局键表上已被占用（切音源 / 领 VIP / 设默认音源），而纯函数 `resolve`
+    /// 看不到当前标签页。这族动作由 `App::handle_event` 在可视化页的浏览态下
+    /// 直接按原始按键注入，优先级高于全局键表；已有弹窗仍由 `handle_action`
+    /// 的模态分派吞掉，不会误触。
+    OpenCavaSettings,
+    /// 可视化页局部键：柱状 / 瀑布切换。同上，由事件层注入。
+    ToggleVisualizerMode,
     /// 按下了数字 1-9。语义由 App 按当前焦点决定：
     /// 侧边栏 → 切标签页。数字键只做这一件事，不会去选中列表项。
     Digit(u8),
@@ -551,6 +561,27 @@ pub fn resolve(key: KeyEvent, mode: KeyMode) -> Action {
     }
 }
 
+/// 可视化页的页面局部键：`e`/`E` 调 cava 参数，`v`/`V` 切柱状/瀑布。
+///
+/// 这四个键在全局键表上已被占用（`v` 切音源、`V` 领 VIP、`E` 设默认音源），
+/// 而 [`resolve`] 是纯函数、看不到当前标签页，所以这一层由
+/// `App::handle_event` 在可视化页的浏览态下**优先**调用——页面局部语义盖过
+/// 全局键位，其余按键原样落回 [`resolve`]。带 Ctrl/Alt/Super 的组合不拦，
+/// 留给全局组合键。
+pub fn resolve_visualizer_local(key: KeyEvent) -> Option<Action> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('e' | 'E') => Some(Action::OpenCavaSettings),
+        KeyCode::Char('v' | 'V') => Some(Action::ToggleVisualizerMode),
+        _ => None,
+    }
+}
+
 /// 输入态键表：文本编辑 + 提交/取消 + 上下移动列表。
 fn resolve_text_input(key: KeyEvent) -> Action {
     match key.code {
@@ -939,6 +970,34 @@ mod tests {
             unbound.is_empty(),
             "帮助面板里这些键其实没绑定：{}",
             unbound.join("、")
+        );
+    }
+
+    /// 可视化页局部键：四个大小写形态都要认，组合键不拦。
+    ///
+    /// 有的终端报大写字母不带 SHIFT 修饰，所以 `e`/`E`/`v`/`V` 四种字形各自
+    /// 独立命中。Ctrl/Alt/Super 是全局组合键的地盘，页面局部键不许抢。
+    #[test]
+    fn visualizer_local_keys_cover_all_case_variants_but_not_ctrl() {
+        for character in ['e', 'E', 'v', 'V'] {
+            for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+                let action =
+                    resolve_visualizer_local(KeyEvent::new(KeyCode::Char(character), modifiers));
+                assert!(
+                    action.is_some(),
+                    "{character}（{modifiers:?}）应当是可视化页局部键"
+                );
+            }
+        }
+        assert_eq!(
+            resolve_visualizer_local(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)),
+            None,
+            "Ctrl 组合不归页面局部键管"
+        );
+        assert_eq!(
+            resolve_visualizer_local(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
+            None,
+            "无关按键原样落回全局键表"
         );
     }
 

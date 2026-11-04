@@ -70,26 +70,31 @@ impl SampleWindow {
         self.cursor.load(Ordering::Relaxed)
     }
 
-    /// 取出 `cursor - since` 个新样本（最多 `max` 个，超出时只保留最新的 `max` 个）。
+    /// 取出 `cursor - since` 个新样本（最多 `max` 个，超出时只保留最新的 `max` 个），
+    /// 写进调用方的缓冲。
     ///
-    /// 返回空表示自 `since` 以来没有新样本（暂停 / 缓冲中），调用方应当跳过这一帧
-    /// 而不是喂空数据——喂空会让 cava 的帧率估算与平滑系数跑偏。
-    pub fn since(&self, since: usize, max: usize) -> Vec<f32> {
+    /// 缓冲被清空后写入；返回空表示自 `since` 以来没有新样本（暂停 / 缓冲中），
+    /// 调用方应当跳过这一帧而不是喂空数据——喂空会让 cava 的帧率估算与
+    /// 平滑系数跑偏。
+    ///
+    /// 采样窗是热路径：30fps 下每帧取一次增量。写入前按本次需要的量
+    /// `reserve`，容量跨帧保留，稳态下不再碰堆。
+    pub fn since_into(&self, since: usize, max: usize, out: &mut Vec<f32>) {
+        out.clear();
         let cursor = self.cursor.load(Ordering::Relaxed);
         let available = cursor.saturating_sub(since).min(WINDOW_SIZE);
         if available == 0 || max == 0 {
-            return Vec::new();
+            return;
         }
         let count = available.min(max);
         // 只取最新的 count 个：环里更旧的那些已经被后续推进覆盖过位置，
         // 继续往里读会拿到不连续的数据。
         let start = cursor - count;
-        (start..cursor)
-            .map(|position| {
-                let index = position % WINDOW_SIZE;
-                f32::from_bits(self.samples[index].load(Ordering::Relaxed))
-            })
-            .collect()
+        out.reserve(count);
+        out.extend((start..cursor).map(|position| {
+            let index = position % WINDOW_SIZE;
+            f32::from_bits(self.samples[index].load(Ordering::Relaxed))
+        }));
     }
 
     /// 清零。停止播放时调用，否则会留着上首歌的波形不动。
@@ -155,14 +160,14 @@ impl AudioLevels {
         self.sample_rate.load(Ordering::Relaxed)
     }
 
-    /// 采样窗的写入游标，配合 [`AudioLevels::samples_since`] 取增量。
+    /// 采样窗的写入游标，配合 [`AudioLevels::samples_since_into`] 取增量。
     pub fn sample_cursor(&self) -> usize {
         self.window.cursor()
     }
 
-    /// 自 `since` 以来新到的单声道采样（最多 `max` 个）。
-    pub fn samples_since(&self, since: usize, max: usize) -> Vec<f32> {
-        self.window.since(since, max)
+    /// 自 `since` 以来新到的单声道采样（最多 `max` 个），写进调用方的缓冲。
+    pub fn samples_since_into(&self, since: usize, max: usize, out: &mut Vec<f32>) {
+        self.window.since_into(since, max, out);
     }
 
     /// 按时间顺序取出全部格子（最旧 → 最新），归一化到 0.0 ~ 1.0。

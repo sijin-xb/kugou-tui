@@ -800,6 +800,46 @@ pub(crate) fn config_root() -> PathBuf {
         .join(APP_DIR_NAME)
 }
 
+/// 仅供测试：把配置根目录临时改指到指定目录，drop 时恢复原值。
+///
+/// `save()` / `load()` 都认 `KUGOU_TUI_CONFIG_DIR`，而那是**进程级**环境变量；
+/// 测试并行跑在同一个进程里，两个测试同时改它就会把对方的配置写到别的目录。
+/// 这里用一把进程级锁串行化：拿到 Guard 的测试独占配置路径，其它要动配置的
+/// 测试（包括 [`Config::load`] 的读路径）在锁上排队。
+#[cfg(test)]
+pub(crate) mod config_dir_guard {
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
+    static LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) struct Guard {
+        _lock: MutexGuard<'static, ()>,
+        previous: Option<OsString>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => unsafe { std::env::set_var("KUGOU_TUI_CONFIG_DIR", value) },
+                None => unsafe { std::env::remove_var("KUGOU_TUI_CONFIG_DIR") },
+            }
+        }
+    }
+
+    pub(crate) fn override_config_dir(dir: &Path) -> Guard {
+        let lock = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os("KUGOU_TUI_CONFIG_DIR");
+        // SAFETY: 单测进程内临时改写；Guard 的 Drop 保证恢复。
+        unsafe { std::env::set_var("KUGOU_TUI_CONFIG_DIR", dir) };
+        Guard {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
 /// 把 `~` 展开成用户主目录，供配置文件里手写路径时使用。
 ///
 /// 两种分隔符都吃：Windows 上用户很自然会写成 `~\Music`。
@@ -860,8 +900,8 @@ mod tests {
     /// 所以只写顶层而不回填进档案，重启后登录态就没了（同理 dfid 要重新探测）。
     ///
     /// 这里跑真实落盘 + 真实 `load()`。为了不碰用户配置，先把
-    /// `KUGOU_TUI_CONFIG_DIR` 指到临时目录，结束后恢复原值——`catch_unwind`
-    /// 保证失败时也会恢复。
+    /// `KUGOU_TUI_CONFIG_DIR` 指到临时目录（经 `config_dir_guard` 独占，
+    /// 与其它动配置路径的测试串行），结束后恢复原值并清掉临时目录。
     ///
     /// **刻意不用 `XDG_CONFIG_HOME`**：那是 XDG 规范，只有 Unix 认；
     /// Windows 上 `dirs` 走的是 `SHGetKnownFolderPath`，那个环境变量对它无效，
@@ -871,10 +911,7 @@ mod tests {
         let temp = std::env::temp_dir().join(format!("kugou-tui-cfgtest-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).expect("建临时配置目录");
-
-        // SAFETY: 单测进程内临时改写并恢复；其它测试不读配置路径，无交叉影响。
-        let previous = std::env::var_os("KUGOU_TUI_CONFIG_DIR");
-        unsafe { std::env::set_var("KUGOU_TUI_CONFIG_DIR", &temp) };
+        let _guard = crate::config::config_dir_guard::override_config_dir(&temp);
 
         let outcome = std::panic::catch_unwind(|| {
             let mut config = Config::default();
@@ -903,10 +940,6 @@ mod tests {
             assert!(restarted.is_logged_in());
         });
 
-        match previous {
-            Some(value) => unsafe { std::env::set_var("KUGOU_TUI_CONFIG_DIR", value) },
-            None => unsafe { std::env::remove_var("KUGOU_TUI_CONFIG_DIR") },
-        }
         let _ = std::fs::remove_dir_all(&temp);
 
         assert!(outcome.is_ok(), "登录态/设备指纹在重启后丢失");

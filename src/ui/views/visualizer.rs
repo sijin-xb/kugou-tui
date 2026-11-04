@@ -48,6 +48,14 @@ const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█
 /// 每格切成 8 个刻度。`height` 行的柱区就是 `height * 8` 个刻度。
 const EIGHTHS: usize = 8;
 
+/// 第 `eighth` 个 1/8 刻度（1..=8）对应的填充块字符。
+///
+/// 迷你频谱只有一行可用，振幅只能编码进字符本身：`▁` 到 `█` 一列比一列实，
+/// 一行也能读出起伏。与柱状图的柱顶收口共用同一组字符，观感一致。
+pub(crate) fn sub_block_glyph(eighth: usize) -> char {
+    BLOCKS[eighth.clamp(1, BLOCKS.len()) - 1]
+}
+
 /// 柱体最多占几列。
 ///
 /// 1 列：这是 cava 的典型观感——柱子细、间隙宽，铺满宽度靠**柱数**而不是
@@ -345,7 +353,7 @@ fn bar_cell(from_bottom: usize, mark: &BarMark, theme: &Theme) -> (char, Style) 
         // 柱顶落在这一格之内：取对应高度的填充块收口
         let partial = mark.filled - lo; // 1..=7
         (
-            BLOCKS[partial - 1],
+            sub_block_glyph(partial),
             bar_style(from_bottom, mark.filled, theme),
         )
     } else if mark.peak_cell == from_bottom {
@@ -378,13 +386,18 @@ fn bar_style(from_bottom: usize, filled: usize, theme: &Theme) -> Style {
 ///
 /// 每列是一根频段，每行是一帧；新帧从底部长出来，旧的往顶上推。强度用
 /// 主题的底槽色到强调色之间的单色渐变表达，安静的格子留空，不画噪点。
-fn render_waterfall(frame: &mut Frame, area: Rect, history: &[Vec<f32>], theme: &Theme) {
+fn render_waterfall(
+    frame: &mut Frame,
+    area: Rect,
+    history: &std::collections::VecDeque<Vec<f32>>,
+    theme: &Theme,
+) {
     let height = area.height as usize;
     let width = area.width as usize;
     if height == 0 || width == 0 || history.is_empty() {
         return;
     }
-    let bands = history[0].len();
+    let bands = history.front().map_or(0, |frame| frame.len());
     if bands == 0 {
         return;
     }
@@ -396,15 +409,15 @@ fn render_waterfall(frame: &mut Frame, area: Rect, history: &[Vec<f32>], theme: 
         return;
     }
 
+    // 历史不足一屏时顶部留空，最旧的一帧往下顺延；新帧永远贴底。
+    let start = history.len().saturating_sub(height);
+    let blank_rows = height - (history.len() - start);
+
     let mut lines = Vec::with_capacity(height);
-    for row in 0..height {
-        // 历史不足一屏时把最旧的留在顶部，新帧贴底；多余的顶部留空。
-        let frame_index = history.len() as isize - height as isize + row as isize;
-        if frame_index < 0 {
-            lines.push(Line::from(Span::raw(" ".repeat(width))));
-            continue;
-        }
-        let levels = &history[frame_index as usize];
+    for _ in 0..blank_rows {
+        lines.push(Line::from(Span::raw(" ".repeat(width))));
+    }
+    for levels in history.iter().skip(start) {
         let mut spans: Vec<Span> = Vec::with_capacity(bars / 4 + 2);
         let mut run = String::with_capacity(width);
         let mut run_style = Style::default();

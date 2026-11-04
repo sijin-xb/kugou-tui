@@ -306,7 +306,6 @@ pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
         return;
     }
 
-    let total = state.lyric.lyric.lines.len();
     let viewport = lyric_area.height as usize;
     let active = state.lyric.active_line;
 
@@ -315,22 +314,33 @@ pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
 
     // 把每一行歌词展平为「原文 + 译文（若有）」的若干个显示单元。
     // 滚动定位按歌词原文行号找显示位置，所以译文不会破坏对齐。
-    let mut display: Vec<(usize, bool, String)> = Vec::with_capacity(total * 2);
-    for (index, line) in state.lyric.lyric.lines.iter().enumerate() {
-        display.push((index, false, line.text.clone()));
-        // 译文与音译**都**显示（各占一行），不再二选一。
-        // 日语歌尤其需要：原文看不懂，译文管理解，罗马音管跟唱，两者用途不同。
-        if let Some(translation) = line.translation.as_deref()
-            && !translation.trim().is_empty()
-        {
-            display.push((index, true, translation.to_string()));
+    //
+    // 结果缓存在 `display_cache`、按内容指纹校验（见 `LyricPane`）：歌词没变就
+    // 直接复用。这函数每帧都要跑（30fps 逐字推进），重建的话每次都得 clone
+    // 全部歌词文本——几百行的歌词就是每秒上万次字符串分配。
+    let cache_key = crate::app::state::lyric_display_cache_key(&state.lyric.lyric);
+    if state.lyric.display_cache_key != cache_key {
+        let mut cache: Vec<(usize, bool, String)> =
+            Vec::with_capacity(state.lyric.lyric.lines.len() * 2);
+        for (index, line) in state.lyric.lyric.lines.iter().enumerate() {
+            cache.push((index, false, line.text.clone()));
+            // 译文与音译**都**显示（各占一行），不再二选一。
+            // 日语歌尤其需要：原文看不懂，译文管理解，罗马音管跟唱，两者用途不同。
+            if let Some(translation) = line.translation.as_deref()
+                && !translation.trim().is_empty()
+            {
+                cache.push((index, true, translation.to_string()));
+            }
+            if let Some(romanization) = line.romanization.as_deref()
+                && !romanization.trim().is_empty()
+            {
+                cache.push((index, true, romanization.to_string()));
+            }
         }
-        if let Some(romanization) = line.romanization.as_deref()
-            && !romanization.trim().is_empty()
-        {
-            display.push((index, true, romanization.to_string()));
-        }
+        state.lyric.display_cache = cache;
+        state.lyric.display_cache_key = cache_key;
     }
+    let display = &state.lyric.display_cache;
 
     let focus_display = display
         .iter()
@@ -367,7 +377,7 @@ pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
     // 稳态走整数距离，既不白算浮点，也保证既有断言的精确相等。
     let transitioning = progress < 1.0;
     let prev_display = if transitioning {
-        prev_line.and_then(|line| display_of(&display, line))
+        prev_line.and_then(|line| display_of(display, line))
     } else {
         None
     };
@@ -864,7 +874,7 @@ fn render_account(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &T
         return;
     }
 
-    let Some(info) = state.user_info.clone() else {
+    let Some(info) = state.user_info.as_ref() else {
         // 三种「没有资料」必须分开说：未登录 / 正在取 / 取失败。
         //
         // 早先只区分了前两种，于是接口挂掉时首页会**永远**停在「加载中…」——

@@ -224,8 +224,9 @@ fn render_main(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
     }
 
     let primary_height = match state.tab {
-        // 搜索框：类型标签 1 行 + 输入 1 行（无上下边框）
-        Tab::Search => 2,
+        // 搜索框：类型标签 1 行 + 输入 1 行，加上上下边框共 4 行。
+        // 这里给 2 会让 render_search_input 因高度不足直接整块不画。
+        Tab::Search => 4,
         // 条目列表占三分之一，但不小于 5 行也不大于 12 行
         _ => (area.height / 3).clamp(5, 12),
     };
@@ -532,6 +533,15 @@ fn render_too_small(frame: &mut Frame, area: Rect) {
 ///
 /// 不占额外高度——用的是布局本来就会留的 1 行 spacing。任何页面播放时都能看到
 /// 音乐在跳，比只看进度条有生命感；可视化页本身已经整屏频谱，这里就不重复画。
+///
+/// 两个观感要点：
+///
+/// * **每一列都画**。频段数（128）通常多于列数，把频段按列聚合（取组内最大值，
+///   鼓点尖峰不被平均掉）。此前按柱状图的 `bar_stride` 跳着画，列数只有宽度
+///   的一半——那行看起来稀稀拉拉，也不随终端宽度伸缩。
+/// * **振幅编码进字符本身**。只有一行可用，靠 `▁▂▃▄▅▆▇█` 八档表示强弱，
+///   而不是「超过阈值画同一个点」。两层平滑之后大部分电平落在 0.1~0.4，
+///   再用 `γ < 1` 抬高中低段，不然安静段落整行都贴在最低档，看不出起伏。
 fn render_mini_spectrum(frame: &mut Frame, player_area: Rect, state: &AppState, theme: &Theme) {
     if state.tab == Tab::Visualizer || player_area.y == 0 {
         return;
@@ -546,36 +556,55 @@ fn render_mini_spectrum(frame: &mut Frame, player_area: Rect, state: &AppState, 
         return;
     }
 
-    // 把 128 个频段重采样到当前列数，每列一个字符
     let levels = &state.smooth_spectrum;
-    let stride = crate::ui::views::visualizer::bar_stride(width, levels.len());
-    let bars = (width / stride).min(levels.len());
-    if bars == 0 {
-        return;
-    }
+    let bands = levels.len();
 
-    let mut spans = Vec::with_capacity(bars);
-    for column in 0..bars {
-        let band = column * levels.len() / bars.max(1);
-        let value = levels[band].clamp(0.0, 1.0);
-        let (symbol, strength) = if value > 0.66 {
-            ("▂", 1.0)
-        } else if value > 0.33 {
-            ("·", 0.5)
-        } else if value > 0.08 {
-            ("·", 0.25)
-        } else {
-            (" ", 0.0)
+    let mut spans: Vec<ratatui::text::Span> = Vec::with_capacity(width / 4 + 2);
+    let mut run = String::with_capacity(width);
+    let mut run_style = ratatui::style::Style::default();
+    let mut have_run = false;
+    for column in 0..width {
+        let start = column * bands / width;
+        let end = ((column + 1) * bands / width).max(start + 1);
+        let value = levels[start..end.min(bands)]
+            .iter()
+            .fold(0.0f32, |max, &level| max.max(level))
+            .clamp(0.0, 1.0);
+
+        let (glyph, style) = {
+            let scaled = value.powf(0.55);
+            if scaled < 0.03 {
+                (' ', ratatui::style::Style::default())
+            } else {
+                let eighth = (scaled * 8.0).ceil().clamp(1.0, 8.0) as usize;
+                (
+                    views::visualizer::sub_block_glyph(eighth),
+                    ratatui::style::Style::default().fg(crate::ui::theme::mix(
+                        theme.progress_bg,
+                        theme.accent,
+                        scaled,
+                    )),
+                )
+            }
         };
-        if strength > 0.0 {
-            let color = crate::ui::theme::mix(theme.progress_bg, theme.accent, strength);
-            spans.push(ratatui::text::Span::styled(
-                symbol,
-                ratatui::style::Style::default().fg(color),
-            ));
-        } else {
-            spans.push(ratatui::text::Span::raw(" "));
+
+        // 相邻同款格子并进同一个 Span，一行通常只有几个 Span
+        if have_run && style == run_style {
+            run.push(glyph);
+            continue;
         }
+        if have_run && !run.is_empty() {
+            spans.push(ratatui::text::Span::styled(
+                std::mem::take(&mut run),
+                run_style,
+            ));
+        }
+        run.push(glyph);
+        run_style = style;
+        have_run = true;
+    }
+    if !run.is_empty() {
+        spans.push(ratatui::text::Span::styled(run, run_style));
     }
     frame.render_widget(
         ratatui::widgets::Paragraph::new(ratatui::text::Line::from(spans)),
@@ -630,6 +659,79 @@ mod tests {
             checked += 1;
         }
         assert_eq!(checked, Tab::SIDEBAR_ORDER.len(), "每个标签都要有命中区");
+    }
+
+    /// 迷你频谱要**铺满整行**：频段重采样到每一列，而不是按柱状图的步长
+    /// 只画半行——空半行就是用户说的「没有自适应长度」。
+    #[test]
+    fn mini_spectrum_fills_the_row_above_the_player() {
+        let mut state = AppState::new(Config::default());
+        state.playback = PlaybackState::Playing;
+        state.smooth_spectrum = vec![1.0; 128];
+
+        let (width, height) = (90u16, 20u16);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("建测试终端");
+        terminal
+            .draw(|frame| render(frame, &mut state))
+            .expect("渲染整帧");
+
+        // 布局：content | 空1行 | player | 空1行 | status。迷你频谱画在
+        // player 上方那行 spacing 里。
+        let player_y = height - PLAYER_HEIGHT - STATUS_HEIGHT - 1;
+        let row = player_y - 1;
+        let line: String = (0..width)
+            .map(|x| terminal.backend().buffer()[(x, row)].symbol())
+            .collect();
+        assert!(
+            line.chars().all(|character| character == '█'),
+            "满格频谱应铺满整行：|{line}|"
+        );
+    }
+
+    /// 两层平滑后电平普遍落在 0.1~0.4，那种量级也要看得见——此前低于
+    /// 0.33 只画一个暗点，整行看上去几乎不动。
+    #[test]
+    fn quiet_levels_still_show_visible_amplitude() {
+        let mut state = AppState::new(Config::default());
+        state.playback = PlaybackState::Playing;
+        state.smooth_spectrum = vec![0.25; 128];
+
+        let (width, height) = (90u16, 20u16);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("建测试终端");
+        terminal
+            .draw(|frame| render(frame, &mut state))
+            .expect("渲染整帧");
+
+        let player_y = height - PLAYER_HEIGHT - STATUS_HEIGHT - 1;
+        let row = player_y - 1;
+        let line: String = (0..width)
+            .map(|x| terminal.backend().buffer()[(x, row)].symbol())
+            .collect();
+        assert!(
+            line.chars().all(|character| character == '▄'),
+            "0.25 的电平应画成中档块字符：|{line}|"
+        );
+    }
+
+    /// 静音就是一整行空白，不该冒出噪点。
+    #[test]
+    fn silent_spectrum_renders_as_an_empty_row() {
+        let mut state = AppState::new(Config::default());
+        state.playback = PlaybackState::Playing;
+        state.smooth_spectrum = vec![0.0; 128];
+
+        let (width, height) = (90u16, 20u16);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("建测试终端");
+        terminal
+            .draw(|frame| render(frame, &mut state))
+            .expect("渲染整帧");
+
+        let player_y = height - PLAYER_HEIGHT - STATUS_HEIGHT - 1;
+        let row = player_y - 1;
+        let line: String = (0..width)
+            .map(|x| terminal.backend().buffer()[(x, row)].symbol())
+            .collect();
+        assert!(line.chars().all(|character| character == ' '), "|{line}|");
     }
 
     /// 各种终端尺寸下整帧渲染都不得 panic。
@@ -776,5 +878,168 @@ mod visual_dump {
                 .collect::<String>();
             println!("|{line}|");
         }
+    }
+
+    /// 迷你频谱的观感：播放条上方那一行在不同电平分布下的样子。
+    ///
+    /// 造一条「低频高、随频率衰减、叠随机峰」的接近真实的频谱（与
+    /// `dump_visualizer` 同一套），看对比度与铺满程度。
+    #[test]
+    #[ignore = "观感检视用，打印整帧文本"]
+    fn dump_mini_spectrum() {
+        let mut state = AppState::new(Config::default());
+        state.playback = crate::audio::engine::PlaybackState::Playing;
+        state.current = Some(crate::api::model::Song {
+            name: "夜的第七章".to_string(),
+            ..crate::api::model::Song::default()
+        });
+        state.spectrum = (0..128)
+            .map(|index| {
+                let t = index as f32 / 128.0;
+                let base = (1.0 - t).powf(1.4);
+                let bump = 0.25 * (12.0 * t * std::f32::consts::PI).sin().abs();
+                (base * 0.85 + bump).clamp(0.0, 1.0)
+            })
+            .collect();
+        state.smooth_spectrum = state.spectrum.clone();
+
+        let (width, height) = (120u16, 20u16);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("建测试终端");
+        terminal
+            .draw(|frame| render(frame, &mut state))
+            .expect("渲染整帧");
+
+        let buffer = terminal.backend().buffer();
+        for y in 0..height {
+            let line: String = (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            println!("|{line}|");
+        }
+    }
+
+    /// 播放中一帧的成本探针：四条 30fps 热路径各跑 300 帧取平均。
+    ///
+    /// `cargo test --release perf_probe -- --ignored --nocapture`。数字是
+    /// AGENTS.md 性能基线表的来源——改渲染热路径或 cava 前后各跑一次对比。
+    #[test]
+    #[ignore = "性能探针，--release 下运行才有意义"]
+    fn perf_probe_playing_frames() {
+        use std::time::Instant;
+        const FRAMES: u32 = 300;
+
+        // 接近真实音乐的一条频谱：低频高、随频率衰减、叠几个随机峰
+        let spectrum: Vec<f32> = (0..128)
+            .map(|index| {
+                let t = index as f32 / 128.0;
+                let base = (1.0 - t).powf(1.4);
+                let bump = 0.25 * (12.0 * t * std::f32::consts::PI).sin().abs();
+                (base * 0.85 + bump).clamp(0.0, 1.0)
+            })
+            .collect();
+
+        // 首页：歌词面板可见 + 迷你频谱 + 逐帧变化的时间与频谱
+        let mut home = AppState::new(Config::default());
+        home.playback = crate::audio::engine::PlaybackState::Playing;
+        home.current = Some(crate::api::model::Song {
+            name: "夜的第七章".to_string(),
+            duration_ms: 280_000,
+            ..crate::api::model::Song::default()
+        });
+        home.duration_ms = 280_000;
+        home.lyric.lyric = crate::api::model::Lyric {
+            text: String::new(),
+            lines: (0..150)
+                .map(|index| crate::api::model::LyricLine {
+                    time_ms: index as u64 * 1_800,
+                    text: format!("夜色慢慢摊开露出月光{index}"),
+                    ..crate::api::model::LyricLine::default()
+                })
+                .collect(),
+        };
+        home.lyric.active_line = Some(60);
+        home.lyric.load.succeed();
+
+        // 可视化页：柱状与瀑布两种模式。瀑布预先灌满 240 帧历史。
+        let mut bars = AppState::new(Config::default());
+        bars.tab = Tab::Visualizer;
+        bars.playback = crate::audio::engine::PlaybackState::Playing;
+        bars.spectrum = spectrum.clone();
+        bars.smooth_spectrum = spectrum.clone();
+        bars.peak_spectrum = spectrum.iter().map(|value| value * 1.15).collect();
+        let mut waterfall = AppState::new(Config::default());
+        waterfall.tab = Tab::Visualizer;
+        waterfall.visualizer_mode = crate::app::state::VisualizerMode::Waterfall;
+        waterfall.playback = crate::audio::engine::PlaybackState::Playing;
+        waterfall.spectrum = spectrum.clone();
+        waterfall.smooth_spectrum = spectrum.clone();
+        for _ in 0..crate::app::state::SPECTRUM_HISTORY_LIMIT {
+            waterfall.advance_visualizer(std::time::Duration::from_millis(33));
+        }
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("建测试终端");
+
+        let mut elapsed = std::time::Duration::ZERO;
+        for frame in 0..FRAMES {
+            home.position_ms = u64::from(frame) * 33;
+            home.lyric.active_line = Some((frame as usize / 4) % 150);
+            home.smooth_spectrum = spectrum.clone();
+            let start = Instant::now();
+            terminal.draw(|f| render(f, &mut home)).expect("渲染");
+            elapsed += start.elapsed();
+        }
+        println!(
+            "首页: {:.0} µs/帧",
+            elapsed.as_secs_f32() * 1e6 / FRAMES as f32
+        );
+
+        let mut elapsed = std::time::Duration::ZERO;
+        for frame in 0..FRAMES {
+            let phase = frame as f32 * 0.1;
+            for (index, value) in bars.smooth_spectrum.iter_mut().enumerate() {
+                *value = (spectrum[index] * (0.8 + 0.2 * (phase + index as f32 * 0.3).sin()))
+                    .clamp(0.0, 1.0);
+            }
+            let start = Instant::now();
+            terminal.draw(|f| render(f, &mut bars)).expect("渲染");
+            elapsed += start.elapsed();
+        }
+        println!(
+            "柱状: {:.0} µs/帧",
+            elapsed.as_secs_f32() * 1e6 / FRAMES as f32
+        );
+
+        let mut elapsed = std::time::Duration::ZERO;
+        for frame in 0..FRAMES {
+            let phase = frame as f32 * 0.1;
+            for (index, value) in waterfall.smooth_spectrum.iter_mut().enumerate() {
+                *value = (spectrum[index] * (0.8 + 0.2 * (phase + index as f32 * 0.3).sin()))
+                    .clamp(0.0, 1.0);
+            }
+            waterfall.advance_visualizer(std::time::Duration::from_millis(33));
+            let start = Instant::now();
+            terminal.draw(|f| render(f, &mut waterfall)).expect("渲染");
+            elapsed += start.elapsed();
+        }
+        println!(
+            "瀑布: {:.0} µs/帧",
+            elapsed.as_secs_f32() * 1e6 / FRAMES as f32
+        );
+
+        // cava 分析：30fps、44.1kHz 下每帧约 1455 个增量采样
+        let mut cava = crate::audio::cava::Cava::with_options(128, 44_100, 0.77, true, 50, 10_000);
+        let samples: Vec<f32> = (0..1455)
+            .map(|index| {
+                let t = index as f32 / 44_100.0;
+                0.5 * (2.0 * std::f32::consts::PI * 220.0 * t).sin()
+                    * (0.5 + 0.5 * (2.0 * std::f32::consts::PI * 2.0 * t).sin())
+            })
+            .collect();
+        let start = Instant::now();
+        for _ in 0..FRAMES {
+            cava.execute(&samples);
+        }
+        let micros = start.elapsed().as_secs_f32() * 1e6 / FRAMES as f32;
+        println!("cava: {micros:.0} µs/帧");
     }
 }

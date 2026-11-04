@@ -318,14 +318,14 @@ impl AudioHandle {
         self.levels.sample_rate()
     }
 
-    /// 采样窗游标。与 [`AudioHandle::samples_since`] 配对使用。
+    /// 采样窗游标。与 [`AudioHandle::samples_since_into`] 配对使用。
     pub fn sample_cursor(&self) -> usize {
         self.levels.sample_cursor()
     }
 
-    /// 自 `since` 以来新到的单声道采样（最多 `max` 个）。
-    pub fn samples_since(&self, since: usize, max: usize) -> Vec<f32> {
-        self.levels.samples_since(since, max)
+    /// 自 `since` 以来新到的单声道采样（最多 `max` 个），写进调用方的缓冲。
+    pub fn samples_since_into(&self, since: usize, max: usize, out: &mut Vec<f32>) {
+        self.levels.samples_since_into(since, max, out);
     }
 
     /// 标记为「缓冲中」。UI 在发起下载前调用，让用户立刻看到反馈。

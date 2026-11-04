@@ -6,6 +6,8 @@
 //! 列表选中态直接用 ratatui 的 [`ListState`]，因为滚动偏移需要跨帧保持——
 //! 每帧重建状态会让长列表的滚动位置反复归零。
 
+use std::collections::VecDeque;
+
 use ratatui::layout::Rect;
 use ratatui::widgets::ListState;
 
@@ -1030,6 +1032,43 @@ pub struct LyricPane {
     /// 同一套约定：只有渲染层知道行几何（译文/音译会让显示行与歌词行不再一一对应），
     /// 而点击要的是歌词行。
     pub display_line_index: Vec<usize>,
+
+    /// 展平后的「显示行」缓存（原文 + 译文 + 音译各占一行）。
+    ///
+    /// 渲染层每帧都要读它；歌词不变时直接复用，不再每帧 clone 全部文本——
+    /// 30fps 逐字推进下那是每秒几千次字符串分配。缓存按内容指纹校验
+    /// （[`lyric_display_cache_key`]），歌词一变下一次渲染自动重建，
+    /// 不依赖赋值方记得走某个 setter。
+    pub display_cache: Vec<(usize, bool, String)>,
+    /// [`Self::display_cache`] 建立时的内容指纹。
+    pub display_cache_key: u64,
+}
+
+/// 歌词内容的指纹：行数、每行的时间戳与全部文本的逐字节 FNV-1a。
+///
+/// 展平缓存的失效判据。刻意从**数据本身**推导而不是记版本号：任何一次
+/// 绕过 setter 的赋值（测试里很常见）都会被指纹逮住，缓存不会变陈旧。
+/// 逐字节哈希一整份歌词约几千次乘加，30fps 下可忽略；比对错一次的代价
+/// （屏幕显示上一首歌的词）大得多。
+pub(crate) fn lyric_display_cache_key(lyric: &Lyric) -> u64 {
+    fn mix(hash: &mut u64, bytes: &[u8]) {
+        for &byte in bytes {
+            *hash = (*hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for line in &lyric.lines {
+        mix(&mut hash, &line.time_ms.to_le_bytes());
+        mix(&mut hash, line.text.as_bytes());
+        if let Some(translation) = line.translation.as_deref() {
+            mix(&mut hash, translation.as_bytes());
+        }
+        if let Some(romanization) = line.romanization.as_deref() {
+            mix(&mut hash, romanization.as_bytes());
+        }
+        mix(&mut hash, &[u8::from(line.words.is_empty())]);
+    }
+    hash
 }
 
 impl LyricPane {
@@ -1221,7 +1260,10 @@ pub struct AppState {
     pub levels: Vec<f32>,
     /// 当前这段声音的频谱（0.0~1.0），由 FFT 分频得到，**频域**。
     pub spectrum: Vec<f32>,
-    pub spectrum_history: Vec<Vec<f32>>,
+    /// 瀑布图的历史帧。队列头是最旧的一帧；满员时丢头并用**它的缓冲**装新帧，
+    /// 稳态下每帧零分配（每帧新建一个 512B 的 Vec 会让 30fps 下出现稳定的
+    /// 分配节奏，RSS 锯齿）。
+    pub spectrum_history: VecDeque<Vec<f32>>,
     pub visualizer_mode: VisualizerMode,
     pub cava_setting: usize,
     pub cava_panel: Option<CavaPanelState>,
@@ -1621,7 +1663,7 @@ impl AppState {
             position_ms: 0,
             levels: Vec::new(),
             spectrum: Vec::new(),
-            spectrum_history: Vec::new(),
+            spectrum_history: VecDeque::new(),
             visualizer_mode: VisualizerMode::Bars,
             cava_setting: 0,
             cava_panel: None,
@@ -1986,11 +2028,17 @@ impl AppState {
             self.peak_spectrum[index] = (peak - peak_fall).max(next);
         }
 
-        // 瀑布图记录平滑后的频谱。Vec<Vec<f32>> 有界，超出就丢最旧的一帧。
-        if self.spectrum_history.len() >= SPECTRUM_HISTORY_LIMIT {
-            self.spectrum_history.remove(0);
+        // 瀑布图记录平滑后的频谱。历史满员时丢最旧一帧，并复用它的缓冲装新帧。
+        if self.spectrum_history.len() >= SPECTRUM_HISTORY_LIMIT
+            && let Some(mut recycled) = self.spectrum_history.pop_front()
+        {
+            recycled.clear();
+            recycled.extend_from_slice(&self.smooth_spectrum);
+            self.spectrum_history.push_back(recycled);
+        } else {
+            self.spectrum_history
+                .push_back(self.smooth_spectrum.clone());
         }
-        self.spectrum_history.push(self.smooth_spectrum.clone());
     }
 
     /// 当前选中的 cava 参数（由 `cava_setting` 环绕取模）。

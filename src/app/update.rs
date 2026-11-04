@@ -149,7 +149,16 @@ impl App {
                 } else {
                     KeyMode::Normal
                 };
-                let action = crate::keymap::resolve(key, mode);
+                // 可视化页的 `e`/`E`/`v`/`V` 是页面局部键（调参 / 切模式）。
+                // 全局键表把这四个键都绑走了，而 `resolve` 看不到标签页，
+                // 所以在这里按页面上下文先解释一遍；打开的弹窗仍由
+                // `handle_action` 的模态分派吞掉，不会误触全局动作。
+                let action = if mode == KeyMode::Normal && self.state.tab == Tab::Visualizer {
+                    crate::keymap::resolve_visualizer_local(key)
+                        .unwrap_or_else(|| crate::keymap::resolve(key, mode))
+                } else {
+                    crate::keymap::resolve(key, mode)
+                };
                 // 排查「按键没反应」时这条日志是决定性的：它能区分
                 // 「按键根本没到程序」和「到了但映射成了 None」。
                 // 默认不输出，用 KUGOU_TUI_DEBUG=1 开启。
@@ -979,6 +988,7 @@ impl App {
         }
 
         // cava 调参面板是模态的：↑↓ 选参数、←→ 调值、Esc/Enter 关闭并保存。
+        // `E` 再按一次也关闭——打开它的键同时是关闭它的键，才叫切换。
         if self.state.cava_panel.is_some() {
             match action {
                 Action::MoveUp => self.state.cava_setting = self.state.cava_setting.wrapping_sub(1),
@@ -987,7 +997,7 @@ impl App {
                 }
                 Action::SeekBackward | Action::CursorLeft => self.state.adjust_cava_setting(-1),
                 Action::SeekForward | Action::CursorRight => self.state.adjust_cava_setting(1),
-                Action::Submit | Action::Cancel => {
+                Action::Submit | Action::Cancel | Action::OpenCavaSettings => {
                     self.state.cava_panel = None;
                     if let Err(error) = self.state.config.save() {
                         self.state.warn(format!("保存 cava 配置失败：{error}"));
@@ -1311,11 +1321,12 @@ impl App {
                 self.state.info("输入歌单名称，Enter 创建 · Esc 取消");
             }
 
-            // 可视化页按 E 调参数、V 切模式；其余页忽略（Char 默认是输入态的键）
-            Action::Char('e') | Action::Char('E') if self.state.tab == Tab::Visualizer => {
+            // 可视化页局部键的动作（`resolve_visualizer_local` 注入）。
+            // 也接收来自 MPRIS / WebSocket 的同名语义动作——它们不经过按键解析。
+            Action::OpenCavaSettings => {
                 self.state.cava_panel = Some(CavaPanelState);
             }
-            Action::Char('v') | Action::Char('V') if self.state.tab == Tab::Visualizer => {
+            Action::ToggleVisualizerMode => {
                 self.state.visualizer_mode = match self.state.visualizer_mode {
                     VisualizerMode::Bars => VisualizerMode::Waterfall,
                     VisualizerMode::Waterfall => VisualizerMode::Bars,
@@ -3615,6 +3626,58 @@ mod tests {
             !app.state.interaction.dragging(HitTarget::Progress),
             "没移动过就不该被标记为拖拽"
         );
+    }
+
+    // ================================================================
+    // 可视化页局部键：e/E 调参、v/V 切模式
+    // ================================================================
+
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// 可视化页上 `v`/`V`/`e`/`E` 是页面局部键，要盖过它们在全局键表上的
+    /// 语义（切音源 / 领 VIP / 设默认音源）。这条直接从 `handle_event` 走
+    /// 完整链路——注入点在事件层，只测 `resolve_visualizer_local` 抓不住
+    /// 「注入条件写反了」这类错误。
+    ///
+    /// 关面板会 `config.save()`，所以先经 `config_dir_guard` 把配置根目录
+    /// 指到临时目录，不能让测试改写用户真实的 config.toml。
+    #[test]
+    fn visualizer_page_local_keys_beat_the_global_bindings() {
+        let temp = std::env::temp_dir().join(format!("kugou-tui-vistest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).expect("建临时配置目录");
+        let _guard = crate::config::config_dir_guard::override_config_dir(&temp);
+
+        let mut app = App::for_test();
+        app.state.tab = Tab::Visualizer;
+
+        // V：全局是「领 VIP」，可视化页必须切换频谱模式
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('V'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.state.visualizer_mode, VisualizerMode::Waterfall);
+        // v：全局是「切音源」，这里同样只能切模式
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('v'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.state.visualizer_mode, VisualizerMode::Bars);
+        assert_eq!(app.state.tab, Tab::Visualizer, "标签页不该被顺带切走");
+
+        // e/E：打开 cava 调参面板；面板开着时再按一次，关闭
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('E'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.state.cava_panel.is_some(), "E 应当打开调参面板");
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('E'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.state.cava_panel.is_none(), "面板开着时 E 应当关闭它");
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 
     /// 指针移动要更新 hover，且松开鼠标后 hover 仍然保留（终端不上报离开）。

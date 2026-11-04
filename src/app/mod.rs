@@ -139,6 +139,8 @@ pub struct App {
     cava_config: (u32, bool, u32, u32),
     /// 上次送到 cava 的采样窗游标。只喂增量，不喂整个窗口。
     cava_cursor: usize,
+    /// 采样增量的复用缓冲。30fps 下每帧取一次，跨帧保留容量，稳态零分配。
+    cava_samples: Vec<f32>,
 
     /// 上次把会话写盘的时间。关机/被杀时 `shutdown()` 不会执行，靠 tick 里
     /// 的定期保存兜底——只在退出时存的话，非正常退出就丢进度了。
@@ -300,6 +302,7 @@ impl App {
             cava_rate: 0,
             cava_config: (0, false, 0, 0),
             cava_cursor: 0,
+            cava_samples: Vec::new(),
             last_session_save: Instant::now(),
             last_mem_trace: Instant::now(),
             pending_device_resume: None,
@@ -433,22 +436,23 @@ impl App {
     /// 没有新数据，调用方应当保持上一帧画面而不是画一片空。
     fn advance_spectrum(&mut self) -> bool {
         // 先把「要读的东西」全部取出来，再借 cava——它会独占 self。
-        // 顺序反过来的话，`samples_since` 那次 `self.audio` 借用会和 `&mut cava` 撞上。
+        // 顺序反过来的话，`samples_since_into` 那次 `self.audio` 借用会和 `&mut cava` 撞上。
         let _ = self.ensure_cava();
         let cursor = self.audio.sample_cursor();
         // 上限取 cava 内部缓冲的一半：一次喂超过它就会被上游截断，
         // 白白丢掉真正的波形。按 96kHz、20fps 算，每帧约 4800 个采样。
         let max = 8_192;
-        let samples = self.audio.samples_since(self.cava_cursor, max);
+        self.audio
+            .samples_since_into(self.cava_cursor, max, &mut self.cava_samples);
         self.cava_cursor = cursor;
-        if samples.is_empty() {
+        if self.cava_samples.is_empty() {
             return false;
         }
         let Some(cava) = self.cava.as_mut() else {
             return false;
         };
         let bars = cava.bars();
-        let levels = cava.execute(&samples);
+        let levels = cava.execute(&self.cava_samples);
         debug_assert_eq!(levels.len(), bars);
         // `execute` 返回的是内部缓冲的借用，下一帧会被覆盖，所以这里必须拷贝。
         // 拷贝本身很小（128 个 f32 = 512 B），且 `state.spectrum` 容量稳定后
@@ -459,16 +463,27 @@ impl App {
     }
 
     fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
+        // 下一拍心跳该发生的时刻。Tick 挂在这个时钟上，而不是只挂在
+        // `recv_timeout` 的超时分支：鼠标移动这类高频事件会连续喂满通道，
+        // `recv_timeout` 永远等不到超时，Tick 于是被饿死——频谱停住、进度条
+        // 不走、歌词不动，表现就是「动一下鼠标可视化页就卡住」。
+        let mut next_tick = Instant::now() + self.frame_interval();
         loop {
             terminal
                 .draw(|frame| crate::ui::render(frame, &mut self.state))
                 .context("渲染失败")?;
 
-            match self.receiver.recv_timeout(self.frame_interval()) {
-                Ok(event) => self.handle_event(event),
-                // 没有事件时用一次心跳推进进度条与歌词
-                Err(RecvTimeoutError::Timeout) => self.handle_event(Event::Tick),
-                Err(RecvTimeoutError::Disconnected) => break,
+            let now = Instant::now();
+            if now >= next_tick {
+                self.handle_event(Event::Tick);
+                next_tick = now + self.frame_interval();
+            } else {
+                match self.receiver.recv_timeout(next_tick - now) {
+                    Ok(event) => self.handle_event(event),
+                    // 时钟到点前没有事件：回到循环顶部先渲染，再走上面的 Tick 分支
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
             }
 
             // 把同一帧内积压的事件一并消化，快速连按时画面才不会滞后
@@ -698,6 +713,7 @@ impl App {
             cava_rate: 0,
             cava_config: (0, false, 0, 0),
             cava_cursor: 0,
+            cava_samples: Vec::new(),
             last_session_save: Instant::now(),
             last_mem_trace: Instant::now(),
             pending_device_resume: None,
