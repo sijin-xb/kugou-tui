@@ -37,7 +37,9 @@ use crate::app::state::{
 };
 use crate::keymap::{CHEATSHEET, display_keys_with_custom};
 use crate::ui::theme::Theme;
-use crate::ui::widgets::{display_width, human_bytes, panel, placeholder, truncate_to_width};
+use crate::ui::widgets::{
+    display_width, human_bytes, panel, placeholder, truncate_to_width, wrap_to_width,
+};
 
 /// 侧边栏宽度：随终端宽度伸缩，但保持在一个可读区间内。
 pub fn sidebar_width(total_width: u16) -> u16 {
@@ -130,31 +132,32 @@ pub fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     // 纯粹的重复，删掉后腾出的行正好让「连接」「缓存」在常见尺寸下都放得下。
     // 剩下两块各自都是别处看不到的：连接是排查用的（服务端认成了哪种会员、
     // 指纹有没有拿到、接口是不是内嵌），缓存是已用 / 上限 / 清理入口。
-    let mut connect: Vec<Line> = vec![
-        kv("API", &api_endpoint_label(state), width, theme),
-        kv(
-            "音源",
-            state.config.active_source_kind().label(),
-            width,
-            theme,
-        ),
-        kv(
-            "登录",
-            if state.logged_in { "是" } else { "否" },
-            width,
-            theme,
-        ),
-        kv(
-            "指纹",
-            if state.config.dfid.is_some() {
-                "已获取"
-            } else {
-                "—"
-            },
-            width,
-            theme,
-        ),
-    ];
+    // `kv` 会折行（续行对齐到值列），折出来的行数已计入下面的块预算；
+    // 矮终端放不下整块时依旧走「一行小结」，不会把后面的块顶出去。
+    let mut connect: Vec<Line> = Vec::new();
+    connect.extend(kv("API", &api_endpoint_label(state), width, theme));
+    connect.extend(kv(
+        "音源",
+        state.config.active_source_kind().label(),
+        width,
+        theme,
+    ));
+    connect.extend(kv(
+        "登录",
+        if state.logged_in { "是" } else { "否" },
+        width,
+        theme,
+    ));
+    connect.extend(kv(
+        "指纹",
+        if state.config.dfid.is_some() {
+            "已获取"
+        } else {
+            "—"
+        },
+        width,
+        theme,
+    ));
     // 会员形态直接显示出来：排查「有会员却只能试听」时，一眼就能看出
     // 服务端到底认成了哪种会员、什么时候到期。
     //
@@ -168,7 +171,7 @@ pub fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
         } else {
             info.short_label()
         };
-        connect.push(kv("会员", &label, width, theme));
+        connect.extend(kv("会员", &label, width, theme));
     }
 
     let limit = if state.config.cache_limit_mib == 0 {
@@ -176,25 +179,23 @@ pub fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     } else {
         format!("{} MiB", state.config.cache_limit_mib)
     };
-    let mut cache: Vec<Line> = vec![
-        kv("已用", &human_bytes(state.cache_bytes), width, theme),
-        kv("上限", &limit, width, theme),
-        // 缓存目录与清理按键挤在一行：侧边栏很窄，完整路径用 `--print-config` 看。
-        // 这里只显示目录最后一段，指个方向就够。
-        //
-        // 键位用 `[C]` 的方括号写法，和状态栏的 `[?] 帮助 [q] 退出` 一致——
-        // 写成 `C清理 kugou-tui` 的话键位和目录名粘成一个词，读不出来。
-        Line::from(vec![
-            Span::styled("  [C] 清理 ", theme.dim()),
-            Span::styled(
-                truncate_to_width(
-                    &dir_basename(&state.config.cache_dir),
-                    (width as usize).saturating_sub(display_width("  [C] 清理 ")),
-                ),
-                theme.body(),
-            ),
-        ]),
-    ];
+    let mut cache: Vec<Line> = Vec::new();
+    cache.extend(kv("已用", &human_bytes(state.cache_bytes), width, theme));
+    cache.extend(kv("上限", &limit, width, theme));
+    // 清理入口独占一行，缓存目录名折行接在下面——此前截成「kugou-pr…」，
+    // 目录名本来就是给人认方向的，认不出来就白写了。只显示目录最后一段，
+    // 完整路径用 `--print-config` 看。键位用 `[C]` 的方括号写法，和状态栏的
+    // `[?] 帮助 [q] 退出` 一致——写成 `C清理 kugou-tui` 的话键位和目录名
+    // 粘成一个词，读不出来。
+    cache.push(Line::from(Span::styled("  [C] 清理", theme.dim())));
+    let dir_indent = " ".repeat(display_width("  [C] 清理 "));
+    let dir_room = (width as usize).saturating_sub(display_width(&dir_indent));
+    for segment in wrap_to_width(&dir_basename(&state.config.cache_dir), dir_room, dir_room) {
+        cache.push(Line::from(vec![
+            Span::styled(dir_indent.clone(), theme.dim()),
+            Span::styled(segment, theme.body()),
+        ]));
+    }
 
     // native 下没有「连接」这回事：接口就在进程里，不存在连不通。标题照旧写
     // 「已连通」会让人以为在跟某个服务说话，出问题时去查端口。
@@ -265,8 +266,8 @@ pub fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
 
     lines.extend(block_lines);
 
-    // 不套 `Wrap`：值在 `kv` 里已经按宽度截断，行数是算好的。留一个会折行的
-    // 段落只会让「算好的行数」失效，把下面的块重新顶出去。
+    // 不套 `Wrap`：kv 折出的行数已经进了上面的块预算，留一个会折行的段落
+    // 只会让「算好的行数」失效，把下面的块重新顶出去。
     frame.render_widget(Paragraph::new(lines), inner);
     inner
 }
@@ -287,18 +288,31 @@ fn section(title: &str, theme: &Theme) -> Line<'static> {
     Line::from(Span::styled(format!("── {title}"), theme.dim()))
 }
 
-/// 侧边栏的一行「键 值」。
+/// 侧边栏的一行「键 值」，值放不下时**折行**，续行对齐到值列。
 ///
-/// 值按可用宽度**截断**而不是折行。侧边栏的行数是按优先级算好的（见
-/// `render_sidebar`），多折出一行就会把后面的块顶出去——那正是「内容无声消失」
-/// 的来源。
-fn kv(key: &str, value: &str, width: u16, theme: &Theme) -> Line<'static> {
+/// 返回多行：折出的行数由调用方计入状态块的预算（见 `render_sidebar`），
+/// 放不下整块的矮终端走「一行小结」，所以折行不会把后面的块顶出去——
+/// 那正是「内容无声消失」的来源，预算制没有被破坏。
+fn kv(key: &str, value: &str, width: u16, theme: &Theme) -> Vec<Line<'static>> {
     let key_text = format!("  {key} ");
-    let room = (width as usize).saturating_sub(display_width(&key_text));
-    Line::from(vec![
+    let first_room = (width as usize).saturating_sub(display_width(&key_text));
+    let indent = " ".repeat(display_width(&key_text));
+    let rest_room = (width as usize).saturating_sub(display_width(&indent));
+    let segments = wrap_to_width(value, first_room, rest_room);
+    if segments.is_empty() {
+        return vec![Line::from(Span::styled(key_text, theme.dim()))];
+    }
+    let mut lines = vec![Line::from(vec![
         Span::styled(key_text, theme.dim()),
-        Span::styled(truncate_to_width(value, room), theme.body()),
-    ])
+        Span::styled(segments[0].clone(), theme.body()),
+    ])];
+    for segment in &segments[1..] {
+        lines.push(Line::from(vec![
+            Span::styled(indent.clone(), theme.dim()),
+            Span::styled(segment.clone(), theme.body()),
+        ]));
+    }
+    lines
 }
 
 /// 从 API 地址里剥掉协议前缀，侧边栏窄，省几个字符。
@@ -949,6 +963,24 @@ mod tests {
             })
             .expect("渲染侧边栏");
         terminal
+    }
+
+    /// 侧边栏的值放不下要**折行**（续行对齐到值列），不再截成「kugou-pr…」；
+    /// 折行后的行数进了块预算，矮终端依旧回退到一行小结，不会把块顶出去。
+    #[test]
+    fn sidebar_values_wrap_instead_of_truncating() {
+        let mut state = AppState::new(Config::default());
+        state.config.cache_dir = std::path::PathBuf::from("/home/xibie/kugou-proxy-cache");
+
+        // 最窄侧边栏：面板 24 列扣掉边框与左右内边距后内容区只有 20 列，
+        // 「  [C] 清理」占 10 列，留给目录名的值列只剩 9 列——17 列的目录名
+        // 必须折成两行，且任何一行都不该再出现省略号。
+        let terminal = draw_sidebar(&state, 24, 40);
+        let text = screen_text(&terminal);
+        assert!(text.contains("kugou-pro"), "目录名前半应显示：{text}");
+        assert!(text.contains("xy-cache"), "目录名后半应折到下一行：{text}");
+        assert!(!text.contains("kugou-pr…"), "不能再是截断形态：{text}");
+        assert!(!text.contains("…"), "最窄侧边栏也不该出现省略号：{text}");
     }
 
     /// 登录弹窗在矮终端下不能 panic。

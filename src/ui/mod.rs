@@ -918,6 +918,74 @@ mod visual_dump {
         }
     }
 
+    /// 窄窗口首页的观感（复刻用户截图的场景）：侧边栏 + 封面贴顶 + 「我的资料」
+    /// 折行。看三件事：封面是否贴面板顶部、账号区各行是否折行而不是 `…` 截断、
+    /// 侧边栏缓存目录名是否完整。
+    #[test]
+    #[ignore = "观感检视用，打印整帧文本"]
+    fn dump_home_narrow() {
+        let mut state = AppState::new(Config::default());
+        state.playback = crate::audio::engine::PlaybackState::Playing;
+        state.current = Some(crate::api::model::Song {
+            name: "Where Is the Love（哪里是爱）".to_string(),
+            singers: vec![crate::api::model::Singer {
+                name: "Josh Vietti".to_string(),
+                ..Default::default()
+            }],
+            album_name: "Best Of Both Worlds".to_string(),
+            duration_ms: 273_000,
+            ..Default::default()
+        });
+        state.duration_ms = 273_000;
+        state.position_ms = 145_000;
+        state.user_info = Some(crate::api::cloud::UserInfo {
+            nickname: "惜别".to_string(),
+            grade: Some(9),
+            duration_min: Some(79_239),
+            ..Default::default()
+        });
+        state.vip_info = Some(crate::api::cloud::VipInfo {
+            kind: crate::api::cloud::VipKind::Concept,
+            product: "svip".to_string(),
+            end_time: "2026-11-06 12:00:00".to_string(),
+        });
+        state.config.sources.active = crate::source::SourceKind::KugouConcept;
+        state
+            .config
+            .switch_source(crate::source::SourceKind::KugouConcept);
+        state.config.cache_dir = std::path::PathBuf::from("/home/xibie/kugou-proxy-cache");
+        state
+            .stats
+            .record_complete_on(Some("2026-11-05".to_string()), "Josh Vietti");
+        state
+            .stats
+            .add_listen_on(Some("2026-11-05".to_string()), 145_000);
+        // 渐变而不是纯色：半块字符在上下同色时会退化成空格（用底色表示），
+        // 纯色图整片空白，看不出贴顶效果。
+        let mut pixels = image::RgbImage::new(64, 64);
+        for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x * 4) as u8, (y * 4) as u8, 128]);
+        }
+        state
+            .cover
+            .set_image("h".to_string(), image::DynamicImage::ImageRgb8(pixels), 1.0);
+        state.picker = Some(ratatui_image::picker::Picker::halfblocks());
+
+        let (width, height) = (92u16, 36u16);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("建测试终端");
+        terminal
+            .draw(|frame| render(frame, &mut state))
+            .expect("渲染整帧");
+
+        let buffer = terminal.backend().buffer();
+        for y in 0..height {
+            let line: String = (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            println!("|{line}|");
+        }
+    }
+
     /// 播放中一帧的成本探针：四条 30fps 热路径各跑 300 帧取平均。
     ///
     /// `cargo test --release perf_probe -- --ignored --nocapture`。数字是

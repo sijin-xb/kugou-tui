@@ -22,6 +22,7 @@ use crate::ui::theme::{Theme, mix};
 use crate::ui::views::{empty_placeholder, failed_placeholder, loading_placeholder};
 use crate::ui::widgets::{
     RowContext, display_width, panel, row_is_visible, selection_list, song_row, truncate_to_width,
+    wrap_to_width,
 };
 
 /// 播放条高度：2 行内容 + 上下边框。
@@ -725,7 +726,12 @@ fn stretch_to(image: &image::DynamicImage, (width, height): (u32, u32)) -> image
     image.resize_exact(width, height, FilterType::Lanczos3)
 }
 
-/// 在 `area` 里找出与图片像素比例一致的最大矩形，居中放置。
+/// 在 `area` 里找出与图片像素比例一致的最大矩形，水平居中、**贴顶**放置。
+///
+/// 贴顶而不是垂直居中：Tall 面板（左栏高、图是方图）里垂直居中会让上下各空
+/// 一大条，看起来像面板坏了；贴顶之后空档集中在下方，视线从封面自然落到
+/// 下面的「我的资料」。缩略图路径（`AboveContent`）的框本来就贴合图片，行为
+/// 不受影响。
 fn fit_box(image: &image::DynamicImage, area: Rect, font: FontSize) -> Rect {
     // 退化区域直接返回空矩形。**不能省这一步**：下面的 `clamp(1, area.height)`
     // 在 `area.height == 0` 时会 panic（`Ord::clamp` 要求 `min <= max`），
@@ -749,12 +755,7 @@ fn fit_box(image: &image::DynamicImage, area: Rect, font: FontSize) -> Rect {
     let columns = columns.clamp(1, area.width);
     let rows = rows.clamp(1, area.height);
 
-    Rect::new(
-        area.x + (area.width - columns) / 2,
-        area.y + (area.height - rows) / 2,
-        columns,
-        rows,
-    )
+    Rect::new(area.x + (area.width - columns) / 2, area.y, columns, rows)
 }
 
 /// 按 `mode` 把 `image` 塞进 `area`，返回（交给图片协议的图, 真正要渲染的矩形）。
@@ -867,8 +868,11 @@ const AVATAR_INITIAL_COLUMNS: u16 = 3;
 
 /// 首页账号区的高度：边框 2 行 + 内容 6 行（头像要能看清，2 行只能画 4 列宽）。
 ///
-/// 固定值，不能被封面框挤掉——封面用剩下的空间。
+/// 这是**下限**，不能被封面框挤掉——封面用剩下的空间。左栏宽裕时账号区最多
+/// 给到 [`ACCOUNT_MAX_HEIGHT`]：长行折行（见 `render_account`）需要行数，
+/// 封面在 Tall 面板里反正贴顶显示，多出来的高度给文字更值。
 const ACCOUNT_HEIGHT: u16 = 8;
+const ACCOUNT_MAX_HEIGHT: u16 = 14;
 
 /// 今天的「概念版」VIP 是否已经领过。
 ///
@@ -996,23 +1000,45 @@ fn render_account(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &T
         ),
     ]));
 
+    // 之后的行都是单一文本：长行按显示宽度**折行**（带两格悬挂缩进），
+    // 不再用 `…` 截断——「概念版 SVIP · 至…」的到期日、统计数字被截掉就是
+    // 信息直接丢失。折行会改变后续行的屏幕行号，所以闭包把折行后的
+    // (起始行, 行数) 返回来，命中区在**外面**按真实行数登记。
+    //
+    // 放不下整个逻辑行就到此为止：命中区必须只覆盖真正画出来的行。
+    let width = text_area.width as usize;
+    let push_wrapped = |lines: &mut Vec<Line>, text: &str, style: Style| -> Option<(u16, u16)> {
+        let wrapped = wrap_to_width(text, width, width.saturating_sub(2));
+        if wrapped.is_empty() || lines.len() + wrapped.len() > text_area.height as usize {
+            return None;
+        }
+        let row = text_area.y + lines.len() as u16;
+        for (index, segment) in wrapped.iter().enumerate() {
+            let line_text = if index == 0 {
+                segment.clone()
+            } else {
+                format!("  {segment}")
+            };
+            lines.push(Line::from(Span::styled(
+                truncate_to_width(&line_text, width),
+                style,
+            )));
+        }
+        Some((row, wrapped.len() as u16))
+    };
+
     // 会员摘要（有就显示）。首页宽，用完整形态（带产品名）
     if let Some(label) = state
         .vip_info
         .as_ref()
         .map(crate::api::cloud::VipInfo::label)
     {
-        lines.push(Line::from(Span::styled(
-            truncate_to_width(&label, text_area.width as usize),
-            theme.now_playing(),
-        )));
+        push_wrapped(&mut lines, &label, theme.now_playing());
     }
 
     // 领取今日 VIP。**只有概念版音源才显示**——这是概念版专属接口，标准版账号
     // 调了只会拿到错误码，摆一个按了没用的入口比不摆更糟。
-    if state.config.active_source_kind() == crate::source::SourceKind::KugouConcept
-        && (lines.len() as u16) < text_area.height
-    {
+    if state.config.active_source_kind() == crate::source::SourceKind::KugouConcept {
         let (text, style) = if state.vip_claiming {
             ("领取中…".to_string(), theme.dim())
         } else if claimed_today(state) {
@@ -1023,40 +1049,26 @@ fn render_account(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &T
                 theme.key_hint(),
             )
         };
-
-        let row = text_area.y + lines.len() as u16;
-        lines.push(Line::from(Span::styled(
-            truncate_to_width(&text, text_area.width as usize),
-            style,
-        )));
-        // 鼠标点这一行也能领（键盘是 V）
-        state.hit_map.insert(
-            Rect::new(text_area.x, row, text_area.width, 1),
-            HitTarget::VipClaim,
-            0,
-            1,
-        );
+        // 鼠标点这一行（含折行续行）也能领（键盘是 V）
+        if let Some((row, height)) = push_wrapped(&mut lines, &text, style) {
+            state.hit_map.insert(
+                Rect::new(text_area.x, row, text_area.width, height),
+                HitTarget::VipClaim,
+                0,
+                1,
+            );
+        }
     }
 
     // 累计听歌时长
-    if let Some(duration) = info.duration_text()
-        && (lines.len() as u16) < text_area.height
-    {
-        lines.push(Line::from(Span::styled(
-            truncate_to_width(&format!("听过 {duration}"), text_area.width as usize),
-            theme.dim(),
-        )));
+    if let Some(duration) = info.duration_text() {
+        push_wrapped(&mut lines, &format!("听过 {duration}"), theme.dim());
     }
 
     // 本地听歌统计摘要。与上面的「累计听歌时长」互补：那是账号的终身数字，
     // 这是本机最近一周的真实收听。没有任何记录时不占版面。
-    if let Some(summary) = state.stats.summary_line()
-        && (lines.len() as u16) < text_area.height
-    {
-        lines.push(Line::from(Span::styled(
-            truncate_to_width(&summary, text_area.width as usize),
-            theme.dim(),
-        )));
+    if let Some(summary) = state.stats.summary_line() {
+        push_wrapped(&mut lines, &summary, theme.dim());
     }
 
     frame.render_widget(Paragraph::new(lines), text_area);
@@ -1114,14 +1126,16 @@ pub fn render_home(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &
             .spacing(1)
             .areas(inner);
 
-        // 左栏竖着切：上方封面（铺满整块）、下方账号信息（固定 8 行，不能被挤掉）。
+        // 左栏竖着切：上方封面（贴顶显示）、下方账号信息（自适应高度）。
         //
         // 之前让封面框按图片比例自己算高度，结果框能把整个左栏吃掉，
-        // 账号区高度变成 0 —— 用户看到「个人信息被挤掉了」。
-        // 现在账号区固定，封面用剩下的全部空间，按 `cover_fill` 铺满
-        // （见 `prepare_cover`）。栏与栏之间同样留一空行/一列，与整屏一致。
+        // 账号区高度变成 0 —— 用户看到「个人信息被挤掉了」。所以账号区
+        // 有 8 行的硬下限；左栏高的时候账号区最多到 [`ACCOUNT_MAX_HEIGHT`]，
+        // 长行折行才有地方落——封面在 Tall 面板里反正贴顶（`fit_box`），
+        // 多出的高度给文字比给空白值。栏与栏之间同样留一空行/一列。
+        let account_rows = (left.height / 2).clamp(ACCOUNT_HEIGHT, ACCOUNT_MAX_HEIGHT);
         let [cover_col, account_col] =
-            Layout::vertical([Constraint::Min(6), Constraint::Length(ACCOUNT_HEIGHT)])
+            Layout::vertical([Constraint::Min(6), Constraint::Length(account_rows)])
                 .spacing(1)
                 .areas(left);
         let left_block = panel("封面", false, theme);
@@ -1485,7 +1499,7 @@ mod tests {
         assert_eq!((stretched.width(), stretched.height()), (200, 100));
     }
 
-    /// 完整显示模式：区域缩到图片比例，居中，绝不超出区域。
+    /// 完整显示模式：区域缩到图片比例，水平居中、贴顶，绝不超出区域。
     #[test]
     fn fit_box_matches_the_image_ratio_and_stays_inside() {
         let font = FontSize::new(10, 20);
@@ -1501,6 +1515,58 @@ mod tests {
         let wide = fit_box(&solid(160, 90), area, font);
         assert!(wide.width <= area.width && wide.height <= area.height);
         assert!(wide.width > square.width, "横图应该更宽");
+    }
+
+    /// Tall 区域里封面框**贴顶**：垂直居中会让上下各空一大条，看起来像面板
+    /// 坏了；贴顶之后空档集中在下方，视线从封面落到下面的「我的资料」。
+    #[test]
+    fn fit_box_hugs_the_top_of_a_tall_area() {
+        let font = FontSize::new(10, 20);
+        let area = Rect::new(0, 3, 34, 30);
+        let square = fit_box(&solid(100, 100), area, font);
+        assert_eq!(square.y, area.y, "Tall 区域里应贴顶而不是垂直居中");
+        assert_eq!(square.x, area.x, "水平居中（34 列正好放下方图）");
+        assert_eq!(square.height, 17, "行数按区域宽度反算");
+        assert!(square.bottom() <= area.bottom());
+    }
+
+    /// 账号区的长行要**折行**而不是 `…` 截断：会员到期日、统计数字被截掉
+    /// 就等于信息丢了。
+    #[test]
+    fn account_lines_wrap_instead_of_truncating() {
+        let mut state = AppState::new(crate::config::Config::default());
+        state.current = Some(crate::api::model::Song::default());
+        state.user_info = Some(crate::api::cloud::UserInfo {
+            nickname: "惜别".to_string(),
+            grade: Some(9),
+            duration_min: Some(79_239),
+            ..Default::default()
+        });
+        state.vip_info = Some(crate::api::cloud::VipInfo {
+            kind: crate::api::cloud::VipKind::Concept,
+            product: "svip".to_string(),
+            end_time: "2026-11-06 12:00:00".to_string(),
+        });
+        state
+            .stats
+            .record_complete_on(Some("2026-11-05".to_string()), "周杰伦");
+        state
+            .stats
+            .add_listen_on(Some("2026-11-05".into()), 90 * 60_000);
+
+        // 22 列的内区逼出折行（完整会员形态有 22 列宽）
+        let area = Rect::new(0, 0, 24, 14);
+        let mut terminal = Terminal::new(TestBackend::new(24, 14)).expect("建测试终端");
+        let theme = Theme::for_config(ThemeName::Default, false);
+        terminal
+            .draw(|frame| render_account(frame, area, &mut state, &theme))
+            .expect("渲染账号区");
+
+        let text = buffer_text(&terminal);
+        assert!(text.contains("11-06"), "会员到期日应显示出来：{text}");
+        assert!(text.contains("最常听"), "统计摘要应显示出来：{text}");
+        assert!(text.contains("周杰伦"), "最常听的歌手应显示出来：{text}");
+        assert!(!text.contains('…'), "账号区不该出现省略号：{text}");
     }
 
     /// 三种模式都不该让图溢出区域——溢出会被 ratatui 裁掉，看起来就是「图缺了一块」。

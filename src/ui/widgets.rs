@@ -449,6 +449,89 @@ pub fn truncate_to_width(text: &str, max_width: usize) -> String {
     output
 }
 
+/// 按显示宽度把一行拆成多行：首行 `first` 列，其余行 `rest` 列。
+///
+/// 拉丁词在空格处断（词内不拆），CJK 与全角字符逐字可断；单个词比预算还宽时
+/// 硬拆——硬拆不够放一行也要推进，否则死循环。各行不带行尾空白，空输入返回空。
+/// 需要续行缩进的调用方（侧边栏的 `kv`）自己给续行加前缀。
+pub fn wrap_to_width(text: &str, first: usize, rest: usize) -> Vec<String> {
+    if text.is_empty() || first == 0 {
+        return Vec::new();
+    }
+
+    // 切词：空白是分隔符；宽字符（CJK/全角）自成一词，逐字可断。
+    let mut tokens: Vec<String> = Vec::new();
+    let mut word = String::new();
+    for character in text.chars() {
+        if character.is_whitespace() {
+            if !word.is_empty() {
+                tokens.push(std::mem::take(&mut word));
+            }
+            tokens.push(" ".to_string());
+        } else if char_width(character) > 1 {
+            if !word.is_empty() {
+                tokens.push(std::mem::take(&mut word));
+            }
+            tokens.push(character.to_string());
+        } else {
+            word.push(character);
+        }
+    }
+    if !word.is_empty() {
+        tokens.push(word);
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    let mut budget = first;
+
+    let mut flush = |current: &mut String, current_width: &mut usize, budget: &mut usize| {
+        if !current.is_empty() {
+            lines.push(std::mem::take(current));
+        }
+        *current_width = 0;
+        *budget = rest;
+    };
+
+    for token in tokens {
+        let token_width = display_width(&token);
+        if token == " " {
+            // 行首的空格丢弃；放不下时把空格留在上一行行尾（截掉）也无所谓——
+            // 下一行从词开始。
+            if current_width + 1 > budget {
+                continue;
+            }
+            current.push(' ');
+            current_width += 1;
+            continue;
+        }
+        if current_width + token_width <= budget {
+            current.push_str(&token);
+            current_width += token_width;
+            continue;
+        }
+        // 放不下：先收尾当前行
+        flush(&mut current, &mut current_width, &mut budget);
+        if token_width <= budget {
+            current.push_str(&token);
+            current_width = token_width;
+            continue;
+        }
+        // 单词比整行还宽：逐字硬拆
+        for character in token.chars() {
+            let character_width = char_width(character);
+            if current_width + character_width > budget {
+                flush(&mut current, &mut current_width, &mut budget);
+            }
+            current.push(character);
+            current_width += character_width;
+        }
+    }
+    flush(&mut current, &mut current_width, &mut budget);
+    lines
+}
+
 /// 把字节数格式化成人类可读的形式。
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 4] = ["B", "KiB", "MiB", "GiB"];
@@ -489,6 +572,32 @@ mod tests {
     #[test]
     fn truncation_of_zero_width_is_empty() {
         assert_eq!(truncate_to_width("abc", 0), "");
+    }
+
+    /// 折行：CJK 逐字可断、拉丁词不拆、空行与超宽词都有确定行为。
+    #[test]
+    fn wrapping_respects_display_width() {
+        // CJK：首行 5 列放不下第二个字（2+2+2 > 5）
+        assert_eq!(wrap_to_width("海阔天空", 5, 5), vec!["海阔", "天空"]);
+        // 拉丁词在空格处断，词内不拆
+        assert_eq!(
+            wrap_to_width("one two three", 7, 7),
+            vec!["one two", "three"]
+        );
+        // 混合：宽字符可以和拉丁词同行，按各自宽度累加
+        assert_eq!(wrap_to_width("a海b阔", 5, 5), vec!["a海b", "阔"]);
+        // 单词比整行还宽：硬拆而不是死循环
+        assert_eq!(wrap_to_width("abcdef", 2, 2), vec!["ab", "cd", "ef"]);
+        assert_eq!(wrap_to_width("海阔", 3, 3), vec!["海", "阔"]);
+        // 续行预算与首行可以不同
+        assert_eq!(wrap_to_width("aaaa bb cc", 4, 2), vec!["aaaa", "bb", "cc"]);
+        // 空输入与零宽
+        assert!(wrap_to_width("", 5, 5).is_empty());
+        assert!(wrap_to_width("abc", 0, 5).is_empty());
+        // 每行都不超预算
+        for line in wrap_to_width("概念版 SVIP · 至 2026-11-06", 14, 14) {
+            assert!(display_width(&line) <= 14, "超预算的行：{line}");
+        }
     }
 
     #[test]
