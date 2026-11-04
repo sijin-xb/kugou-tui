@@ -31,7 +31,7 @@ cargo test
 
 ## 改 UI 前先读这两处
 
-**`src/ui/widgets.rs` 的 `panel()`。** 面板只画**左右竖线**，不画上下横线。这是刻意的：一屏七八个面板全画成闭合框会变成一堆方格子。代价是布局常量里**不要再按「边框占 2 行」算**——`Block::title` 在没有上边框时会占用内容区第一行，所以窄区域（如两行的播放条）不要挂标题，用 `bare_panel`。
+**`src/ui/widgets.rs` 的 `panel()`。** 圆角闭合边框 + 左右各 1 列内边距（`Padding::horizontal(1)`）：内容区比面板**窄 4 列、矮 2 行**，算布局预算按这个来。标题画在边框线上，不额外吃行；但太窄的面板（比如 2 行高的）塞不下内容，先想清楚再挂。
 
 **`src/ui/hit.rs` 的 `HitMap`。** 鼠标命中区由渲染层每帧回填，事件层查表。不要在视图里自己算「鼠标落在第几行」——用 `hits.data_index_under(inner, offset, len)`。新增可点元素时：在 `HitTarget` 加变体 → 渲染时 `hit_map.insert_*` → `app/update.rs` 的 `click_at` 与三处「不处理」分支都要补齐。
 
@@ -62,7 +62,7 @@ cargo test
 
 加依赖前先问。现有依赖每一处取舍都写在 `Cargo.toml` 的注释里，改之前读那一段。
 
-**不要**为了「更现代」把 `ratatui` 换成 `cursive` / `tui-realm`。`src/ui/` 约 8.2 千行、`src/app/` 约 1.1 万行，全部围绕 ratatui 的 `Frame` / `Layout` / `ListState` 写；cursive 的线性布局做不出「侧边栏自适应 + 窄屏歌词上下对半」，也没有 `ratatui-image` 的等价物。
+**不要**为了「更现代」把 `ratatui` 换成 `cursive` / `tui-realm`。`src/ui/` 约 8.7 千行、`src/app/` 约 1.3 万行，全部围绕 ratatui 的 `Frame` / `Layout` / `ListState` 写；cursive 的线性布局做不出「侧边栏自适应 + 窄屏歌词上下对半」，也没有 `ratatui-image` 的等价物。
 
 ## 已验证的实测数据
 
