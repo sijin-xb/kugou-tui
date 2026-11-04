@@ -228,6 +228,39 @@ impl App {
         self.state.info(format!("歌词偏移 {offset:+} ms"));
     }
 
+    /// 把「随便听听」抓回来的歌洗牌、装进队列并开播第一首。
+    ///
+    /// 拿到空列表只提示不动作：队列里可能还有用户自己排的歌，宁可不改。
+    pub(super) fn apply_random_queue(&mut self, title: &str, mut songs: Vec<Song>) {
+        if songs.is_empty() {
+            self.state
+                .warn("随便听听没拿到歌（当前音源可能没有歌单广场），稍后再试");
+            return;
+        }
+        crate::app::update::shuffle(&mut songs);
+        let count = songs.len();
+        let first = songs[0].clone();
+
+        let mode = self.state.queue.mode();
+        if self.state.queue.replace_with(songs, 0).is_none() {
+            self.state.warn("随便听听没拿到歌，稍后再试");
+            return;
+        }
+        // replace_with 会重置模式，把它装回去
+        self.state.queue.set_mode(mode);
+        self.state.current = self.state.queue.current().cloned();
+        self.state.duration_ms = self
+            .state
+            .current
+            .as_ref()
+            .map(|song| song.duration_ms)
+            .unwrap_or(0);
+        // 先起播再报歌单名：start_playback 自己会写「正在解析播放地址」，
+        // 后写的这条才留得住——歌单来源比解析过程更值得留在状态栏。
+        self.start_playback(first, 0);
+        self.state.info(format!("随便听听：{title} · {count} 首"));
+    }
+
     /// 睡眠定时：在 关 → 15 → 30 → 60 → 120 分钟 之间循环。
     ///
     /// 切档按**档位下标**走（渐弱尾段剩余不足一分钟，从剩余时长反推会算错档），
@@ -486,6 +519,69 @@ mod tests {
         let half = sleep_fade_volume(volume, Duration::from_secs_f32(7.5));
         assert!((half - 0.4).abs() < 1e-6, "剩余一半时音量减半，实际 {half}");
         assert_eq!(sleep_fade_volume(volume, Duration::ZERO), 0.0);
+    }
+
+    /// 「随便听听」的队列替换：旧队列被整体换掉、第一首起播、模式保留；
+    /// 空列表不动队列只提示。
+    #[test]
+    fn random_queue_replaces_the_queue_and_starts_the_first_song() {
+        let mut app = App::for_test();
+        app.state.queue.append(crate::api::model::Song {
+            name: "旧歌".to_string(),
+            ..Default::default()
+        });
+        app.state
+            .queue
+            .set_mode(crate::app::queue::PlaybackMode::RepeatOne);
+
+        let songs = vec![
+            crate::api::model::Song {
+                name: "A".to_string(),
+                duration_ms: 100_000,
+                ..Default::default()
+            },
+            crate::api::model::Song {
+                name: "B".to_string(),
+                duration_ms: 200_000,
+                ..Default::default()
+            },
+        ];
+        app.apply_random_queue("华语热歌", songs);
+
+        assert_eq!(app.state.queue.len(), 2, "队列被替换");
+        assert!(
+            app.state.status.contains("华语热歌"),
+            "{}",
+            app.state.status
+        );
+        assert!(
+            app.state.current.is_some(),
+            "第一首应已就位（replace_with 定位到游标）"
+        );
+        let current_duration = app
+            .state
+            .current
+            .as_ref()
+            .map(|song| song.duration_ms)
+            .unwrap_or(0);
+        assert_eq!(app.state.duration_ms, current_duration, "时长跟 current 走");
+        assert_eq!(
+            app.state.queue.mode(),
+            crate::app::queue::PlaybackMode::RepeatOne,
+            "播放模式不应被替换冲掉"
+        );
+        assert_eq!(
+            app.state.playback,
+            crate::audio::engine::PlaybackState::Loading,
+            "起播走了取链，进入缓冲态"
+        );
+
+        // 空列表：提示，队列原样
+        let mut app = App::for_test();
+        app.state.queue.append(crate::api::model::Song::default());
+        app.apply_random_queue("空", Vec::new());
+        assert_eq!(app.state.queue.len(), 1, "空列表不该动队列");
+        assert!(app.state.status.contains("没拿到歌"));
     }
 
     /// 档位循环：关 → 15 → 30 → 60 → 120 → 关。切档按档位下标走，

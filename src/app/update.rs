@@ -86,6 +86,38 @@ fn expand_cover_size(url: &str, size: u32) -> String {
     }
 }
 
+/// xorshift64* 伪随机数。种子来自当前纳秒 + 自增常数：本项目刻意不依赖
+/// `rand`（见 `Cargo.toml` 注释），而「随便听听」要的只是不可预测，
+/// 不是密码学强度。
+fn random_u64() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as u64);
+    let mut value = nanos ^ COUNTER.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed);
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    value
+}
+
+/// `0..n` 的伪随机下标；`n == 0` 返回 0（调用方保证不会走到）。
+fn random_below(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        (random_u64() % n as u64) as usize
+    }
+}
+
+/// 就地 Fisher-Yates 洗牌。
+pub(super) fn shuffle<T>(items: &mut [T]) {
+    for index in (1..items.len()).rev() {
+        items.swap(index, random_below(index + 1));
+    }
+}
+
 /// 图片真实宽高比（宽/高）。
 ///
 /// 宽或高为 0、比值算出非有限值时按 1.0（方图）处理——宁可稍微变形，也别让
@@ -1313,6 +1345,7 @@ impl App {
             Action::ToggleSortOrder => self.toggle_sort_order(),
             Action::OpenRanks => self.switch_tab(Tab::Ranks),
             Action::OpenCloud => self.switch_tab(Tab::Cloud),
+            Action::RandomListen => self.random_listen(),
             Action::Login => self.start_login(),
             Action::ClaimVip => self.claim_daily_vip(),
             Action::CycleArtistFilter => self.cycle_artist_filter(),
@@ -1553,6 +1586,63 @@ impl App {
                 Ok(boards) => bus.emit(Loaded::RankBoards(boards)),
                 Err(error) => bus.fail_loading(LoadingTarget::Ranks, "载入排行榜失败", error),
             }
+        });
+    }
+
+    /// `w`：随便听听。
+    ///
+    /// 从歌单广场随机挑一个歌单、取它第一页的歌，洗牌后**替换**整个播放队列
+    /// 开播。刻意不新做接口：所有音源都有歌单广场（见 `MusicApi`），而
+    /// KaMusic / MoeKoeMusic 那类「每日推荐 / 私人 FM」要各音源专属端点，
+    /// 以后再接。替换而不是追加——随便听听本来就是「换一批听」，且歌单
+    /// 广场的东西随时能再找回来，不设确认。
+    pub fn random_listen(&mut self) {
+        let api = self.api.clone();
+        let active_source = self.state.config.active_source_kind();
+        let bus = self.bus.clone();
+        // 广场通常有很多页，随机页更有「手气」；空了回第 1 页兜底。
+        let page = 1 + random_below(5) as u32;
+        let category = self.state.playlists.category;
+        let page_size = self.state.config.page_size;
+
+        self.state.busy = Some("随便听听：挑歌单".to_string());
+
+        self.runtime.spawn(async move {
+            let mut playlists = active_source
+                .plaza_playlists(&api, category, page, page_size)
+                .await
+                .unwrap_or_default();
+            if playlists.is_empty() && page > 1 {
+                playlists = active_source
+                    .plaza_playlists(&api, category, 1, page_size)
+                    .await
+                    .unwrap_or_default();
+            }
+            let Some(playlist) = (!playlists.is_empty())
+                .then(|| playlists.swap_remove(random_below(playlists.len())))
+            else {
+                bus.emit(Loaded::RandomQueue {
+                    title: String::new(),
+                    songs: Vec::new(),
+                });
+                return;
+            };
+
+            // 只要第一页：够一次「随便听听」的量，不必整单翻页。
+            let songs = active_source
+                .playlist_tracks_page(
+                    &api,
+                    PlaylistRef::Public(&playlist.id),
+                    1,
+                    PAGE_LIMIT,
+                    false,
+                )
+                .await
+                .unwrap_or_default();
+            bus.emit(Loaded::RandomQueue {
+                title: playlist.name,
+                songs,
+            });
         });
     }
 
@@ -2281,6 +2371,11 @@ impl App {
                 // 「已同步 N 首」比「云端歌单：N 个」重要得多，不该被它覆盖掉。
                 // 列表本身的变化已经是足够的反馈。
                 self.state.cloud.list.replace(items);
+            }
+
+            Loaded::RandomQueue { title, songs } => {
+                self.state.busy = None;
+                self.apply_random_queue(&title, songs);
             }
 
             Loaded::Lyric { hash, lyric } => {
@@ -3768,6 +3863,27 @@ mod tests {
             crate::audio::engine::AudioEvent::TrackFinished,
         ));
         assert_eq!(app.state.stats.top_artist(), None, "试听片段不计数");
+    }
+
+    /// 洗牌是置换（一个不少、一个不多），随机下标不越界。
+    #[test]
+    fn shuffle_keeps_every_element_and_random_below_stays_in_range() {
+        let mut items: Vec<usize> = (0..64).collect();
+        shuffle(&mut items);
+        items.sort_unstable();
+        assert_eq!(items, (0..64).collect::<Vec<_>>(), "洗牌只能换位置");
+
+        for _ in 0..200 {
+            assert!(random_below(7) < 7);
+        }
+        assert_eq!(random_below(0), 0, "空集合不下标");
+
+        // 空表与单元素表洗牌不能 panic
+        let mut empty: Vec<u8> = Vec::new();
+        shuffle(&mut empty);
+        let mut one = vec![1u8];
+        shuffle(&mut one);
+        assert_eq!(one, vec![1]);
     }
 
     /// 指针移动要更新 hover，且松开鼠标后 hover 仍然保留（终端不上报离开）。

@@ -159,6 +159,8 @@ pub enum Action {
     ///
     /// 倒计时只在播放中走表（暂停即冻结），到点音量渐弱后暂停播放。
     CycleSleepTimer,
+    /// 随便听听：随机广场歌单抽一页歌，替换队列开播。
+    RandomListen,
     /// 可视化页局部键：打开 cava 调参面板。
     ///
     /// 不进 `resolve_normal`，也不在 CHEATSHEET / REBINDABLE 里——`e`/`v`/`V`/`E`
@@ -294,6 +296,7 @@ const REBINDABLE: &[(&str, Action)] = &[
     ("lyric_delay", Action::LyricDelay),
     ("lyric_advance", Action::LyricAdvance),
     ("sleep_timer", Action::CycleSleepTimer),
+    ("random_listen", Action::RandomListen),
     // ---- 业务 ----
     ("open_search", Action::OpenSearch),
     ("open_settings", Action::OpenSettings),
@@ -654,6 +657,8 @@ fn resolve_normal(key: KeyEvent) -> Action {
         KeyCode::Char('[') => Action::LyricDelay,
         // 睡眠定时：z 就是最直观的 zZz
         KeyCode::Char('z') => Action::CycleSleepTimer,
+        // 随便听听：w = whatever。大写 W 已经是下载，正好错开
+        KeyCode::Char('w') => Action::RandomListen,
 
         // ---- 业务 ----
         KeyCode::Char('/') => Action::OpenSearch,
@@ -774,6 +779,7 @@ pub const CHEATSHEET: &[(&str, &str, &str)] = &[
         "睡眠定时：关 → 15/30/60/120 分钟循环（到点渐弱暂停）",
         "播放",
     ),
+    ("w", "随便听听：随机歌单抽一页歌，替换队列开播", "播放"),
 ];
 
 #[cfg(test)]
