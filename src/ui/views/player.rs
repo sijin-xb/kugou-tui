@@ -1039,9 +1039,22 @@ fn render_account(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &T
     }
 
     // 累计听歌时长
-    if let Some(duration) = info.duration_text() {
+    if let Some(duration) = info.duration_text()
+        && (lines.len() as u16) < text_area.height
+    {
         lines.push(Line::from(Span::styled(
             truncate_to_width(&format!("听过 {duration}"), text_area.width as usize),
+            theme.dim(),
+        )));
+    }
+
+    // 本地听歌统计摘要。与上面的「累计听歌时长」互补：那是账号的终身数字，
+    // 这是本机最近一周的真实收听。没有任何记录时不占版面。
+    if let Some(summary) = state.stats.summary_line()
+        && (lines.len() as u16) < text_area.height
+    {
+        lines.push(Line::from(Span::styled(
+            truncate_to_width(&summary, text_area.width as usize),
             theme.dim(),
         )));
     }

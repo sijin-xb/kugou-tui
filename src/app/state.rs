@@ -1314,6 +1314,10 @@ pub struct AppState {
     pub volume_before_mute: Option<f32>,
     pub lyric: LyricPane,
 
+    /// 本地听歌统计（播完次数 + 收听时长）。App 层在启动时读回、tick 累加、
+    /// 定期落盘；渲染层只在首页资料区读摘要。见 `app::stats`。
+    pub stats: crate::app::stats::ListeningStats,
+
     // ---- 云端同步 ----
     /// 同步目标歌单。在云端标签页选中歌单时自动设置。
     pub sync_target: Option<Playlist>,
@@ -1701,6 +1705,7 @@ impl AppState {
             audio_devices: Vec::new(),
             volume_before_mute: None,
             lyric: LyricPane::default(),
+            stats: crate::app::stats::ListeningStats::default(),
             cover: CoverArt::default(),
             settings_cursor: 0,
             sync_target: None,

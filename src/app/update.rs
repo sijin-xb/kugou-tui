@@ -3129,6 +3129,15 @@ impl App {
                     return;
                 }
 
+                // 完整听完一首：计入本地听歌统计（见 `app::stats`）。先取歌手再
+                // 切歌——`next_track` 之后 `current` 就不是这首了。
+                if let Some(song) = self.state.current.as_ref() {
+                    let artist = song.singers.first().map(|singer| singer.name.clone());
+                    self.state
+                        .stats
+                        .record_complete(&artist.unwrap_or_default());
+                }
+
                 // 自然播完：顺序模式到底就停，单曲循环原地重播
                 self.next_track(false);
             }
@@ -3209,9 +3218,10 @@ impl App {
 
         // 定期落盘会话。只在正常退出时存是不够的——关机、断电、进程被杀时
         // `shutdown()` 根本不会执行，上次进度就丢了（用户实测「重启就没了」）。
-        // 这里每 30 秒存一次兜底，最坏情况丢半分钟进度。
+        // 这里每 30 秒存一次兜底，最坏情况丢半分钟进度。听歌统计同一节奏落盘。
         if self.last_session_save.elapsed() >= std::time::Duration::from_secs(30) {
             self.persist_session();
+            self.state.stats.save();
             self.last_session_save = std::time::Instant::now();
         }
 
@@ -3271,6 +3281,11 @@ impl App {
         // 睡眠定时：只在播放中走表（暂停即冻结）。到点把音量还原、暂停播放；
         // 尾段 15 秒按剩余比例渐弱，到点正好归零。
         let playing = self.state.playback == PlaybackState::Playing;
+        // 收听时长按真实经过时间累加：哪怕界面卡了一拍，音乐是照放的，
+        // 这段时间就该算进去（与动画用的 `advance_visualizer` 不同，不夹 0.5s）。
+        if playing {
+            self.state.stats.add_listen(elapsed.as_millis() as u64);
+        }
         let sleep_expired = self.state.sleep_timer.as_mut().is_some_and(|timer| {
             crate::app::playback::advance_sleep_timer(timer, elapsed, playing)
         });
@@ -3714,6 +3729,45 @@ mod tests {
         assert!(app.state.cava_panel.is_none(), "面板开着时 E 应当关闭它");
 
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// 完整听完一首计入本地统计，歌手进榜；试听片段播完**不**计数。
+    ///
+    /// 日期相关的断言写不了（`time` 在多线程测试进程里可能拒绝推断本地偏移，
+    /// 当天计数会随机跳过），所以只断言歌手榜——它与日期无关。
+    #[test]
+    fn finishing_a_track_counts_into_local_stats() {
+        let mut app = App::for_test();
+        let singer = |name: &str| crate::api::model::Singer {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        app.state.current = Some(crate::api::model::Song {
+            name: "夜曲".to_string(),
+            singers: vec![singer("周杰伦")],
+            ..Default::default()
+        });
+        app.handle_event(Event::Audio(
+            crate::audio::engine::AudioEvent::TrackFinished,
+        ));
+        assert_eq!(
+            app.state.stats.top_artist(),
+            Some("周杰伦"),
+            "播完应当计入歌手榜"
+        );
+
+        // 试听片段不算「听完」
+        let mut app = App::for_test();
+        app.state.current = Some(crate::api::model::Song {
+            name: "试听".to_string(),
+            singers: vec![singer("某歌手")],
+            ..Default::default()
+        });
+        app.state.current_is_trial = true;
+        app.handle_event(Event::Audio(
+            crate::audio::engine::AudioEvent::TrackFinished,
+        ));
+        assert_eq!(app.state.stats.top_artist(), None, "试听片段不计数");
     }
 
     /// 指针移动要更新 hover，且松开鼠标后 hover 仍然保留（终端不上报离开）。

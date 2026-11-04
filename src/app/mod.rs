@@ -91,6 +91,7 @@ pub mod search;
 pub mod session;
 pub mod settings;
 pub mod state;
+pub mod stats;
 pub mod update;
 
 use std::time::{Duration, Instant};
@@ -342,6 +343,10 @@ impl App {
         // 音频后端，那是音频线程的地盘，主线程只取一次名字就走。
         app.state.audio_devices = crate::audio::list_output_devices();
 
+        // 听歌统计是长期数据，跟会话一起在启动时读回（App::for_test 不走这里，
+        // 测试里统计从空开始，不会读写用户文件）。
+        app.state.stats = crate::app::stats::ListeningStats::load();
+
         app.restore_session();
         app.announce_readiness();
         // 放在 announce_readiness 之后：这种故障比「未登录」严重，提示不能被覆盖
@@ -579,6 +584,7 @@ impl App {
         } else {
             self.persist_config();
             self.persist_session();
+            self.state.stats.save();
         }
         // 先把还在下的那条流叫停，再关音频线程：否则音频线程会在
         // `Player::clear()` 里等那个阻塞在 read() 里的解码器（最长 15 秒）
