@@ -62,7 +62,7 @@ pub fn render_player(frame: &mut Frame, area: Rect, state: &mut AppState, theme:
 ///
 /// 播放条只有两行，所以把歌手、专辑并进歌名那一行——拆成独立一行的话进度条
 /// 就得再让一行出来，列表能显示的内容反而更少。右侧那一小段用暗色，不抢歌名。
-fn render_song_info(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+fn render_song_info(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     let marker = match state.playback {
         PlaybackState::Playing => crate::ui::icons::now_playing(true),
         PlaybackState::Paused => crate::ui::icons::now_playing(false),
@@ -123,7 +123,7 @@ fn render_song_info(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
     } else if display_width(&volume) as u16 + 3 + mode_width <= max_right {
         format!("{volume} · {mode}")
     } else {
-        mode
+        mode.clone()
     };
 
     let right_width = (display_width(&right_text) as u16).min(area.width);
@@ -157,6 +157,43 @@ fn render_song_info(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
             )))
             .alignment(Alignment::Right),
             right_area,
+        );
+
+        // 播放条鼠标控制：右段里「下一首 / 音量 / 模式」都能点，
+        // 点歌名左侧的播放状态图标则切播放/暂停。
+        //
+        // 坐标必须按**渲染时真正显示出来的那段字符串**算：窄屏会丢段，
+        // 直接按完整字符串找子串会登记到看不见的文本上。右段是右对齐的，
+        // 所以子串的列偏移要在「可能被截断后的右段」里找，再换算成屏幕列。
+        let right_display = truncate_to_width(&right_text, right_area.width as usize);
+        let right_x = right_area.x
+            + right_area
+                .width
+                .saturating_sub(display_width(&right_display) as u16);
+        let register_right_hit = |state: &mut AppState, needle: &str, target: HitTarget| {
+            let Some(start) = right_display.find(needle) else {
+                return;
+            };
+            let x = right_x + display_width(&right_display[..start]) as u16;
+            let width = display_width(needle) as u16;
+            if width > 0 && x < right_area.right() {
+                state.hit_map.insert_flat(
+                    Rect::new(x, right_area.y, width.min(right_area.right() - x), 1),
+                    target,
+                );
+            }
+        };
+        if next.is_some() {
+            register_right_hit(state, "下一首", HitTarget::NextTrack);
+        }
+        register_right_hit(state, &volume, HitTarget::Volume);
+        register_right_hit(state, &mode, HitTarget::PlayMode);
+
+        // 播放状态图标是左段最前面那个字符，占 2 列（图标 + 空格）
+        let icon_width = display_width(&format!("{marker} ")) as u16;
+        state.hit_map.insert_flat(
+            Rect::new(left_area.x, left_area.y, icon_width.min(left_area.width), 1),
+            HitTarget::PlayPause,
         );
     }
 }

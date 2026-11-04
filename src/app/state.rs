@@ -212,20 +212,17 @@ pub enum HitTarget {
     ConfirmYes,
     /// 确认对话框的「取消」按钮。
     ConfirmNo,
-    /// 播放条的「上一首」按钮。播放条未重做，暂无登记方。
+    /// 播放条的「上一首」按钮。保留给点击/拖拽分派，但旧版播放条外观里
+    /// 没有独立的上一首按钮，所以当前没有登记方（见 `player::render_song_info`）。
     #[allow(dead_code)]
     PrevTrack,
-    /// 播放条的「播放 / 暂停」按钮。播放条未重做，暂无登记方。
-    #[allow(dead_code)]
+    /// 播放条的「播放 / 暂停」按钮。
     PlayPause,
-    /// 播放条的「下一首」按钮。播放条未重做，暂无登记方。
-    #[allow(dead_code)]
+    /// 播放条的「下一首」按钮。
     NextTrack,
-    /// 播放条的音量条：点击 / 拖动改音量。播放条未重做，暂无登记方。
-    #[allow(dead_code)]
+    /// 播放条的音量条：点击 / 拖动改音量。
     Volume,
-    /// 播放条的循环模式按钮：点一次换一种模式。播放条未重做，暂无登记方。
-    #[allow(dead_code)]
+    /// 播放条的循环模式按钮：点一次换一种模式。
     PlayMode,
 }
 
@@ -1130,7 +1127,40 @@ impl LyricPane {
 // 根状态
 // ============================================================================
 
-#[derive(Debug)]
+/// 可视化页频谱模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualizerMode {
+    Bars,
+    Waterfall,
+}
+
+/// cava 调参面板里可改的四项参数，顺序即面板里的上下顺序。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum CavaSetting {
+    NoiseReduction,
+    AutoSensitivity,
+    LowCutoff,
+    HighCutoff,
+}
+
+impl CavaSetting {
+    pub const ALL: [CavaSetting; 4] = [
+        CavaSetting::NoiseReduction,
+        CavaSetting::AutoSensitivity,
+        CavaSetting::LowCutoff,
+        CavaSetting::HighCutoff,
+    ];
+}
+
+/// cava 调参面板的 UI 状态。目前只用一个存在标记，后续要加编辑缓冲再说。
+#[derive(Debug, Default)]
+pub struct CavaPanelState;
+
+/// 瀑布图保留多少帧历史。按 30fps 算约 8 秒；每行 128 个 f32（512B），
+/// 上限约 120KB，不会随播放时长增长。
+pub const SPECTRUM_HISTORY_LIMIT: usize = 240;
+
 pub struct AppState {
     // ---- 配置与连接 ----
     pub config: Config,
@@ -1191,6 +1221,10 @@ pub struct AppState {
     pub levels: Vec<f32>,
     /// 当前这段声音的频谱（0.0~1.0），由 FFT 分频得到，**频域**。
     pub spectrum: Vec<f32>,
+    pub spectrum_history: Vec<Vec<f32>>,
+    pub visualizer_mode: VisualizerMode,
+    pub cava_setting: usize,
+    pub cava_panel: Option<CavaPanelState>,
     /// 平滑后的频谱。原始频谱每帧跳一次，直接画会明显抖动；这里做
     /// 「快起慢落」的缓动后，柱子才跟手又不抖。
     pub smooth_spectrum: Vec<f32>,
@@ -1587,6 +1621,10 @@ impl AppState {
             position_ms: 0,
             levels: Vec::new(),
             spectrum: Vec::new(),
+            spectrum_history: Vec::new(),
+            visualizer_mode: VisualizerMode::Bars,
+            cava_setting: 0,
+            cava_panel: None,
             smooth_spectrum: Vec::new(),
             peak_spectrum: Vec::new(),
             duration_ms: 0,
@@ -1919,6 +1957,7 @@ impl AppState {
         if self.spectrum.is_empty() {
             self.smooth_spectrum.clear();
             self.peak_spectrum.clear();
+            self.spectrum_history.clear();
             return;
         }
 
@@ -1946,6 +1985,112 @@ impl AppState {
             let peak = self.peak_spectrum[index];
             self.peak_spectrum[index] = (peak - peak_fall).max(next);
         }
+
+        // 瀑布图记录平滑后的频谱。Vec<Vec<f32>> 有界，超出就丢最旧的一帧。
+        if self.spectrum_history.len() >= SPECTRUM_HISTORY_LIMIT {
+            self.spectrum_history.remove(0);
+        }
+        self.spectrum_history.push(self.smooth_spectrum.clone());
+    }
+
+    /// 当前选中的 cava 参数（由 `cava_setting` 环绕取模）。
+    pub fn cava_setting(&self) -> CavaSetting {
+        CavaSetting::ALL[self.cava_setting % CavaSetting::ALL.len()]
+    }
+
+    /// ←/→ 调当前选中的 cava 参数，每档一个合理步长，并夹到有效范围。
+    ///
+    /// 只改内存里的 config；退出面板时统一 `save()`，避免每按一次就写一次盘。
+    /// `ensure_cava` 会在检测到参数变化后重建分析器，所以下一帧就能看到效果。
+    pub fn adjust_cava_setting(&mut self, direction: i32) {
+        let setting = self.cava_setting();
+        let config = &mut self.config;
+        match setting {
+            CavaSetting::NoiseReduction => {
+                config.cava_noise_reduction =
+                    (config.cava_noise_reduction + direction as f32 * 0.05).clamp(0.0, 0.95);
+            }
+            CavaSetting::AutoSensitivity => {
+                if direction != 0 {
+                    config.cava_autosens = !config.cava_autosens;
+                }
+            }
+            CavaSetting::LowCutoff => {
+                let step = 10 * direction;
+                let next = config.cava_low_cutoff as i64 + step as i64;
+                config.cava_low_cutoff = next.clamp(20, 200) as u32;
+                if config.cava_high_cutoff <= config.cava_low_cutoff + 100 {
+                    config.cava_high_cutoff = (config.cava_low_cutoff + 100).min(20_000);
+                }
+            }
+            CavaSetting::HighCutoff => {
+                let step = 500 * direction;
+                let next = config.cava_high_cutoff as i64 + step as i64;
+                config.cava_high_cutoff = next.clamp(1_000, 20_000) as u32;
+                if config.cava_high_cutoff <= config.cava_low_cutoff + 100 {
+                    config.cava_low_cutoff = config.cava_high_cutoff.saturating_sub(100).max(20);
+                }
+            }
+        }
+    }
+
+    /// 当前 cava 配置指纹，用于 `ensure_cava` 判断是否需要重建分析器。
+    pub fn cava_config_key(&self) -> (u32, bool, u32, u32) {
+        (
+            self.config.cava_noise_reduction.to_bits(),
+            self.config.cava_autosens,
+            self.config.cava_low_cutoff,
+            self.config.cava_high_cutoff,
+        )
+    }
+}
+
+#[cfg(test)]
+mod cava_tests {
+    use super::*;
+
+    #[test]
+    fn cava_settings_clamp_and_history_stays_bounded() {
+        let mut state = AppState::new(Config::default());
+
+        // 平滑强度：左右各调 100 次也不能越出 0..0.95
+        state.cava_setting = CavaSetting::NoiseReduction as usize;
+        for _ in 0..100 {
+            state.adjust_cava_setting(1);
+        }
+        assert!(state.config.cava_noise_reduction <= 0.95);
+        for _ in 0..100 {
+            state.adjust_cava_setting(-1);
+        }
+        assert!(state.config.cava_noise_reduction >= 0.0);
+
+        // 自动增益：两个方向都是 toggle
+        state.cava_setting = CavaSetting::AutoSensitivity as usize;
+        let before = state.config.cava_autosens;
+        state.adjust_cava_setting(1);
+        assert_eq!(state.config.cava_autosens, !before);
+        state.adjust_cava_setting(-1);
+        assert_eq!(state.config.cava_autosens, before);
+
+        // 瀑布历史：有界，不会随帧数无限增长
+        state.spectrum = vec![0.5; 4];
+        for _ in 0..SPECTRUM_HISTORY_LIMIT + 50 {
+            state.advance_visualizer(std::time::Duration::from_millis(16));
+        }
+        assert_eq!(state.spectrum_history.len(), SPECTRUM_HISTORY_LIMIT);
+
+        // 停止采样时清历史，下次起播从空画布开始
+        state.spectrum.clear();
+        state.advance_visualizer(std::time::Duration::from_millis(16));
+        assert!(state.spectrum_history.is_empty());
+    }
+
+    #[test]
+    fn visualizer_mode_and_cava_setting_are_stable() {
+        let state = AppState::new(Config::default());
+        assert_eq!(state.visualizer_mode, VisualizerMode::Bars);
+        assert_eq!(state.cava_setting(), CavaSetting::NoiseReduction);
+        assert_eq!(CavaSetting::ALL.len(), 4);
     }
 }
 

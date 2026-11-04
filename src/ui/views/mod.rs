@@ -24,7 +24,7 @@ pub use player::{
 };
 pub use settings::render_settings;
 pub use sources::{render_login_picker, render_sources};
-pub use visualizer::render_visualizer;
+pub use visualizer::{render_cava_panel, render_visualizer};
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Rect};

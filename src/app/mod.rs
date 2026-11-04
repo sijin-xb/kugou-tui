@@ -100,7 +100,6 @@ use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 use crate::api::ApiClient;
 use crate::api::traits::MusicApi;
-use crate::app::state::Tab;
 use crate::audio::engine::PlaybackState;
 use crate::audio::{AudioCache, AudioHandle, Downloader};
 use crate::config::Config;
@@ -136,6 +135,8 @@ pub struct App {
     cava: Option<crate::audio::cava::Cava>,
     /// `cava` 是按哪个采样率建的。与当前采样率不一致时重建。
     cava_rate: u32,
+    /// 建 `cava` 时的四项配置。可视化页实时调参后要重建才能生效。
+    cava_config: (u32, bool, u32, u32),
     /// 上次送到 cava 的采样窗游标。只喂增量，不喂整个窗口。
     cava_cursor: usize,
 
@@ -297,6 +298,7 @@ impl App {
             last_frame_at: Instant::now(),
             cava: None,
             cava_rate: 0,
+            cava_config: (0, false, 0, 0),
             cava_cursor: 0,
             last_session_save: Instant::now(),
             last_mem_trace: Instant::now(),
@@ -378,20 +380,21 @@ impl App {
     /// 而不是「等满一个 tick 才响应」。
     /// 当前这一帧该等多久。
     ///
-    /// 平时用配置的 `tick_ms`（默认 200ms，省电）。但有两处需要连续重绘：
-    /// 可视化页的频谱柱，以及**歌词真的显示在屏幕上**时的逐字推进——5fps 下
-    /// 再精细的插值也是五格一跳。两处都临时提到 ~30fps（33ms）。
+    /// 平时用配置的 `tick_ms`（默认 200ms，省电）。但需要连续重绘的有三处：
+    /// 可视化页的整屏频谱、歌词真的显示时的逐字推进、以及所有页面播放时那条
+    /// 单行迷你频谱——5fps 下再精细的插值也是五格一跳。三处都临时提到 ~30fps
+    /// （33ms）。
     ///
     /// 为什么不到 60fps：终端一次重绘是整屏 diff，16ms 与 33ms 的观感差别很小，
     /// 代价却是翻倍的 CPU。这里按「看起来顺」而不是「数字好看」取值。
     fn frame_interval(&self) -> Duration {
         let playing = self.state.playback == PlaybackState::Playing;
-        let visualizer = playing && self.state.tab == Tab::Visualizer;
-        // 歌词可见**且**在播才提速：暂停时那一格不会动，没必要重绘；
-        // 不显示歌词时更是白费 CPU——这是本项目「低占用」卖点的一部分。
+        // 可视化页的整屏频谱、所有页面播放时的单行迷你频谱、歌词逐字推进，
+        // 三者都需要连续帧；5fps 下再精细的插值也是五格一跳。
+        // lite_mode 下 `frame_delay` 仍会压回 200ms。
         let lyric = playing && self.state.lyric_visible;
 
-        frame_delay(&self.state.config, visualizer, lyric)
+        frame_delay(&self.state.config, playing, lyric)
     }
 
     /// 保证 cava 分析器与当前音源的采样率一致。
@@ -405,7 +408,8 @@ impl App {
             // 还没开始播，采样率未知。此时不建，等第一帧有数据再说。
             return None;
         }
-        if self.cava.is_none() || self.cava_rate != rate {
+        let config_key = self.state.cava_config_key();
+        if self.cava.is_none() || self.cava_rate != rate || self.cava_config != config_key {
             self.cava = Some(crate::audio::cava::Cava::with_options(
                 crate::audio::spectrum::BAND_COUNT,
                 rate,
@@ -415,6 +419,7 @@ impl App {
                 self.state.config.cava_high_cutoff,
             ));
             self.cava_rate = rate;
+            self.cava_config = config_key;
             // 新分析器的内部缓冲是空的，游标要跟着对上，否则会把整窗历史
             // 当成「新样本」一次性灌进去。
             self.cava_cursor = self.audio.sample_cursor();
@@ -691,6 +696,7 @@ impl App {
             last_frame_at: Instant::now(),
             cava: None,
             cava_rate: 0,
+            cava_config: (0, false, 0, 0),
             cava_cursor: 0,
             last_session_save: Instant::now(),
             last_mem_trace: Instant::now(),

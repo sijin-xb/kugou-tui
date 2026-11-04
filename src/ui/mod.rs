@@ -116,6 +116,7 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     }
 
     render_main(frame, main_area, state, &theme);
+    render_mini_spectrum(frame, player_area, state, &theme);
     views::render_player(frame, player_area, state, &theme);
     views::render_status(frame, status_area, state, busy, &theme);
 
@@ -158,6 +159,11 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     if let Some(picker) = state.quality_picker.as_ref() {
         let zones = views::render_quality_picker(frame, picker, &state.hit_map, &theme);
         state.merge_hit_zones(zones);
+    }
+
+    // cava 调参面板：盖在可视化页之上，最后画，和确认框同级
+    if state.cava_panel.is_some() {
+        views::render_cava_panel(frame, area, state, &theme);
     }
 
     // 确认对话框优先级最高，画在最上层
@@ -520,6 +526,61 @@ fn render_too_small(frame: &mut Frame, area: Rect) {
         area.width, area.height, MIN_WIDTH, MIN_HEIGHT
     );
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), area);
+}
+
+/// 播放条上方那条空白间隔里的单行迷你频谱。
+///
+/// 不占额外高度——用的是布局本来就会留的 1 行 spacing。任何页面播放时都能看到
+/// 音乐在跳，比只看进度条有生命感；可视化页本身已经整屏频谱，这里就不重复画。
+fn render_mini_spectrum(frame: &mut Frame, player_area: Rect, state: &AppState, theme: &Theme) {
+    if state.tab == Tab::Visualizer || player_area.y == 0 {
+        return;
+    }
+    if state.playback != PlaybackState::Playing || state.smooth_spectrum.is_empty() {
+        return;
+    }
+
+    let area = Rect::new(player_area.x, player_area.y - 1, player_area.width, 1);
+    let width = area.width as usize;
+    if width == 0 {
+        return;
+    }
+
+    // 把 128 个频段重采样到当前列数，每列一个字符
+    let levels = &state.smooth_spectrum;
+    let stride = crate::ui::views::visualizer::bar_stride(width, levels.len());
+    let bars = (width / stride).min(levels.len());
+    if bars == 0 {
+        return;
+    }
+
+    let mut spans = Vec::with_capacity(bars);
+    for column in 0..bars {
+        let band = column * levels.len() / bars.max(1);
+        let value = levels[band].clamp(0.0, 1.0);
+        let (symbol, strength) = if value > 0.66 {
+            ("▂", 1.0)
+        } else if value > 0.33 {
+            ("·", 0.5)
+        } else if value > 0.08 {
+            ("·", 0.25)
+        } else {
+            (" ", 0.0)
+        };
+        if strength > 0.0 {
+            let color = crate::ui::theme::mix(theme.progress_bg, theme.accent, strength);
+            spans.push(ratatui::text::Span::styled(
+                symbol,
+                ratatui::style::Style::default().fg(color),
+            ));
+        } else {
+            spans.push(ratatui::text::Span::raw(" "));
+        }
+    }
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(ratatui::text::Line::from(spans)),
+        area,
+    );
 }
 
 #[cfg(test)]

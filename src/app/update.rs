@@ -38,8 +38,8 @@ use crate::api::model::{Artist, Playlist, RankBoard, Song, format_duration_ms};
 use crate::app::App;
 use crate::app::settings::quality_label;
 use crate::app::state::{
-    ConfirmAction, Connection, CoverArt, Focus, HitTarget, HitZone, LoginState, PromptAction,
-    PromptState, QualityPicker, Tab,
+    CavaPanelState, ConfirmAction, Connection, CoverArt, Focus, HitTarget, HitZone, LoginState,
+    PromptAction, PromptState, QualityPicker, Tab, VisualizerMode,
 };
 use crate::audio::engine::AudioSource;
 use crate::error::AppError;
@@ -243,6 +243,11 @@ impl App {
             // 但会在每一格都 seek 一次。节流交给音频线程的 seek 去重。
             HitTarget::LyricLine => self.drag_lyric(mouse),
             HitTarget::Songs | HitTarget::Entries | HitTarget::Queue => self.drag_list_row(mouse),
+            HitTarget::Volume => {
+                if let Some(zone) = self.state.hit_test(mouse.column, mouse.row) {
+                    self.drag_volume(zone, mouse);
+                }
+            }
             _ => {}
         }
     }
@@ -973,6 +978,31 @@ impl App {
             return;
         }
 
+        // cava 调参面板是模态的：↑↓ 选参数、←→ 调值、Esc/Enter 关闭并保存。
+        if self.state.cava_panel.is_some() {
+            match action {
+                Action::MoveUp => self.state.cava_setting = self.state.cava_setting.wrapping_sub(1),
+                Action::MoveDown => {
+                    self.state.cava_setting = self.state.cava_setting.wrapping_add(1)
+                }
+                Action::SeekBackward | Action::CursorLeft => self.state.adjust_cava_setting(-1),
+                Action::SeekForward | Action::CursorRight => self.state.adjust_cava_setting(1),
+                Action::Submit | Action::Cancel => {
+                    self.state.cava_panel = None;
+                    if let Err(error) = self.state.config.save() {
+                        self.state.warn(format!("保存 cava 配置失败：{error}"));
+                    }
+                }
+                Action::Quit => self.state.should_quit = true,
+                Action::ForceQuit => {
+                    self.state.should_quit = true;
+                    self.state.force_quit = true;
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // 设置页：← → 是「改值」。这一页没有输入框也没有播放进度，
         // 让方向键去快进/快退的话，用户在这一页就只剩 Enter 能用，很别扭。
         //
@@ -1279,6 +1309,17 @@ impl App {
                     PromptAction::CreateCloudPlaylist,
                 ));
                 self.state.info("输入歌单名称，Enter 创建 · Esc 取消");
+            }
+
+            // 可视化页按 E 调参数、V 切模式；其余页忽略（Char 默认是输入态的键）
+            Action::Char('e') | Action::Char('E') if self.state.tab == Tab::Visualizer => {
+                self.state.cava_panel = Some(CavaPanelState);
+            }
+            Action::Char('v') | Action::Char('V') if self.state.tab == Tab::Visualizer => {
+                self.state.visualizer_mode = match self.state.visualizer_mode {
+                    VisualizerMode::Bars => VisualizerMode::Waterfall,
+                    VisualizerMode::Waterfall => VisualizerMode::Bars,
+                };
             }
 
             // 这些动作只在输入态有意义，浏览态下忽略
@@ -3204,17 +3245,18 @@ impl App {
 
         // 电平每帧刷新（audio 那一侧只是读原子量，开销可忽略）
         self.state.levels = self.audio.levels();
-        // 频谱只在可视化页且真的在播时算：一次双窗口 FFT 在小几百微秒，
-        // 但为所有页面每帧都付这份钱没必要——别的页面根本不显示它。
-        let wants_spectrum = !self.state.config.lite_mode
-            && self.state.tab == Tab::Visualizer
-            && self.state.playback == PlaybackState::Playing;
+        // 频谱在可视化页画整屏柱子，在其它页面画播放条上方那一行迷你频谱，
+        // 所以只要真的在播（且没开省电的 lite_mode）就采样。其它页面仍是
+        // 5fps 心跳，迷你频谱跟着心跳走，不必为它单独提帧率。
+        let wants_spectrum =
+            !self.state.config.lite_mode && self.state.playback == PlaybackState::Playing;
         if wants_spectrum {
             // 没有新采样（缓冲中）时保留上一帧，别把柱子清零——
             // 清零会让缓冲那一瞬闪一下黑屏。
             self.advance_spectrum();
         } else {
             self.state.spectrum.clear();
+            self.state.spectrum_history.clear();
             // 切走或暂停时把 cava 的历史清掉：回来时柱子从 0 长起，
             // 而不是从上一首歌的形状往下掉。
             if let Some(cava) = self.cava.as_mut() {

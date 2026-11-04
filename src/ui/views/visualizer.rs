@@ -27,9 +27,9 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Clear, Paragraph};
 
-use crate::app::state::AppState;
+use crate::app::state::{AppState, VisualizerMode};
 use crate::audio::engine::PlaybackState;
 use crate::keymap::key_hint_for;
 use crate::ui::theme::{Theme, mix};
@@ -63,7 +63,11 @@ pub fn render_visualizer(
     focused: bool,
     theme: &Theme,
 ) {
-    let block = panel("可视化", focused, theme);
+    let title = match state.visualizer_mode {
+        VisualizerMode::Bars => "可视化 · 柱状（V 切瀑布 · E 调参数）",
+        VisualizerMode::Waterfall => "可视化 · 瀑布（V 切柱状 · E 调参数）",
+    };
+    let block = panel(title, focused, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -94,13 +98,18 @@ pub fn render_visualizer(
     match state.playback {
         PlaybackState::Loading => render_buffering(frame, content_area, state, theme),
         PlaybackState::Playing if !state.smooth_spectrum.is_empty() => {
-            render_bars(
-                frame,
-                bars_area,
-                &state.smooth_spectrum,
-                &state.peak_spectrum,
-                theme,
-            );
+            match state.visualizer_mode {
+                VisualizerMode::Bars => render_bars(
+                    frame,
+                    bars_area,
+                    &state.smooth_spectrum,
+                    &state.peak_spectrum,
+                    theme,
+                ),
+                VisualizerMode::Waterfall => {
+                    render_waterfall(frame, bars_area, &state.spectrum_history, theme)
+                }
+            }
         }
         _ => render_idle(frame, content_area, state, theme),
     }
@@ -135,7 +144,7 @@ fn shrink_horizontal(area: Rect, amount: u16) -> Rect {
 /// 是 0（粘成一片），而且宽度从 64 到 127 列都有余量没铺满。所以这个区间改走
 /// 2 列步长——柱数减半，但既有空隙又铺满。聚合时取的是每组的**最大值**，
 /// 鼓点那种尖峰不会被平均掉，减半的代价只是频段分辨率。
-fn bar_stride(area_width: usize, bands: usize) -> usize {
+pub(crate) fn bar_stride(area_width: usize, bands: usize) -> usize {
     if bands == 0 {
         return 1;
     }
@@ -363,6 +372,154 @@ fn bar_style(from_bottom: usize, filled: usize, theme: &Theme) -> Style {
     // 深色里，安静段落像没在动。
     let color = mix(theme.progress_bg, theme.accent, t.powf(0.7));
     Style::default().fg(color)
+}
+
+/// 频谱瀑布：把最近若干帧的频谱按时间从上到下铺开。
+///
+/// 每列是一根频段，每行是一帧；新帧从底部长出来，旧的往顶上推。强度用
+/// 主题的底槽色到强调色之间的单色渐变表达，安静的格子留空，不画噪点。
+fn render_waterfall(frame: &mut Frame, area: Rect, history: &[Vec<f32>], theme: &Theme) {
+    let height = area.height as usize;
+    let width = area.width as usize;
+    if height == 0 || width == 0 || history.is_empty() {
+        return;
+    }
+    let bands = history[0].len();
+    if bands == 0 {
+        return;
+    }
+
+    // 和柱状图共用一套「可用宽 → 柱数」换算，保证两种模式横向尺度一致。
+    let stride = bar_stride(width, bands);
+    let bars = (width / stride).min(bands);
+    if bars == 0 {
+        return;
+    }
+
+    let mut lines = Vec::with_capacity(height);
+    for row in 0..height {
+        // 历史不足一屏时把最旧的留在顶部，新帧贴底；多余的顶部留空。
+        let frame_index = history.len() as isize - height as isize + row as isize;
+        if frame_index < 0 {
+            lines.push(Line::from(Span::raw(" ".repeat(width))));
+            continue;
+        }
+        let levels = &history[frame_index as usize];
+        let mut spans: Vec<Span> = Vec::with_capacity(bars / 4 + 2);
+        let mut run = String::with_capacity(width);
+        let mut run_style = Style::default();
+        let mut have_run = false;
+
+        for bar in 0..bars {
+            let start = bar * levels.len() / bars;
+            let end = ((bar + 1) * levels.len() / bars).max(start + 1);
+            let value = levels[start..end.min(levels.len())]
+                .iter()
+                .fold(0.0f32, |max, &level| max.max(level))
+                .clamp(0.0, 1.0);
+            let (glyph, style) = waterfall_cell(value, theme);
+            for column in 0..stride {
+                // 只在柱体的第一列画，其余作间隙；但间隙也要带背景，
+                // 否则上一帧的残影会留下来。
+                let cell_style = if column == 0 { style } else { Style::default() };
+                let cell_glyph = if column == 0 { glyph } else { ' ' };
+                if have_run && cell_style == run_style {
+                    run.push(cell_glyph);
+                    continue;
+                }
+                if have_run && !run.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut run), run_style));
+                }
+                run.push(cell_glyph);
+                run_style = cell_style;
+                have_run = true;
+            }
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, run_style));
+        }
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// 瀑布图一格：强度越高，字符越实、颜色越靠近强调色。
+fn waterfall_cell(value: f32, theme: &Theme) -> (char, Style) {
+    if value < 0.05 {
+        return (' ', Style::default());
+    }
+    let glyph = if value > 0.75 {
+        '█'
+    } else if value > 0.45 {
+        '▓'
+    } else if value > 0.20 {
+        '▒'
+    } else {
+        '░'
+    };
+    let color = mix(theme.progress_bg, theme.accent, value.powf(0.7));
+    (glyph, Style::default().fg(color))
+}
+
+/// cava 调参面板：↑↓ 选参数、←→ 调值、Esc/Enter 关闭并保存。
+///
+/// 面板是只读投影，不复制一份配置——改的就是 `state.config`，
+/// 所以关掉时 `save()` 一次即可，实时重建由 `App::ensure_cava` 负责。
+pub fn render_cava_panel(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let popup = crate::ui::widgets::centered_rect(area, 54, 11);
+    frame.render_widget(Clear, popup);
+    let block = panel("cava 参数", true, theme);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    if inner.height == 0 {
+        return;
+    }
+
+    let selected = state.cava_setting() as usize;
+    let rows: Vec<(String, String)> = vec![
+        (
+            "平滑强度".to_string(),
+            format!("{:.2}", state.config.cava_noise_reduction),
+        ),
+        (
+            "自动增益".to_string(),
+            if state.config.cava_autosens {
+                "开"
+            } else {
+                "关"
+            }
+            .to_string(),
+        ),
+        (
+            "低频下限".to_string(),
+            format!("{} Hz", state.config.cava_low_cutoff),
+        ),
+        (
+            "高频上限".to_string(),
+            format!("{} Hz", state.config.cava_high_cutoff),
+        ),
+    ];
+
+    let mut lines = Vec::with_capacity(rows.len() + 2);
+    lines.push(Line::from(Span::styled(
+        "↑↓ 选择 · ←→ 调整 · Enter/Esc 保存",
+        theme.dim(),
+    )));
+    for (index, (label, value)) in rows.iter().enumerate() {
+        let marker = if index == selected { "▸" } else { " " };
+        let style = if index == selected {
+            theme.selection().add_modifier(Modifier::BOLD)
+        } else {
+            theme.body()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} {label:<10}"), style),
+            Span::styled(value.clone(), theme.now_playing()),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("参数会在下一帧生效", theme.dim())));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// 峰值刻度：用正文色（中性、亮）配一个居中的 `▔`，和彩色的柱体区分开。
