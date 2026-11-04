@@ -17,8 +17,8 @@ use crate::keymap::key_hint_for;
 use crate::ui::theme::Theme;
 use crate::ui::views::{empty_placeholder, failed_placeholder, loading_placeholder};
 use crate::ui::widgets::{
-    RowContext, bare_panel, display_width, entry_row, panel, row_is_visible, selection_list,
-    song_row, truncate_to_width,
+    RowContext, display_width, entry_row, panel, row_is_visible, selection_list, song_row,
+    truncate_to_width,
 };
 
 /// 面板太小时直接跳过绘制。
@@ -315,7 +315,7 @@ fn render_entry_list<T: EntryTitle>(
     let last = list.entries.len().saturating_sub(1);
     let offset = list.cursor.offset().min(last);
     let selected = list.cursor.selected().map(|index| index.min(last));
-    let hover_row = hits.data_index_under(inner, offset, list.entries.len());
+    let _ = hits; // 块面式布局撤掉后条目列表暂无悬停需求，保留参数以兼容调用方
     let items: Vec<_> = list
         .entries
         .iter()
@@ -326,15 +326,7 @@ fn render_entry_list<T: EntryTitle>(
             if !row_is_visible(index, offset, selected, visible_rows) {
                 return ListItem::from("");
             }
-            entry_row(
-                index,
-                entry.title(),
-                &subtitle(entry),
-                None,
-                width,
-                hover_row == Some(index),
-                theme,
-            )
+            entry_row(index, entry.title(), &subtitle(entry), None, width, theme)
         })
         .collect();
 
@@ -378,13 +370,17 @@ pub fn render_search_input(
     focused: bool,
     theme: &Theme,
 ) {
-    if area.height < 2 || area.width < 12 {
+    if area.height < 4 || area.width < 12 {
         return;
     }
 
-    // 搜索框不挂标题：标题会占掉内容行，而这块只有 2 行（类型标签 + 输入）。
-    // 「按 / 输入」的提示已经在输入框占位符和空态里各写了一次。
-    let block = bare_panel("", focused, theme);
+    let title = if pane.editing {
+        "搜索 · 输入中（Enter 提交 / Esc 退出）"
+    } else {
+        "搜索 · 按 Enter 或 / 开始输入"
+    };
+
+    let block = panel(title, focused, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

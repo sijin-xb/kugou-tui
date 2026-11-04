@@ -106,12 +106,14 @@ impl Interaction {
 
     /// 当前按住的区域是不是 `target`（不论有没有在拖）。
     ///
-    /// 音量条这类「按着就生效」的控件用它做按下反馈。
+    /// 「按着就生效」的控件（音量条这类）用它做按下反馈。
+    #[allow(dead_code)]
     pub fn pressed(&self, target: HitTarget) -> bool {
         self.press.is_some_and(|press| press.target == target)
     }
 
     /// 当前按住的区域是不是 `target` 且确实在拖。
+    #[allow(dead_code)]
     pub fn dragging(&self, target: HitTarget) -> bool {
         self.press
             .is_some_and(|press| press.target == target && press.dragging)

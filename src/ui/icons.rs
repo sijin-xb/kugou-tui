@@ -78,59 +78,6 @@ pub fn next_up() -> &'static str {
     icon("\u{f064}", ">")
 }
 
-/// 播控按钮：上一首 / 播放暂停 / 下一首。
-///
-/// ASCII 回退用 `|<` `>` `>|` 这种一眼认得出的写法——终端里没有图标字体时，
-/// 单字符的 `<` `>` 会和界面的导航箭头混淆。
-pub fn prev() -> &'static str {
-    icon("\u{f048}", "|<")
-}
-
-pub fn next() -> &'static str {
-    icon("\u{f051}", ">|")
-}
-
-pub fn prev_ascii() -> &'static str {
-    "|<"
-}
-
-pub fn next_ascii() -> &'static str {
-    ">|"
-}
-
-pub fn play_pause_marker(playback: crate::audio::engine::PlaybackState) -> &'static str {
-    use crate::audio::engine::PlaybackState;
-    match playback {
-        PlaybackState::Playing => icon("\u{f04c}", "||"),
-        PlaybackState::Paused => icon("\u{f04b}", ">"),
-        PlaybackState::Loading => icon("\u{f250}", ".."),
-        PlaybackState::Stopped => icon("\u{f04b}", ">"),
-    }
-}
-
-pub fn play_pause_ascii(playback: crate::audio::engine::PlaybackState) -> &'static str {
-    use crate::audio::engine::PlaybackState;
-    match playback {
-        PlaybackState::Playing => "||",
-        PlaybackState::Paused | PlaybackState::Stopped => ">",
-        PlaybackState::Loading => "..",
-    }
-}
-
-/// 音量。
-pub fn volume(muted: bool) -> &'static str {
-    if muted {
-        icon("\u{f026}", "x")
-    } else {
-        icon("\u{f028}", "v")
-    }
-}
-
-/// 是否在画图标字体。渲染层用它决定拿哪一列（图标 / ASCII）去画。
-pub fn nerd_enabled() -> bool {
-    has_nerd_font()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,7 +90,5 @@ mod tests {
         assert!(!loading().is_empty());
         assert!(!stopped().is_empty());
         assert!(!next_up().is_empty());
-        assert!(!prev().is_empty());
-        assert!(!next().is_empty());
     }
 }
