@@ -187,10 +187,15 @@ pub fn row_is_visible(
     index >= low && index <= high
 }
 
-/// 统一的带边框面板。
+/// 统一的面板。
 ///
-/// `focused` 决定边框亮度——这是界面里唯一表示「键盘焦点在哪」的视觉线索，
-/// 比给每个面板加标题后缀更省空间。
+/// 视觉取向是「块面」而不是「表格」：只画**左右两侧的竖线**，不画上下横线。
+/// 一屏七八个面板时全画成闭合圆角框会变成一堆方格子，块与块之间的呼吸全靠
+/// 间距撑着；去掉横线之后，`Layout::spacing` 留出的空行本身就是分隔，
+/// 整屏读起来是几条纵向的栏，而不是一张表格。
+///
+/// 焦点不再用「整圈边框换色」表达——只剩竖线时那样做会像一根亮着的进度条。
+/// 改为把标题点亮：标题本来就要画，用它当焦点指示不额外占地方。
 pub fn panel(title: impl Into<Line<'static>>, focused: bool, theme: &Theme) -> Block<'static> {
     let border_style = if focused {
         theme.focused_border()
@@ -198,14 +203,37 @@ pub fn panel(title: impl Into<Line<'static>>, focused: bool, theme: &Theme) -> B
         theme.idle_border()
     };
 
+    // 标题前留一格：竖线紧挨文字会像被截断
+    let mut title_line: Line<'static> = title.into();
+    title_line.spans.insert(0, Span::raw(" "));
+
     Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .borders(Borders::LEFT | Borders::RIGHT)
+        .border_type(BorderType::Plain)
         .border_style(border_style)
-        .title(title.into())
+        .title(title_line)
         .title_style(if focused { theme.title() } else { theme.dim() })
-        // 左右各留一列：内容贴着边框会显得很挤（rmpc 全项目都这么做）
         .padding(Padding::horizontal(1))
+}
+
+/// 无边框面板：只有标题，没有竖线。
+///
+/// 给「本身就是内容」的区块用——首页的封面/歌词、可视化页的频谱。
+/// 这些区域再套一层竖线会把画面切成两半，反而比留白更吵。
+pub fn bare_panel(title: impl Into<Line<'static>>, focused: bool, theme: &Theme) -> Block<'static> {
+    let mut title_line: Line<'static> = title.into();
+    title_line.spans.insert(0, Span::raw(" "));
+
+    // 空标题不设：`Block::title` 即使内容为空也会占用内容区第一行，
+    // 两行的播放条被吃掉一行就只剩进度条。
+    let block = Block::default()
+        .title_style(if focused { theme.title() } else { theme.dim() })
+        .padding(Padding::horizontal(1));
+    if title_line.width() > 1 {
+        block.title(title_line)
+    } else {
+        block
+    }
 }
 
 /// 在 `area` 内居中放置一个固定尺寸的矩形，用于弹窗。
@@ -369,6 +397,7 @@ pub fn entry_row(
     subtitle: &str,
     marker: Option<&str>,
     width: usize,
+    hover: bool,
     theme: &Theme,
 ) -> ListItem<'static> {
     let prefix = marker.unwrap_or(" ");
@@ -385,9 +414,15 @@ pub fn entry_row(
     let reserved = display_width(&index_text) + display_width(&subtitle_text);
     let available = width.saturating_sub(reserved).max(6);
 
+    // 悬停时标题加粗——与歌曲列表保持同一种反馈，用户不用为两类列表学两套。
+    let title_style = if hover {
+        theme.body().add_modifier(ratatui::style::Modifier::BOLD)
+    } else {
+        theme.body()
+    };
     let line = Line::from(vec![
         Span::styled(index_text, theme.dim()),
-        Span::styled(truncate_to_width(title, available), theme.body()),
+        Span::styled(truncate_to_width(title, available), title_style),
         Span::styled(subtitle_text, theme.dim()),
     ]);
 

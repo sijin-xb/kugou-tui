@@ -37,7 +37,7 @@ pub fn render_settings(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if inner.height < 3 || inner.width < 24 {
+    if inner.height < 2 || inner.width < 24 {
         return;
     }
 
@@ -57,8 +57,13 @@ pub fn render_settings(
         };
         let rect = Rect::new(list_area.x, list_area.y + row as u16, list_area.width, 1);
         let selected = index == state.settings_cursor;
+        let hovered = state.hit_map.is_over(rect);
+        // 选中态优先：悬停只是「鼠标在这行上」，不该盖掉光标所在的位置。
+        // 两者同时存在时选中仍然是最强的视觉信号。
         let style = if selected {
             theme.selection().add_modifier(Modifier::BOLD)
+        } else if hovered {
+            theme.body().add_modifier(Modifier::BOLD)
         } else {
             theme.body()
         };
@@ -83,13 +88,15 @@ pub fn render_settings(
 
     // 点击选中、再点一次改值，所以整块列表区都要能命中
     if list_area.height > 0 {
-        state.add_hit_zone(list_area, HitTarget::Settings, offset, total);
+        state
+            .hit_map
+            .insert(list_area, HitTarget::Settings, offset, total);
     }
 
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             truncate_to_width(
-                "↑↓ 选择 · ←→ / Enter 修改 · 点击选中、再点一次修改",
+                "↑↓ 选择 · ←→ / Enter 修改 · ? 帮助 · q 退出",
                 hint_area.width as usize,
             ),
             theme.dim(),

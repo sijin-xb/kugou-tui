@@ -311,10 +311,21 @@ impl AudioHandle {
 
     /// 当前这段声音的频谱（`bands` 个 0.0 ~ 1.0 的能量值）。
     ///
-    /// FFT 在这里（主线程）算，不在音频线程：它是一次纯计算，放进音频线程
-    /// 会拖住采样供给，表现出来就是爆音。
-    pub fn spectrum(&self, bands: usize) -> Vec<f32> {
-        self.levels.spectrum(bands)
+    /// 数据源与算法都在主线程侧：这里只暴露原子量的读取，真正的 cava 分析由
+    /// `App` 持有的 [`crate::audio::cava::Cava`] 做——它要跨帧保存平滑历史，
+    /// 放在这个可克隆的句柄里会被复制出多份状态。
+    pub fn sample_rate(&self) -> u32 {
+        self.levels.sample_rate()
+    }
+
+    /// 采样窗游标。与 [`AudioHandle::samples_since`] 配对使用。
+    pub fn sample_cursor(&self) -> usize {
+        self.levels.sample_cursor()
+    }
+
+    /// 自 `since` 以来新到的单声道采样（最多 `max` 个）。
+    pub fn samples_since(&self, since: usize, max: usize) -> Vec<f32> {
+        self.levels.samples_since(since, max)
     }
 
     /// 标记为「缓冲中」。UI 在发起下载前调用，让用户立刻看到反馈。

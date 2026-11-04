@@ -47,7 +47,6 @@ use crate::source::{PlaylistRef, SourceKind};
 
 use crate::audio::download::{Downloader, PREROLL_BYTES, StreamOutcome};
 use crate::audio::engine::{AudioEvent, PlaybackState, SEEK_STEP_MS, VOLUME_STEP};
-use crate::audio::spectrum::BAND_COUNT;
 use crate::event::{Event, Loaded, LoadingTarget, PlaylistSource, VipClaimOutcome};
 use crate::keymap::{Action, CHEATSHEET, KeyMode};
 use crate::logger::tlog;
@@ -188,15 +187,137 @@ impl App {
     fn handle_mouse(&mut self, mouse: MouseEvent) {
         use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 
+        // 每次鼠标事件都先更新指针位置：`Drag` 事件不带独立的 Moved，
+        // 不更新的话 hover 会停在按下时的位置。
+        self.state
+            .interaction
+            .set_hover(Some((mouse.column, mouse.row)));
+
         match mouse.kind {
-            // 悬停反馈：这里只记位置，真正的命中判断交给渲染层（只有它知道行几何）
-            MouseEventKind::Moved => {
-                self.state.hover = Some((mouse.column, mouse.row));
-            }
+            MouseEventKind::Moved => {}
             MouseEventKind::ScrollDown => self.scroll_list_at(&mouse, 1),
             MouseEventKind::ScrollUp => self.scroll_list_at(&mouse, -1),
-            MouseEventKind::Down(MouseButton::Left) => self.click_at(&mouse),
+            MouseEventKind::Down(MouseButton::Left) => self.left_down_at(&mouse),
             MouseEventKind::Down(MouseButton::Right) => self.right_click_at(&mouse),
+            MouseEventKind::Drag(MouseButton::Left) => self.left_drag_at(&mouse),
+            MouseEventKind::Up(MouseButton::Left) => self.left_up_at(&mouse),
+            _ => {}
+        }
+    }
+
+    /// 左键按下：先记 press，再按旧语义执行一次「点击」。
+    ///
+    /// 点击与拖拽的判定不能在这里做——按下那一刻还不知道用户接下来会不会拖。
+    /// 所以按下时立即执行点击动作（选中、跳转），拖拽开始后再用连续的
+    /// [`Self::left_drag_at`] 修正。代价是拖进度条时会先跳一次，随后立刻跟上，
+    /// 用户看不到中间那一帧。
+    fn left_down_at(&mut self, mouse: &MouseEvent) {
+        let Some(zone) = self.state.hit_test(mouse.column, mouse.row) else {
+            return;
+        };
+        self.state.interaction.begin_press(
+            zone.target,
+            zone.index_at(mouse.row),
+            ratatui::crossterm::event::MouseButton::Left,
+            (mouse.column, mouse.row),
+        );
+        self.click_at(mouse);
+    }
+
+    /// 左键拖拽：按下时命中的目标决定拖动什么。
+    ///
+    /// 只处理三类可以「连续跟随」的东西：进度条、歌词行、列表行。别的一律忽略
+    /// ——把侧边栏标签做成可拖拽没有意义，反而会在斜着拖的时候误切换标签页。
+    fn left_drag_at(&mut self, mouse: &MouseEvent) {
+        if self.state.interaction.press.is_none() {
+            return;
+        }
+        self.state.interaction.drag_to((mouse.column, mouse.row));
+
+        let Some(press) = self.state.interaction.press else {
+            return;
+        };
+        match press.target {
+            HitTarget::Progress => self.drag_progress(mouse),
+            // 歌词行拖动等同「拖到哪句就从哪句开始放」——与单击同一套换算，
+            // 但会在每一格都 seek 一次。节流交给音频线程的 seek 去重。
+            HitTarget::LyricLine => self.drag_lyric(mouse),
+            HitTarget::Songs | HitTarget::Entries | HitTarget::Queue => self.drag_list_row(mouse),
+            _ => {}
+        }
+    }
+
+    /// 左键松开：清掉 press。当前所有动作都在拖动过程中即时生效，
+    /// 松开不需要再结算什么——留着这个钩子是为了将来加「拖完才提交」的控件。
+    fn left_up_at(&mut self, _mouse: &MouseEvent) {
+        self.state.interaction.end_press();
+    }
+
+    /// 点 / 拖音量条：按 x 比例设置音量。
+    ///
+    /// 拖动时**不弹状态栏消息**——每挪一格刷一条「音量 73%」会闪成一片。
+    /// 音量百分比就画在同一个控件上，看得到。
+    fn drag_volume(&mut self, zone: HitZone, mouse: &MouseEvent) {
+        if zone.rect.width == 0 {
+            return;
+        }
+        let ratio =
+            f64::from(mouse.column.saturating_sub(zone.rect.left())) / f64::from(zone.rect.width);
+        let volume = (ratio as f32).clamp(0.0, 1.0);
+        // 从静音里调音量 = 解除静音，与键盘 `+`/`-` 的行为一致
+        self.state.volume_before_mute = None;
+        self.state.volume = volume;
+        self.audio.set_volume(volume);
+    }
+
+    /// 拖动进度条：按 x 比例连续跳转。
+    fn drag_progress(&mut self, mouse: &MouseEvent) {
+        // 拖出进度条范围时直接停下，不做边缘吸附：进度条只占播放条中间那一段，
+        // 按边缘算会让「拖到屏幕最右边」变成跳到 100%，而用户很可能只是想
+        // 把指针移出这个控件。
+        let Some(zone) = self.state.hit_test(mouse.column, mouse.row) else {
+            return;
+        };
+        if zone.target != HitTarget::Progress {
+            return;
+        }
+        self.seek_progress_to(zone, mouse);
+    }
+
+    /// 拖动歌词：与点击歌词同一套换算，但只在换行时才真的 seek。
+    fn drag_lyric(&mut self, mouse: &MouseEvent) {
+        let Some(zone) = self.state.hit_test(mouse.column, mouse.row) else {
+            return;
+        };
+        if zone.target != HitTarget::LyricLine {
+            return;
+        }
+        let Some(display) = zone.index_at(mouse.row) else {
+            return;
+        };
+        // 连续拖动会反复落在同一句上，重复 seek 会让音频线程不停重置缓冲。
+        if self.state.lyric.drag_line == Some(display) {
+            return;
+        }
+        self.state.lyric.drag_line = Some(display);
+        self.click_lyric(zone, mouse);
+    }
+
+    /// 拖动列表：把选中项跟到指针所在行。
+    ///
+    /// 这里**不**触发播放（拖动是选，不是激活）——想播就松开后再点一次，
+    /// 或直接用双击。拖到列表外时保持最后一行选中，不做越界回绕。
+    fn drag_list_row(&mut self, mouse: &MouseEvent) {
+        let Some(zone) = self.state.hit_test(mouse.column, mouse.row) else {
+            return;
+        };
+        let Some(index) = zone.index_at(mouse.row) else {
+            return;
+        };
+        match zone.target {
+            HitTarget::Entries => self.state.select_entry_index(index),
+            HitTarget::Songs => self.state.select_song_index(index),
+            HitTarget::Queue => self.state.queue_cursor.select(Some(index)),
             _ => {}
         }
     }
@@ -242,6 +363,15 @@ impl App {
                 self.state.info("正在重新获取用户资料…");
                 self.fetch_user_info();
             }
+            HitTarget::MenuItem => self.click_menu_item(zone, mouse),
+            HitTarget::QualityItem => self.click_quality_item(zone, mouse),
+            HitTarget::ConfirmYes => self.confirm_pending(true),
+            HitTarget::ConfirmNo => self.confirm_pending(false),
+            HitTarget::PrevTrack => self.handle_action(Action::Prev),
+            HitTarget::PlayPause => self.handle_action(Action::PlayPause),
+            HitTarget::NextTrack => self.handle_action(Action::Next),
+            HitTarget::PlayMode => self.handle_action(Action::CyclePlaybackMode),
+            HitTarget::Volume => self.drag_volume(zone, mouse),
         }
     }
 
@@ -279,7 +409,16 @@ impl App {
             | HitTarget::LyricLine
             | HitTarget::Settings
             | HitTarget::VipClaim
-            | HitTarget::ProfileRetry => {
+            | HitTarget::ProfileRetry
+            | HitTarget::MenuItem
+            | HitTarget::QualityItem
+            | HitTarget::ConfirmYes
+            | HitTarget::ConfirmNo
+            | HitTarget::PrevTrack
+            | HitTarget::PlayPause
+            | HitTarget::NextTrack
+            | HitTarget::PlayMode
+            | HitTarget::Volume => {
                 return;
             }
         }
@@ -308,7 +447,16 @@ impl App {
             | HitTarget::LyricLine
             | HitTarget::Settings
             | HitTarget::VipClaim
-            | HitTarget::ProfileRetry => {
+            | HitTarget::ProfileRetry
+            | HitTarget::MenuItem
+            | HitTarget::QualityItem
+            | HitTarget::ConfirmYes
+            | HitTarget::ConfirmNo
+            | HitTarget::PrevTrack
+            | HitTarget::PlayPause
+            | HitTarget::NextTrack
+            | HitTarget::PlayMode
+            | HitTarget::Volume => {
                 return;
             }
         }
@@ -323,6 +471,11 @@ impl App {
 
     /// 点击进度条：按 x 比例跳转到对应时间。
     fn click_progress(&mut self, zone: HitZone, mouse: &MouseEvent) {
+        self.seek_progress_to(zone, mouse);
+    }
+
+    /// 把进度跳到指针在进度条上的位置。点击与拖动共用。
+    fn seek_progress_to(&mut self, zone: HitZone, mouse: &MouseEvent) {
         let duration_ms = self.state.duration_ms;
         if duration_ms == 0 || zone.rect.width == 0 {
             return;
@@ -362,6 +515,48 @@ impl App {
         ));
     }
 
+    /// 点击右键菜单的一项：先把它变成当前项，再走和键盘 `Enter` 完全相同的路径。
+    ///
+    /// 不直接调 `run_menu_action`，是为了让「鼠标点的」和「键盘选的」共用同一处
+    /// 状态清理——菜单项里有动作会再开新弹窗（下载音质选择），提前关菜单的时机
+    /// 必须一致。
+    fn click_menu_item(&mut self, zone: HitZone, mouse: &MouseEvent) {
+        let Some(index) = zone.index_at(mouse.row) else {
+            return;
+        };
+        let Some(menu) = self.state.context_menu.as_mut() else {
+            return;
+        };
+        if index >= menu.items.len() {
+            return;
+        }
+        menu.cursor = index;
+        self.handle_menu_key(Action::Submit);
+    }
+
+    /// 点击音质选择框的一项：选中并立刻确认。
+    fn click_quality_item(&mut self, zone: HitZone, mouse: &MouseEvent) {
+        let Some(index) = zone.index_at(mouse.row) else {
+            return;
+        };
+        let Some(picker) = self.state.quality_picker.as_mut() else {
+            return;
+        };
+        if index >= picker.candidates.len() {
+            return;
+        }
+        picker.cursor.select(Some(index));
+        self.confirm_quality_picker();
+    }
+
+    /// 点击确认框的按钮。`yes` 为真等同 `Enter`，为假等同 `Esc`。
+    fn confirm_pending(&mut self, yes: bool) {
+        if self.state.pending_confirm.is_none() {
+            return;
+        }
+        self.handle_action(if yes { Action::Submit } else { Action::Cancel });
+    }
+
     /// 把焦点切到命中区对应的面板。离开搜索框时退出输入态，否则字母键会被吞掉。
     fn focus_hit_target(&mut self, target: HitTarget) {
         let focus = match target {
@@ -375,7 +570,16 @@ impl App {
             | HitTarget::Progress
             | HitTarget::LyricLine
             | HitTarget::VipClaim
-            | HitTarget::ProfileRetry => return,
+            | HitTarget::ProfileRetry
+            | HitTarget::MenuItem
+            | HitTarget::QualityItem
+            | HitTarget::ConfirmYes
+            | HitTarget::ConfirmNo
+            | HitTarget::PrevTrack
+            | HitTarget::PlayPause
+            | HitTarget::NextTrack
+            | HitTarget::PlayMode
+            | HitTarget::Volume => return,
         };
 
         if self.state.focus == Focus::Primary && focus != Focus::Primary {
@@ -2817,13 +3021,9 @@ impl App {
                 // 曲目真的起来了，之前记的"续播点"已经兑现（或者早就过期了），
                 // 留着只会让下次按 Space 莫名回到某个中间位置
                 self.state.resume = None;
-                let title = self
-                    .state
-                    .current
-                    .as_ref()
-                    .map(describe_song)
-                    .unwrap_or_default();
-                self.state.success(format!("正在播放：{title}"));
+                // 不再往状态栏发「正在播放：xxx」：播放条上就写着曲目，
+                // 再刷一遍只会把真正有用的消息（连接失败、缓存清理结果）
+                // 挤走。
             }
             AudioEvent::DeviceOpened { name } => {
                 // 第一次是启动时上报，只记下来不打扰；之后的切换才提示
@@ -2977,7 +3177,7 @@ impl App {
                 crate::logger::rss_kib(),
                 self.downloader.active_streams(),
                 self.state.queue.len(),
-                self.state.hit_zones.capacity(),
+                self.state.hit_map.len(),
                 current
             );
         }
@@ -3004,15 +3204,23 @@ impl App {
 
         // 电平每帧刷新（audio 那一侧只是读原子量，开销可忽略）
         self.state.levels = self.audio.levels();
-        // 频谱只在可视化页且真的在播时算：一次 2048 点 FFT 只要零点几毫秒，
+        // 频谱只在可视化页且真的在播时算：一次双窗口 FFT 在小几百微秒，
         // 但为所有页面每帧都付这份钱没必要——别的页面根本不显示它。
         let wants_spectrum = !self.state.config.lite_mode
             && self.state.tab == Tab::Visualizer
             && self.state.playback == PlaybackState::Playing;
         if wants_spectrum {
-            self.state.spectrum = self.audio.spectrum(BAND_COUNT);
+            // 没有新采样（缓冲中）时保留上一帧，别把柱子清零——
+            // 清零会让缓冲那一瞬闪一下黑屏。
+            self.advance_spectrum();
         } else {
             self.state.spectrum.clear();
+            // 切走或暂停时把 cava 的历史清掉：回来时柱子从 0 长起，
+            // 而不是从上一首歌的形状往下掉。
+            if let Some(cava) = self.cava.as_mut() {
+                cava.reset();
+            }
+            self.cava_cursor = self.audio.sample_cursor();
         }
         self.state.advance_visualizer(elapsed);
         // 歌词换行的过渡时钟。放在 `update_active_lyric` **之前**：这样本帧刚换的行
@@ -3279,6 +3487,169 @@ fn auto_skip_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ================================================================
+    // 鼠标交互：按下 / 拖拽 / 松开
+    // ================================================================
+
+    use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: ratatui::crossterm::event::KeyModifiers::empty(),
+        }
+    }
+
+    /// 进度条拖拽：按下后跨过阈值应当真的 seek，而不是只在按下那一下跳。
+    ///
+    /// 这是本次改造最核心的回归点——改造前只处理 `Down`，拖着走时时间不动。
+    #[test]
+    fn dragging_the_progress_bar_seeks_continuously() {
+        let mut app = App::for_test();
+        app.state.duration_ms = 200_000;
+        app.state.position_ms = 0;
+
+        // 进度条横跨第 30 行、x 从 2 到 102（共 100 列）
+        let area = ratatui::layout::Rect::new(2, 30, 100, 1);
+        app.state.begin_frame();
+        app.state.hit_map.insert_flat(area, HitTarget::Progress);
+
+        // 按在中间偏左
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            12,
+            30,
+        )));
+        let after_click = app.state.position_ms;
+        assert!(after_click > 0, "按下就该跳一次，实际停在 {after_click}");
+
+        // 往右拖：跨过阈值后应当继续跟手
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            52,
+            30,
+        )));
+        let after_drag = app.state.position_ms;
+        assert!(
+            after_drag > after_click,
+            "拖到右边进度应当往前走：{after_click} → {after_drag}"
+        );
+
+        // 松开后状态清空
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            52,
+            30,
+        )));
+        assert!(
+            app.state.interaction.press.is_none(),
+            "松开后不该还留着 press"
+        );
+    }
+
+    /// 单击（按下即松开，没有拖动）不能被当成拖拽。
+    #[test]
+    fn a_click_without_movement_is_not_a_drag() {
+        let mut app = App::for_test();
+        let area = ratatui::layout::Rect::new(2, 30, 100, 1);
+        app.state.begin_frame();
+        app.state.hit_map.insert_flat(area, HitTarget::Progress);
+
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            50,
+            30,
+        )));
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            50,
+            30,
+        )));
+
+        assert!(
+            !app.state.interaction.dragging(HitTarget::Progress),
+            "没移动过就不该被标记为拖拽"
+        );
+    }
+
+    /// 指针移动要更新 hover，且松开鼠标后 hover 仍然保留（终端不上报离开）。
+    #[test]
+    fn pointer_movement_updates_hover() {
+        let mut app = App::for_test();
+
+        app.handle_event(Event::Mouse(mouse(MouseEventKind::Moved, 7, 9)));
+        assert_eq!(app.state.interaction.hover, Some((7, 9)));
+
+        // 拖拽事件不带独立的 Moved，也要更新 hover
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            3,
+            4,
+        )));
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            20,
+            21,
+        )));
+        assert_eq!(app.state.interaction.hover, Some((20, 21)));
+    }
+
+    /// 拖动列表行只改选中，不触发播放。
+    #[test]
+    fn dragging_a_list_moves_selection_without_playing() {
+        use crate::api::model::Song;
+        use crate::app::state::SongList;
+
+        let mut app = App::for_test();
+        let songs: Vec<Song> = (0..10)
+            .map(|index| Song {
+                name: format!("曲目{index}"),
+                hash: format!("h{index}"),
+                ..Song::default()
+            })
+            .collect();
+        app.state.search.results = SongList::default();
+        app.state.search.results.replace("测试", songs);
+        app.state.tab = crate::app::state::Tab::Search;
+
+        // 列表内容区从第 10 行起、10 行高
+        let area = ratatui::layout::Rect::new(2, 10, 60, 10);
+        app.state.begin_frame();
+        app.state.hit_map.insert(area, HitTarget::Songs, 0, 10);
+
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            5,
+            10,
+        )));
+        app.handle_event(Event::Mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            5,
+            14,
+        )));
+
+        assert_eq!(
+            app.state.search.results.cursor.selected(),
+            Some(4),
+            "拖到第 5 行应当选中第 4 条"
+        );
+        assert!(app.state.current.is_none(), "拖动只是选，不该开始播放");
+    }
+
+    /// 拖拽阈值：挪 1 格仍算点击，挪 2 格才算拖。
+    #[test]
+    fn drag_needs_two_cells_of_movement() {
+        use crate::app::interaction::Interaction;
+
+        let mut interaction = Interaction::default();
+        interaction.begin_press(HitTarget::Progress, None, MouseButton::Left, (10, 5));
+
+        assert!(!interaction.drag_to((11, 5)), "一格是抖动，不算拖");
+        assert!(interaction.drag_to((12, 5)), "两格才算拖");
+    }
 
     /// 点歌词行跳转必须**加回歌词偏移**。
     ///

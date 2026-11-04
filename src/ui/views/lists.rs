@@ -17,8 +17,8 @@ use crate::keymap::key_hint_for;
 use crate::ui::theme::Theme;
 use crate::ui::views::{empty_placeholder, failed_placeholder, loading_placeholder};
 use crate::ui::widgets::{
-    RowContext, display_width, entry_row, panel, row_is_visible, selection_list, song_row,
-    truncate_to_width,
+    RowContext, bare_panel, display_width, entry_row, panel, row_is_visible, selection_list,
+    song_row, truncate_to_width,
 };
 
 /// 面板太小时直接跳过绘制。
@@ -26,7 +26,7 @@ use crate::ui::widgets::{
 /// ratatui 对 0 尺寸区域是安全的，但边框加内容至少需要 3 行 10 列才有意义；
 /// 提前返回也能省掉无谓的字符串构造。
 fn too_small(area: Rect) -> bool {
-    area.height < 3 || area.width < 10
+    area.height < 2 || area.width < 10
 }
 
 /// 歌曲列表。五个标签页的「下半屏」都用它。
@@ -35,8 +35,6 @@ pub struct SongView<'a> {
     pub focused: bool,
     pub current_hash: Option<&'a str>,
     pub playback: PlaybackState,
-    /// 鼠标位置（列, 行）。用于算出悬停行（渲染函数内部换算，所以这里存原始坐标）。
-    pub pointer: Option<(u16, u16)>,
 }
 
 pub fn render_song_list(
@@ -44,6 +42,7 @@ pub fn render_song_list(
     area: Rect,
     list: &mut SongList,
     view: SongView,
+    hits: &crate::ui::hit::HitMap,
     theme: &Theme,
 ) {
     if too_small(area) {
@@ -89,19 +88,9 @@ pub fn render_song_list(
     // 可见行数（供 `row_is_visible` 判断哪些行值得真正构造）
     let visible_rows = inner.height as usize;
 
-    // 把鼠标位置换算成「数据行下标」：List 内部按 cursor.offset() 滚动，
-    // 屏幕第 r 行对应的是 offset + r。
-    let hover_row = view.pointer.and_then(|(column, row)| {
-        if row < inner.y
-            || row >= inner.y + inner.height
-            || column < inner.x
-            || column >= inner.x + inner.width
-        {
-            return None;
-        }
-        let visible = (row - inner.y) as usize + list.cursor.offset();
-        (visible < list.songs.len()).then_some(visible)
-    });
+    // 悬停行：几何换算统一交给 `HitMap`，视图不再自己算坐标。
+    // `inner` 已扣掉边框，所以行号直接就是可见行的偏移。
+    let hover_row = hits.data_index_under(inner, list.cursor.offset(), list.songs.len());
 
     // `offset`/`selected` 是 ratatui 在 `render_stateful_widget` **内部**才钳位的，这里读到
     // 的是上一帧的旧值。列表刚缩短（删歌、换搜索结果）而光标还没来得及 clamp 时，旧下标
@@ -142,9 +131,10 @@ pub fn render_playlist_entries(
     area: Rect,
     list: &mut EntryList<Playlist>,
     focused: bool,
+    hits: &crate::ui::hit::HitMap,
     theme: &Theme,
 ) {
-    render_playlist_entries_titled(frame, area, list, "歌单广场", focused, theme);
+    render_playlist_entries_titled(frame, area, list, "歌单广场", focused, hits, theme);
 }
 
 /// 歌单条目列表（自定义标题）。搜索页用它把标题写成「搜索歌单」。
@@ -154,11 +144,21 @@ pub fn render_playlist_entries_titled(
     list: &mut EntryList<Playlist>,
     title: &str,
     focused: bool,
+    hits: &crate::ui::hit::HitMap,
     theme: &Theme,
 ) {
-    render_entry_list(frame, area, list, title, focused, theme, |playlist| {
-        playlist_subtitle(playlist)
-    });
+    render_entry_list(
+        frame,
+        area,
+        list,
+        EntryView {
+            title,
+            focused,
+            hits,
+            theme,
+        },
+        playlist_subtitle,
+    );
 }
 
 /// 歌手条目列表。
@@ -167,9 +167,10 @@ pub fn render_artist_entries(
     area: Rect,
     list: &mut EntryList<Artist>,
     focused: bool,
+    hits: &crate::ui::hit::HitMap,
     theme: &Theme,
 ) {
-    render_artist_entries_titled(frame, area, list, "歌手", focused, theme);
+    render_artist_entries_titled(frame, area, list, "歌手", focused, hits, theme);
 }
 
 /// 歌手条目列表（自定义标题）。搜索页用它把标题写成「搜索歌手」。
@@ -179,9 +180,21 @@ pub fn render_artist_entries_titled(
     list: &mut EntryList<Artist>,
     title: &str,
     focused: bool,
+    hits: &crate::ui::hit::HitMap,
     theme: &Theme,
 ) {
-    render_entry_list(frame, area, list, title, focused, theme, artist_subtitle);
+    render_entry_list(
+        frame,
+        area,
+        list,
+        EntryView {
+            title,
+            focused,
+            hits,
+            theme,
+        },
+        artist_subtitle,
+    );
 }
 
 /// 排行榜条目列表。
@@ -190,9 +203,21 @@ pub fn render_rank_entries(
     area: Rect,
     list: &mut EntryList<RankBoard>,
     focused: bool,
+    hits: &crate::ui::hit::HitMap,
     theme: &Theme,
 ) {
-    render_entry_list(frame, area, list, "排行榜", focused, theme, rank_subtitle);
+    render_entry_list(
+        frame,
+        area,
+        list,
+        EntryView {
+            title: "排行榜",
+            focused,
+            hits,
+            theme,
+        },
+        rank_subtitle,
+    );
 }
 
 /// 云端歌单条目列表。
@@ -201,15 +226,19 @@ pub fn render_cloud_entries(
     area: Rect,
     list: &mut EntryList<Playlist>,
     focused: bool,
+    hits: &crate::ui::hit::HitMap,
     theme: &Theme,
 ) {
     render_entry_list(
         frame,
         area,
         list,
-        "云端歌单 · s 收藏单曲 / S 同步队列",
-        focused,
-        theme,
+        EntryView {
+            title: "云端歌单 · s 收藏单曲 / S 同步队列",
+            focused,
+            hits,
+            theme,
+        },
         |playlist| {
             let mut subtitle = playlist_subtitle(playlist);
             if !playlist.is_writable() {
@@ -220,16 +249,31 @@ pub fn render_cloud_entries(
     );
 }
 
+/// 条目列表的视图参数。
+///
+/// 收成结构体是因为参数已经到 8 个（frame/area/list/title/focused/hits/theme/subtitle），
+/// clippy 的 `too_many_arguments` 拦着；且后四个总是成组出现，语义上也该绑在一起。
+struct EntryView<'a> {
+    title: &'a str,
+    focused: bool,
+    hits: &'a crate::ui::hit::HitMap,
+    theme: &'a Theme,
+}
+
 /// 条目列表的通用渲染。`subtitle` 由调用方决定每类条目显示什么副信息。
 fn render_entry_list<T: EntryTitle>(
     frame: &mut Frame,
     area: Rect,
     list: &mut EntryList<T>,
-    title: &str,
-    focused: bool,
-    theme: &Theme,
+    view: EntryView<'_>,
     subtitle: impl Fn(&T) -> String,
 ) {
+    let EntryView {
+        title,
+        focused,
+        hits,
+        theme,
+    } = view;
     if too_small(area) {
         return;
     }
@@ -271,6 +315,7 @@ fn render_entry_list<T: EntryTitle>(
     let last = list.entries.len().saturating_sub(1);
     let offset = list.cursor.offset().min(last);
     let selected = list.cursor.selected().map(|index| index.min(last));
+    let hover_row = hits.data_index_under(inner, offset, list.entries.len());
     let items: Vec<_> = list
         .entries
         .iter()
@@ -281,7 +326,15 @@ fn render_entry_list<T: EntryTitle>(
             if !row_is_visible(index, offset, selected, visible_rows) {
                 return ListItem::from("");
             }
-            entry_row(index, entry.title(), &subtitle(entry), None, width, theme)
+            entry_row(
+                index,
+                entry.title(),
+                &subtitle(entry),
+                None,
+                width,
+                hover_row == Some(index),
+                theme,
+            )
         })
         .collect();
 
@@ -325,17 +378,13 @@ pub fn render_search_input(
     focused: bool,
     theme: &Theme,
 ) {
-    if area.height < 4 || area.width < 12 {
+    if area.height < 2 || area.width < 12 {
         return;
     }
 
-    let title = if pane.editing {
-        "搜索 · 输入中（Enter 提交 / Esc 退出）"
-    } else {
-        "搜索 · 按 Enter 或 / 开始输入"
-    };
-
-    let block = panel(title, focused, theme);
+    // 搜索框不挂标题：标题会占掉内容行，而这块只有 2 行（类型标签 + 输入）。
+    // 「按 / 输入」的提示已经在输入框占位符和空态里各写了一次。
+    let block = bare_panel("", focused, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -473,9 +522,12 @@ mod tests {
                     frame,
                     area,
                     &mut list,
-                    "测试",
-                    true,
-                    &Theme::for_config(ThemeName::Default, false),
+                    EntryView {
+                        title: "测试",
+                        focused: true,
+                        hits: &crate::ui::hit::HitMap::default(),
+                        theme: &Theme::for_config(ThemeName::Default, false),
+                    },
                     |_| "副标题".to_string(),
                 );
             })
@@ -502,7 +554,6 @@ mod tests {
             focused: true,
             current_hash: None,
             playback: PlaybackState::Playing,
-            pointer: None,
         };
 
         let mut list = SongList::default();
@@ -519,6 +570,7 @@ mod tests {
                     Rect::new(0, 0, 40, 8),
                     &mut list,
                     view(),
+                    &crate::ui::hit::HitMap::default(),
                     &Theme::for_config(ThemeName::Default, false),
                 );
             })
@@ -533,6 +585,7 @@ mod tests {
                     Rect::new(0, 0, 40, 8),
                     &mut list,
                     view(),
+                    &crate::ui::hit::HitMap::default(),
                     &Theme::for_config(ThemeName::Default, false),
                 );
             })
@@ -551,6 +604,7 @@ mod tests {
                     Rect::new(0, 0, 40, 8),
                     &mut list,
                     view(),
+                    &crate::ui::hit::HitMap::default(),
                     &Theme::for_config(ThemeName::Default, false),
                 );
             })
@@ -579,9 +633,12 @@ mod tests {
                     frame,
                     Rect::new(0, 0, width, height),
                     list,
-                    "歌单广场",
-                    true,
-                    &Theme::for_config(ThemeName::Default, false),
+                    EntryView {
+                        title: "歌单广场",
+                        focused: true,
+                        hits: &crate::ui::hit::HitMap::default(),
+                        theme: &Theme::for_config(ThemeName::Default, false),
+                    },
                     playlist_subtitle,
                 );
             })
@@ -661,9 +718,12 @@ mod tests {
                         frame,
                         area,
                         &mut list,
-                        "歌单广场",
-                        true,
-                        &theme,
+                        EntryView {
+                            title: "歌单广场",
+                            focused: true,
+                            hits: &crate::ui::hit::HitMap::default(),
+                            theme: &theme,
+                        },
                         playlist_subtitle,
                     )
                 })

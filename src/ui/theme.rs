@@ -152,32 +152,34 @@ impl ThemeName {
             Self::Default => Theme::with_accent(
                 Color::Rgb(122, 200, 255),
                 Color::Rgb(86, 138, 180),
-                Color::Rgb(38, 66, 96),
+                // 选中底色要比 accent_dim 亮、比 accent 暗：太暗看不出来，
+                // 太亮会把行文字压没。这一档在深色终端上是一块清楚的蓝色块。
+                Color::Rgb(46, 88, 132),
             ),
             Self::Graphite => Theme::with_accent(
                 Color::Rgb(226, 232, 240),
                 Color::Rgb(148, 156, 168),
-                Color::Rgb(70, 74, 82),
+                Color::Rgb(84, 90, 100),
             ),
             Self::Sunset => Theme::with_accent(
                 Color::Rgb(255, 146, 88),
                 Color::Rgb(186, 106, 74),
-                Color::Rgb(96, 56, 46),
+                Color::Rgb(112, 68, 54),
             ),
             Self::Forest => Theme::with_accent(
                 Color::Rgb(134, 226, 158),
                 Color::Rgb(92, 152, 112),
-                Color::Rgb(40, 74, 52),
+                Color::Rgb(52, 92, 64),
             ),
             Self::Neon => Theme::with_accent(
                 Color::Rgb(255, 92, 214),
                 Color::Rgb(178, 74, 152),
-                Color::Rgb(84, 34, 74),
+                Color::Rgb(104, 44, 92),
             ),
             Self::Dracula => Theme::with_accent(
                 Color::Rgb(189, 147, 249),
                 Color::Rgb(138, 108, 184),
-                Color::Rgb(68, 52, 92),
+                Color::Rgb(82, 64, 112),
             ),
         }
     }

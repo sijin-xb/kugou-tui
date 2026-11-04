@@ -171,6 +171,26 @@ pub struct Config {
     #[serde(default)]
     pub lite_mode: bool,
 
+    /// cava 的平滑强度，0~1。越高越稳、越迟钝；上游默认 0.77。
+    ///
+    /// 它同时决定三件事：回落速度（越低掉得越快）、积分记忆（越高越黏）、
+    /// 以及 autosens 的收敛速度。想要 btop 那种「一有声音就弹上去、立刻掉下来」
+    /// 的观感就调到 0.3 附近；想看清低频的持续起伏就用 0.85 以上。
+    #[serde(default = "default_cava_noise_reduction")]
+    pub cava_noise_reduction: f32,
+
+    /// cava 的自动增益。开启后任何音量下柱子都能铺满，代价是安静段落也会被抬起来。
+    #[serde(default = "default_cava_autosens")]
+    pub cava_autosens: bool,
+
+    /// 频谱分析的下限频率（Hz）。低于它的内容不画。
+    #[serde(default = "default_cava_low_cutoff")]
+    pub cava_low_cutoff: u32,
+
+    /// 频谱分析的上限频率（Hz）。会被钳到采样率的奈奎斯特频率以下。
+    #[serde(default = "default_cava_high_cutoff")]
+    pub cava_high_cutoff: u32,
+
     /// 首页大封面的铺满方式，见 [`CoverFill`]。
     #[serde(default)]
     pub cover_fill: CoverFill,
@@ -243,6 +263,22 @@ fn default_api_auto_start() -> bool {
 
 fn default_qr_aspect() -> f32 {
     2.0
+}
+
+fn default_cava_noise_reduction() -> f32 {
+    0.77
+}
+
+fn default_cava_autosens() -> bool {
+    true
+}
+
+fn default_cava_low_cutoff() -> u32 {
+    50
+}
+
+fn default_cava_high_cutoff() -> u32 {
+    10_000
 }
 
 /// 歌词换行过渡的默认时长（毫秒）。
@@ -342,6 +378,10 @@ impl Default for Config {
             keymap: std::collections::BTreeMap::new(),
             qr_aspect: default_qr_aspect(),
             lite_mode: false,
+            cava_noise_reduction: default_cava_noise_reduction(),
+            cava_autosens: default_cava_autosens(),
+            cava_low_cutoff: default_cava_low_cutoff(),
+            cava_high_cutoff: default_cava_high_cutoff(),
             cover_fill: CoverFill::default(),
             tray: default_tray(),
             api_auto_start: default_api_auto_start(),

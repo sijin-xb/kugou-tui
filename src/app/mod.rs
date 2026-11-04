@@ -38,9 +38,23 @@ fn detect_image_picker() -> ratatui_image::picker::Picker {
     use ratatui_image::picker::{Picker, ProtocolType};
 
     let mut picker = Picker::halfblocks();
-    let is_kitty = std::env::var_os("KITTY_WINDOW_ID").is_some()
-        || std::env::var("TERM").is_ok_and(|term| term.contains("kitty"));
-    let is_iterm2 = std::env::var("TERM_PROGRAM").is_ok_and(|value| value == "iTerm.app");
+
+    // **tmux / screen 一律退回半块字符**，哪怕外层终端是 kitty。
+    //
+    // `KITTY_WINDOW_ID` 和 `TERM=xterm-kitty` 会被 tmux **继承**，于是探测
+    // 认为「这是 kitty」而选 Kitty 协议；但 tmux 默认不透传图形协议，那些
+    // 转义序列被当成普通字符画出来——实测播放条左侧是一串 `􎻮̅̅ᷕ` 之类的乱码。
+    // 用 tmux 的人很多，与其赌它配了 `allow-passthrough`，不如稳稳退回半块字符：
+    // 封面照样看得见，只是分辨率低一档。
+    let in_multiplexer = std::env::var_os("TMUX").is_some()
+        || std::env::var_os("STY").is_some()
+        || std::env::var("TERM").is_ok_and(|term| term.starts_with("screen"));
+
+    let is_kitty = !in_multiplexer
+        && (std::env::var_os("KITTY_WINDOW_ID").is_some()
+            || std::env::var("TERM").is_ok_and(|term| term.contains("kitty")));
+    let is_iterm2 =
+        !in_multiplexer && std::env::var("TERM_PROGRAM").is_ok_and(|value| value == "iTerm.app");
 
     if is_kitty {
         picker.set_protocol_type(ProtocolType::Kitty);
@@ -69,6 +83,7 @@ fn detect_image_picker() -> ratatui_image::picker::Picker {
 
 pub mod cloud;
 pub mod desktop;
+pub mod interaction;
 pub mod navigation;
 pub mod playback;
 pub mod queue;
@@ -115,6 +130,14 @@ pub struct App {
 
     /// 上一帧的时间戳，用来算出真实经过时长（dt），供动画做时间无关的缓动。
     last_frame_at: Instant,
+
+    /// cava 频谱分析器。跨帧保存平滑历史与 autosens 增益，所以必须由 App 独占；
+    /// 采样率变了（换歌 / 换源）要重建，见 [`App::ensure_cava`]。
+    cava: Option<crate::audio::cava::Cava>,
+    /// `cava` 是按哪个采样率建的。与当前采样率不一致时重建。
+    cava_rate: u32,
+    /// 上次送到 cava 的采样窗游标。只喂增量，不喂整个窗口。
+    cava_cursor: usize,
 
     /// 上次把会话写盘的时间。关机/被杀时 `shutdown()` 不会执行，靠 tick 里
     /// 的定期保存兜底——只在退出时存的话，非正常退出就丢进度了。
@@ -272,6 +295,9 @@ impl App {
             downloader,
             runtime,
             last_frame_at: Instant::now(),
+            cava: None,
+            cava_rate: 0,
+            cava_cursor: 0,
             last_session_save: Instant::now(),
             last_mem_trace: Instant::now(),
             pending_device_resume: None,
@@ -366,6 +392,65 @@ impl App {
         let lyric = playing && self.state.lyric_visible;
 
         frame_delay(&self.state.config, visualizer, lyric)
+    }
+
+    /// 保证 cava 分析器与当前音源的采样率一致。
+    ///
+    /// 采样率变了必须重建：分频点到 bin 的换算、Hann 窗、内部缓冲长度全部
+    /// 按采样率算死。换歌（44.1k → 48k、或 hi-res 96k）不重建的话，柱子会整体
+    /// 偏移——低频段被当成中频段画。
+    fn ensure_cava(&mut self) -> Option<&mut crate::audio::cava::Cava> {
+        let rate = self.audio.sample_rate();
+        if rate == 0 {
+            // 还没开始播，采样率未知。此时不建，等第一帧有数据再说。
+            return None;
+        }
+        if self.cava.is_none() || self.cava_rate != rate {
+            self.cava = Some(crate::audio::cava::Cava::with_options(
+                crate::audio::spectrum::BAND_COUNT,
+                rate,
+                self.state.config.cava_noise_reduction,
+                self.state.config.cava_autosens,
+                self.state.config.cava_low_cutoff,
+                self.state.config.cava_high_cutoff,
+            ));
+            self.cava_rate = rate;
+            // 新分析器的内部缓冲是空的，游标要跟着对上，否则会把整窗历史
+            // 当成「新样本」一次性灌进去。
+            self.cava_cursor = self.audio.sample_cursor();
+        }
+        self.cava.as_mut()
+    }
+
+    /// 推进一帧频谱：取增量采样 → 喂 cava → 写回 `state.spectrum`。
+    ///
+    /// 只在可视化页且真的在播时调用（见 `App::tick`）。返回 false 表示这一帧
+    /// 没有新数据，调用方应当保持上一帧画面而不是画一片空。
+    fn advance_spectrum(&mut self) -> bool {
+        // 先把「要读的东西」全部取出来，再借 cava——它会独占 self。
+        // 顺序反过来的话，`samples_since` 那次 `self.audio` 借用会和 `&mut cava` 撞上。
+        let _ = self.ensure_cava();
+        let cursor = self.audio.sample_cursor();
+        // 上限取 cava 内部缓冲的一半：一次喂超过它就会被上游截断，
+        // 白白丢掉真正的波形。按 96kHz、20fps 算，每帧约 4800 个采样。
+        let max = 8_192;
+        let samples = self.audio.samples_since(self.cava_cursor, max);
+        self.cava_cursor = cursor;
+        if samples.is_empty() {
+            return false;
+        }
+        let Some(cava) = self.cava.as_mut() else {
+            return false;
+        };
+        let bars = cava.bars();
+        let levels = cava.execute(&samples);
+        debug_assert_eq!(levels.len(), bars);
+        // `execute` 返回的是内部缓冲的借用，下一帧会被覆盖，所以这里必须拷贝。
+        // 拷贝本身很小（128 个 f32 = 512 B），且 `state.spectrum` 容量稳定后
+        // 不会再分配。
+        self.state.spectrum.clear();
+        self.state.spectrum.extend_from_slice(levels);
+        true
     }
 
     fn event_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> anyhow::Result<()> {
@@ -604,6 +689,9 @@ impl App {
             downloader,
             runtime,
             last_frame_at: Instant::now(),
+            cava: None,
+            cava_rate: 0,
+            cava_cursor: 0,
             last_session_save: Instant::now(),
             last_mem_trace: Instant::now(),
             pending_device_resume: None,

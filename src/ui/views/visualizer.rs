@@ -50,9 +50,10 @@ const EIGHTHS: usize = 8;
 
 /// 柱体最多占几列。
 ///
-/// 宽屏下步长会变大，若把多出来的列全给柱体，柱子会胖成一块块方砖。封顶之后
-/// 余量让给**空隙**——柱子始终是一根根细柱，铺满宽度靠的是间距而不是体量。
-const MAX_BODY: usize = 2;
+/// 1 列：这是 cava 的典型观感——柱子细、间隙宽，铺满宽度靠**柱数**而不是
+/// 柱宽。封顶到 2 时宽屏下柱子会胖成方砖，几根连在一起就成了一片色块，
+/// 看不出是频谱。
+const MAX_BODY: usize = 1;
 
 /// 绘制可视化页面。
 pub fn render_visualizer(
@@ -71,10 +72,10 @@ pub fn render_visualizer(
         return;
     }
 
-    // 节奏：频谱占满剩余空间，其下依次是「地面线」「呼吸」「曲目信息」
-    let [bars_area, floor_area, _gap, info_area] = Layout::vertical([
+    // 频谱占满剩余空间，底部只留一行曲目信息。
+    // 不再画「地面线」：柱子本身就是从底边生长的，多一条横线反而把画面压住。
+    let [bars_area, _gap, info_area] = Layout::vertical([
         Constraint::Min(2),
-        Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -82,7 +83,6 @@ pub fn render_visualizer(
 
     // 左右各留 2 列内边距，柱子不贴边框，观感更稳
     let bars_area = shrink_horizontal(bars_area, 2);
-    let floor_area = shrink_horizontal(floor_area, 2);
 
     // 空状态（未播放 / 缓冲）跨过地面线整块居中：只把内容塞进柱区的话，
     // 视觉重心会明显偏高，下面空一大片。
@@ -101,7 +101,6 @@ pub fn render_visualizer(
                 &state.peak_spectrum,
                 theme,
             );
-            render_floor(frame, floor_area, theme);
         }
         _ => render_idle(frame, content_area, state, theme),
     }
@@ -144,9 +143,13 @@ fn bar_stride(area_width: usize, bands: usize) -> usize {
     if fit >= 2 {
         return fit;
     }
-    // fit <= 1：频段数不少于可用列数，柱子只能是 1 列宽。
-    // 此时若还有余量（宽度 > 频段数），走 2 列步长换取空隙 + 铺满。
-    if area_width > bands { 2 } else { 1 }
+    // fit <= 1：频段数不少于可用列数。
+    //
+    // 这里**永远走 2 列步长**，哪怕宽度装不下 2×柱数——柱子少几根，
+    // 但每根都带一格间隙。1 列步长在终端上会让相邻柱子的 `█` 直接相连，
+    // 整片读成一团色块，完全看不出是一根根的柱子；少几根柱子换「看得出
+    // 是频谱」是值得的。cava 本身在窄终端下也是这个取舍。
+    2
 }
 
 /// 画柱状频谱：底部对齐，柱内自下而上做渐变，柱顶用半块字符收口，柱顶之上
@@ -177,6 +180,13 @@ fn render_bars(frame: &mut Frame, area: Rect, levels: &[f32], peaks: &[f32], the
     // 柱体封顶，步长里多出来的列全给空隙
     let body = stride.saturating_sub(1).clamp(1, MAX_BODY);
     let gap = stride.saturating_sub(body);
+    // 柱数比宽度允许的少时，把**余下的列均摊进间隙**，让柱子铺满整行。
+    // 不这么做的话，频段数不足时右侧会空一大片（宽度 116、柱 58 时右边
+    // 还有一半是空的），看着像图没画完。
+    let used_before = bars * stride;
+    let spare = (area.width as usize).saturating_sub(used_before);
+    let extra_gap = if bars > 1 { spare / (bars - 1) } else { 0 };
+    let gap = gap + extra_gap;
 
     // 频段数通常多于柱子数，把一段频段压成一根柱子。
     // 取**最大值**而不是平均值：平均会把鼓点那一下的尖峰抹平，柱子就只剩一团钝钝的起伏。
@@ -216,23 +226,72 @@ fn render_bars(frame: &mut Frame, area: Rect, levels: &[f32], peaks: &[f32], the
         // 从底部数起的行号，用来判断这一格要不要点亮
         let from_bottom = height - row;
 
-        let mut spans: Vec<Span> = Vec::with_capacity(bars + 1);
-        if pad > 0 {
-            spans.push(Span::raw(" ".repeat(pad)));
+        // 逐格生成 (字符, 样式)，再把**相邻同款**的格子并进同一个 Span。
+        //
+        // 逐柱各建一个 String 时，一帧要分配 `height × bars` 个字符串
+        // （23 行 × 58 柱 ≈ 1300 个），30fps 下每秒四万次。合并之后一行通常
+        // 只剩十来个 Span——大部分格子是「空格 + 同一个样式」。
+        let mut spans: Vec<Span> = Vec::with_capacity(bars / 4 + 2);
+        let mut run: String = String::with_capacity(area.width as usize);
+        let mut run_style = Style::default();
+        let mut have_run = false;
+
+        let push_cell = |glyph: char,
+                         style: Style,
+                         run: &mut String,
+                         run_style: &mut Style,
+                         have_run: &mut bool,
+                         spans: &mut Vec<Span>| {
+            if *have_run && style == *run_style {
+                run.push(glyph);
+                return;
+            }
+            if *have_run && !run.is_empty() {
+                spans.push(Span::styled(std::mem::take(run), *run_style));
+            }
+            run.push(glyph);
+            *run_style = style;
+            *have_run = true;
+        };
+
+        for _ in 0..pad {
+            push_cell(
+                ' ',
+                Style::default(),
+                &mut run,
+                &mut run_style,
+                &mut have_run,
+                &mut spans,
+            );
         }
         for (bar, mark) in marks.iter().enumerate() {
             let (glyph, style) = bar_cell(from_bottom, mark, theme);
-            let mut chunk = String::with_capacity(body + gap);
             for _ in 0..body {
-                chunk.push(glyph);
+                push_cell(
+                    glyph,
+                    style,
+                    &mut run,
+                    &mut run_style,
+                    &mut have_run,
+                    &mut spans,
+                );
             }
             // 柱间空隙。最后一根后面不留，否则右边会多出一列空白
             if bar + 1 < bars {
                 for _ in 0..gap {
-                    chunk.push(' ');
+                    push_cell(
+                        ' ',
+                        Style::default(),
+                        &mut run,
+                        &mut run_style,
+                        &mut have_run,
+                        &mut spans,
+                    );
                 }
             }
-            spans.push(Span::styled(chunk, style));
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, run_style));
         }
         lines.push(Line::from(spans));
     }
@@ -296,11 +355,13 @@ fn bar_style(from_bottom: usize, filled: usize, theme: &Theme) -> Style {
     let rows = (filled as f32 / EIGHTHS as f32).max(1.0);
     let t = (from_bottom as f32 / rows).clamp(0.0, 1.0);
 
-    let color = if t < 0.5 {
-        mix(theme.progress_bg, theme.accent_dim, t * 2.0)
-    } else {
-        mix(theme.accent_dim, theme.accent, (t - 0.5) * 2.0)
-    };
+    // 单色纵向渐变：底暗、顶亮，全程只在「主题底槽 → 强调色」之间插值。
+    // 早先中段掺了 `accent_dim` 做三段过渡，读起来像彩虹断层；Apple Music
+    // 那套观感的关键是**一个色相内的明度变化**，不是多色相。
+    //
+    // 指数 0.7 让下半段更快地离开底槽色：线性插值时低矮的柱子整根都贴在
+    // 深色里，安静段落像没在动。
+    let color = mix(theme.progress_bg, theme.accent, t.powf(0.7));
     Style::default().fg(color)
 }
 
@@ -309,21 +370,6 @@ fn bar_style(from_bottom: usize, filled: usize, theme: &Theme) -> Style {
 /// 不用强调色是因为柱顶本身就是强调色，同色的话那条浮线又会被读成柱子的一部分。
 fn peak_style(theme: &Theme) -> Style {
     Style::default().fg(theme.text).add_modifier(Modifier::BOLD)
-}
-
-/// 柱区的**地面线**：一排暗色横线，给柱子一个落脚的地方，眼睛有参照。
-fn render_floor(frame: &mut Frame, area: Rect, theme: &Theme) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let rule = "─".repeat(area.width as usize);
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            rule,
-            Style::default().fg(theme.border),
-        ))),
-        area,
-    );
 }
 
 /// 未播放：给一句能直接照做的引导，而不是干瘪的「无数据」。
@@ -592,15 +638,15 @@ mod tests {
         );
     }
 
-    /// 「可用宽 ÷ 频段数 == 1」且还有余量时，改走 2 列步长。
+    /// 频段数不少于可用列数时，**一律走 2 列步长**换取间隙。
     ///
-    /// 那个区间里 1 列步长会得到「1 列宽 + 0 空隙」的柱子：既粘成一整片（看不出
-    /// 是一根根柱子），又因为宽度从 64 到 127 列都有余量而铺不满。
+    /// 1 列步长会得到「1 列宽 + 0 空隙」的柱子，相邻柱子的 `█` 直接相连，
+    /// 整片读成一团色块。宁可在窄终端里少画几根柱子，也要保住「一根根」的观感。
     #[test]
-    fn stride_prefers_gaps_when_one_column_would_not_fill() {
+    fn stride_always_leaves_a_gap_when_bands_outnumber_columns() {
         assert_eq!(bar_stride(100, 64), 2, "有余量时应改走 2 列步长");
-        assert_eq!(bar_stride(64, 64), 1, "正好等于频段数时 1 列就铺满");
-        assert_eq!(bar_stride(40, 64), 1, "比频段数还少只能贴着放");
+        assert_eq!(bar_stride(64, 64), 2, "正好等于频段数时也要留空隙");
+        assert_eq!(bar_stride(40, 64), 2, "比频段数还少同样留空隙");
         assert_eq!(bar_stride(192, 64), 3, "宽屏下柱子直接变宽");
         assert_eq!(bar_stride(80, 0), 1, "没有频段时不能除零");
     }
@@ -691,13 +737,14 @@ mod tests {
         assert!(marker < 3, "峰值标记应在柱体之上，实际在第 {marker} 行");
     }
 
-    /// 窄屏放不下空隙时，柱子贴着画（不塌陷、不错位）。
+    /// 窄屏下柱子减少但**保留间隙**，不会塌陷或错位。
     #[test]
     fn bars_degrade_gracefully_when_narrow() {
-        // 4 列画 4 个频段 → stride 1，没有空隙，但仍是 4 根
+        // 4 列画 4 个频段 → stride 2，只能画 2 根（各占 1 列，间隔 1 列）。
+        // 少画两根柱子换「看得出是一根根」，这是有意的取舍。
         let buffer = bars_of(4, 2, &[1.0; 4]);
         let filled = (0..4).filter(|&x| buffer[(x, 1)].symbol() == "█").count();
-        assert_eq!(filled, 4, "窄屏也该画满 4 列");
+        assert_eq!(filled, 2, "窄屏下柱子减半，但每根之间留空隙");
     }
 
     /// 数一行里被点亮的**连续段**数量。

@@ -21,25 +21,40 @@ use crate::keymap::key_hint_for;
 use crate::ui::theme::{Theme, mix};
 use crate::ui::views::{empty_placeholder, failed_placeholder, loading_placeholder};
 use crate::ui::widgets::{
-    RowContext, display_width, panel, row_is_visible, selection_list, song_row, truncate_to_width,
+    RowContext, bare_panel, display_width, panel, row_is_visible, selection_list, song_row,
+    truncate_to_width,
 };
 
-/// 播放条高度：2 行内容 + 上下边框。
+/// 播放条高度：2 行内容，无上下边框。
 ///
-/// 2 行 = 曲目信息 / 进度条。
+/// 2 行 = 曲目信息 / 进度条。面板只画左右竖线（见 `widgets::panel`），
+/// 所以不再需要为上下边框留 2 行。
 ///
-/// 这里**刻意不放封面**：播放条总共才 4 行，给封面最多 8×4 格——那个尺寸下
-/// 专辑图只是一团糊色，既看不清又白占宽度。封面挪到「首页」和「歌词」页，
-/// 那里有整块区域可以按真实比例放大（见 `draw_cover_block`）。
-pub const PLAYER_HEIGHT: u16 = 4;
+/// 3 行时左侧能放一块 5 列的封面缩略图（半块字符下约 10×6「像素」），
+/// 已经能认出主色调；右侧放得下模式、音量与三个播控按钮。
+/// 窄于 64 列时自动降级成 2 行布局（见 `render_player` 的分支）。
+pub const PLAYER_HEIGHT: u16 = 3;
 
-/// 播放条：封面 + 曲目信息 + 进度条 + 下一首。
+/// 播放条：左封面 + 中曲目与进度 + 右控制按钮。
+///
+/// 三行的信息分层：
+///
+/// ```text
+/// ┌──────┬────────────────────────────────────────┬──────────────┐
+/// │      │ 疑心病 · 任然 · 从小到大                │  🔁  🔊 100% │
+/// │ 封面 │ ███████████░░░░░░░░░░░  03:56 / 04:52  │  ⏮  ⏸  ⏭    │
+/// └──────┴────────────────────────────────────────┴──────────────┘
+/// ```
+///
+/// 左侧封面是新增的：两行时代它放不下（8×2 格的专辑图只是一团糊色），
+/// 三行、封面占 5 列之后按半块字符画出来已经能认出封面主色调。
 pub fn render_player(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
-    if area.height < 3 || area.width < 20 {
+    if area.height < 2 || area.width < 20 {
         return;
     }
 
-    let block = panel("播放", false, theme);
+    // 播放条不挂标题：`Block::title` 会占用内容区第一行。
+    let block = bare_panel("", false, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -47,15 +62,278 @@ pub fn render_player(frame: &mut Frame, area: Rect, state: &mut AppState, theme:
         return;
     }
 
-    // 两行：曲目信息 / 进度条。高度只有 1 行时（极端窄终端）只给进度条。
-    if inner.height >= 2 {
-        let [info_area, gauge_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
-        render_song_info(frame, info_area, state, theme);
-        render_progress(frame, gauge_area, state, theme);
-    } else {
-        render_progress(frame, inner, state, theme);
+    // 高度不够时逐级降级：3 行完整版 → 2 行（无封面、无按钮）→ 1 行（只有进度）。
+    match inner.height {
+        0 => {}
+        1 => render_progress_row(frame, inner, state, theme),
+        2 => {
+            let [info_area, gauge_area] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+            render_song_info_compact(frame, info_area, state, theme);
+            render_progress(frame, gauge_area, state, theme);
+        }
+        _ => render_full_player(frame, inner, state, theme),
     }
+}
+
+/// 三行完整版：封面 | 曲目 + 进度 | 控制按钮。
+fn render_full_player(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    // 封面列宽固定 8 列：半块字符下是 16×6 的「像素」，足以认出封面构图
+    // 而不仅仅是平均色。再宽就会把歌名挤到断行；收不到封面时回退成 0 列。
+    const COVER_COLUMNS: u16 = 8;
+    const CONTROLS_WIDTH: u16 = 22;
+
+    let has_cover = state.cover.is_drawable();
+    let cover_width = if has_cover { COVER_COLUMNS } else { 0 };
+
+    // 窄终端下先丢控制按钮列，再丢封面：曲目信息与进度是这块区域的本职。
+    let (area, cover_area, controls_area) = if area.width >= 64 {
+        let [cover, middle, controls] = Layout::horizontal([
+            Constraint::Length(cover_width),
+            Constraint::Min(24),
+            Constraint::Length(CONTROLS_WIDTH),
+        ])
+        .spacing(1)
+        .areas(area);
+        (middle, Some(cover), Some(controls))
+    } else if area.width >= 40 {
+        // 中宽：保住封面与内容，丢掉按钮列——但模式仍要显示，
+        // 它**只在这里出现**（见下面 `render_song_info` 的注释）。
+        let (cover_opt, middle) = if cover_width > 0 {
+            let [cover, middle] =
+                Layout::horizontal([Constraint::Length(cover_width), Constraint::Min(16)])
+                    .spacing(1)
+                    .areas(area);
+            (Some(cover), middle)
+        } else {
+            (None, area)
+        };
+        (middle, cover_opt, None)
+    } else {
+        (area, None, None)
+    };
+
+    if let Some(cover_area) = cover_area {
+        draw_player_cover(frame, cover_area, state);
+    }
+
+    // 左侧中间列自上而下：下一首 + 进度条 + 曲目信息。
+    //
+    // 播放控制（模式 / 音量 / 三个按钮）在**右侧独立一列**，不占这里的行——
+    // 那是「操作」，曲目与进度是「状态」，两者不该在纵向抢位置。
+    // 三行自上而下：进度条 / 曲目信息 / 下一首。
+    //
+    // 「下一首」放最底下、与控制区错开：控制区在右侧列的第 1 行，两者
+    // 挤同一行会撞在一起（实测「下一首 Run Free」直接压在模式标签上）。
+    let [gauge_area, info_area, next_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+    render_progress(frame, gauge_area, state, theme);
+    render_song_info(frame, info_area, state, theme);
+    render_next_hint(frame, next_area, state, theme);
+
+    if let Some(controls_area) = controls_area {
+        render_controls(frame, controls_area, state, theme);
+    } else {
+        // 没有控制列（窄终端）时：模式与音量压到第一行右侧，按钮无处安放
+        // （键盘仍能用）。模式是这一行唯一别处看不到的信息，必须留着。
+        let mode = state.queue.mode().label();
+        let width = (display_width(mode) as u16 + 2).min(gauge_area.width);
+        if width > 0 && gauge_area.height > 0 {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(format!(" {mode} "), theme.dim())))
+                    .alignment(Alignment::Right),
+                Rect {
+                    x: gauge_area.right().saturating_sub(width),
+                    width,
+                    ..gauge_area
+                },
+            );
+        }
+    }
+}
+
+/// 播放条左侧的小封面。
+///
+/// 走与首页相同的那套 `ratatui-image` 路径，但区域很小，所以只要求「能看出是
+/// 什么颜色」——这也是为什么 `lite_mode` 下直接不画：解码一张图换 5 列色块不划算。
+fn draw_player_cover(frame: &mut Frame, area: Rect, state: &mut AppState) {
+    if area.height == 0 || area.width == 0 || state.config.lite_mode {
+        return;
+    }
+    // 用 `Crop`：小区域里完整显示会缩成一条，裁剪才能保住主色调。
+    let Some(picker) = state.picker.as_ref() else {
+        return;
+    };
+    let Some((protocol, render)) = state
+        .cover
+        .fit_to(crate::config::CoverFill::Crop, area, picker)
+    else {
+        return;
+    };
+    frame.render_stateful_widget(ratatui_image::StatefulImage::new(), render, protocol);
+}
+
+/// 第 3 行（无按钮时）：下一首提示与循环模式，右对齐且逐段丢弃。
+fn render_next_hint(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    // 只写「下一首」：循环模式在右侧控制列的上行，重复一次会让两处看起来
+    // 像两个不同的东西。
+    let Some(song) = state.queue.peek_next() else {
+        return;
+    };
+    let text = format!("{} 下一首 {}", crate::ui::icons::next_up(), song.name);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate_to_width(&text, area.width as usize),
+            theme.dim(),
+        )))
+        .alignment(Alignment::Right),
+        area,
+    );
+}
+
+/// 右侧控制按钮：上行模式与音量，下行上一首 / 播放暂停 / 下一首。
+///
+/// 每一块都登记命中区，点得动；悬停时提亮。终端里没有真正的按钮，
+/// 所以用「固定位置的图标 + 悬停反色」表达可点。
+fn render_controls(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    // 与左侧三行对齐：第 1 行放模式与音量，第 3 行放按钮，中间那行空着——
+    // 三行是这块区域的总高度，只压两行的话按钮会浮到进度条那一格上。
+    let [top_area, _gap, bottom_area] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(area);
+
+    // 上行：循环模式 + 音量百分比
+    let mode_label = state.queue.mode().label();
+    let volume_label = if state.is_muted() {
+        "静音".to_string()
+    } else {
+        format!("{:.0}%", state.volume * 100.0)
+    };
+    let mode_rect = Rect {
+        x: top_area.x,
+        width: (top_area.width / 2).max(6),
+        ..top_area
+    };
+    let volume_rect = Rect {
+        x: mode_rect.right(),
+        width: top_area.width.saturating_sub(mode_rect.width),
+        ..top_area
+    };
+
+    let mode_hovered = state.hit_map.is_over(mode_rect);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                " {} ",
+                truncate_to_width(mode_label, mode_rect.width as usize - 2)
+            ),
+            if mode_hovered {
+                theme.selection()
+            } else {
+                theme.dim()
+            },
+        ))),
+        mode_rect,
+    );
+    state.hit_map.insert_flat(mode_rect, HitTarget::PlayMode);
+
+    let volume_hovered =
+        state.hit_map.is_over(volume_rect) || state.interaction.pressed(HitTarget::Volume);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(
+                " {} {} ",
+                crate::ui::icons::volume(state.is_muted()),
+                volume_label
+            ),
+            if volume_hovered {
+                theme.body()
+            } else {
+                theme.dim()
+            },
+        )))
+        .alignment(Alignment::Right),
+        volume_rect,
+    );
+    state.hit_map.insert_flat(volume_rect, HitTarget::Volume);
+
+    if bottom_area.height == 0 || bottom_area.width < 8 {
+        return;
+    }
+
+    // 下行：三个按钮等分
+    let button_width = (bottom_area.width / 3).max(2);
+    let buttons = [
+        (
+            crate::ui::icons::prev(),
+            crate::ui::icons::prev_ascii(),
+            HitTarget::PrevTrack,
+        ),
+        (
+            crate::ui::icons::play_pause_marker(state.playback),
+            crate::ui::icons::play_pause_ascii(state.playback),
+            HitTarget::PlayPause,
+        ),
+        (
+            crate::ui::icons::next(),
+            crate::ui::icons::next_ascii(),
+            HitTarget::NextTrack,
+        ),
+    ];
+    for (index, (nerd, ascii, target)) in buttons.iter().enumerate() {
+        let x = bottom_area.x + button_width * index as u16;
+        let rect = Rect {
+            x,
+            width: if index == 2 {
+                bottom_area.right().saturating_sub(x)
+            } else {
+                button_width
+            },
+            height: 1,
+            ..bottom_area
+        };
+        if rect.width == 0 {
+            break;
+        }
+        let hovered = state.hit_map.is_over(rect);
+        // 用图标字体判定，与别处保持一致
+        let glyph = if crate::ui::icons::nerd_enabled() {
+            *nerd
+        } else {
+            *ascii
+        };
+        let style = if hovered {
+            theme.selection()
+        } else if *target == HitTarget::PlayPause {
+            theme.now_playing()
+        } else {
+            theme.body()
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(glyph, style))).alignment(Alignment::Center),
+            rect,
+        );
+        state.hit_map.insert_flat(rect, *target);
+    }
+}
+
+/// 只有 1 行时的降级：只画进度条与时间。
+fn render_progress_row(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    render_progress(frame, area, state, theme);
 }
 
 /// 第 1 行：播放状态 + 歌名 · 歌手 · 专辑（左），下一首与音量/模式（右）。
@@ -87,78 +365,49 @@ fn render_song_info(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
         None => ("未在播放（在列表里按 Enter 播放）".to_string(), theme.dim()),
     };
 
-    // 右侧：循环模式 + 音量 + 下一首。**按优先级分段**，放不下的整段丢掉，
-    // 而不是把拼好的整串一刀截断——那样被切掉的总是排在最后的那段。
-    //
-    // 模式排在最后（最右）也最重要：它**只在这里显示**，别处（队列标题、状态栏）
-    // 都看不到；音量次之；「下一首」最次——队列面板本来就列着它。于是无论终端多
-    // 窄，循环模式都一定留在播放条上，这正是「窄终端里模式凭空消失」的修复。
-    //
-    // 宽度必须按**显示宽度**算，不能按字符数：`下一首 <歌名>` 里歌名常是中文，
-    // 一个字符占两列，按字符数算出来的宽度会明显偏小。
+    // 只有这一行，整行都归曲目信息。模式 / 音量 / 下一首在 3 行版里由
+    // `render_controls` 与 `render_next_hint` 分别负责，不再挤在这里；
+    // 2 行降级时它们是别处看不到的信息，所以仍由调用方（`render_song_info_compact`）
+    // 画在右侧。
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!("{marker} "), theme.playback(state.playback)),
+            Span::styled(
+                truncate_to_width(&left_text, area.width.saturating_sub(3) as usize),
+                emphasis,
+            ),
+        ])),
+        area,
+    );
+}
+
+/// 2 行降级模式下的曲目信息行：右侧带上模式与音量。
+///
+/// 3 行版有独立控制列，这里没有——那两个值在别处看不到，丢了下拉菜单里
+/// 也没有对应项，所以宁可让歌名短一截也要留着它们。
+fn render_song_info_compact(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
     let mode = state.queue.mode().label().to_string();
     let volume = if state.is_muted() {
         "静音".to_string()
     } else {
         format!("音量 {:.0}%", state.volume * 100.0)
     };
-    let next = state
-        .queue
-        .peek_next()
-        .map(|song| format!("{} 下一首 {}", crate::ui::icons::next_up(), song.name));
+    let right_text = format!("{volume} · {mode}");
+    let right_width = (display_width(&right_text) as u16)
+        .min(area.width / 2)
+        .max(1);
 
-    // 右侧最多占一半宽，但至少放得下模式——模式是这一行唯一别处看不到的信息。
-    let mode_width = display_width(&mode) as u16;
-    let max_right = (area.width / 2).max(mode_width);
-
-    // 从低优先级往高优先级逐段尝试：先带上「下一首」，放不下就丢它；再放不下就
-    // 丢音量。模式永不丢。整段取舍而不是截半句，所以不会出现「音量 80…」这种
-    // 两半都被切坏的残句。
-    let with_next = match next.as_deref() {
-        Some(next) => format!("{next} · {volume} · {mode}"),
-        None => format!("{volume} · {mode}"),
-    };
-    let right_text = if display_width(&with_next) as u16 <= max_right {
-        with_next
-    } else if display_width(&volume) as u16 + 3 + mode_width <= max_right {
-        format!("{volume} · {mode}")
-    } else {
-        mode
-    };
-
-    let right_width = (display_width(&right_text) as u16).min(area.width);
-    let (left_area, right_area) = if right_width > 0 {
-        // 左段给一个下限而不是按比例：歌名再长也要留几个字，不然一行全是右段。
-        let [left, right] =
-            Layout::horizontal([Constraint::Min(12), Constraint::Length(right_width)])
-                .spacing(1)
-                .areas(area);
-        (left, Some(right))
-    } else {
-        (area, None)
-    };
-
+    let [left_area, right_area] =
+        Layout::horizontal([Constraint::Min(8), Constraint::Length(right_width)]).areas(area);
+    render_song_info(frame, left_area, state, theme);
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(format!("{marker} "), theme.playback(state.playback)),
-            Span::styled(
-                truncate_to_width(&left_text, left_area.width.saturating_sub(3) as usize),
-                emphasis,
-            ),
-        ])),
-        left_area,
+        Paragraph::new(Line::from(Span::styled(
+            truncate_to_width(&right_text, right_area.width as usize),
+            theme.dim(),
+        )))
+        .alignment(Alignment::Right),
+        right_area,
     );
-
-    if let Some(right_area) = right_area {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                truncate_to_width(&right_text, right_area.width as usize),
-                theme.dim(),
-            )))
-            .alignment(Alignment::Right),
-            right_area,
-        );
-    }
 }
 
 /// 第 3 行：进度条。自带居中标签，把时间放在条上。
@@ -168,16 +417,44 @@ fn render_progress(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &
         format_duration_ms(state.position_ms),
         format_duration_ms(state.duration_ms)
     );
+    // 悬停 / 拖动时把槽底提亮一档：终端没有光标形状可换，用户只能靠颜色
+    // 知道「这个东西可以拖」。拖动中更亮，给出「正在跟手」的即时反馈。
+    let hovered = state.hit_map.is_over(area) || state.interaction.dragging(HitTarget::Progress);
+    let background = if hovered {
+        mix(theme.progress_bg, theme.progress, 0.25)
+    } else {
+        theme.progress_bg
+    };
+
+    // 进度条只占**中间一段**，时间标签在右侧。整行铺满的粗条会像一条横幅，
+    // 把播放条压垮；Apple Music 那种细条才是「一个控件」而不是「一条分区线」。
+    let label_width = label.chars().count() as u16;
+    let bar_width = area.width.saturating_sub(label_width + 2).max(8);
+    let bar_area = Rect {
+        width: bar_width,
+        ..area
+    };
+    let label_area = Rect {
+        x: area.x + bar_width + 1,
+        width: area.width.saturating_sub(bar_width + 1),
+        ..area
+    };
+
     frame.render_widget(
         Gauge::default()
-            .gauge_style(Style::default().fg(theme.progress).bg(theme.progress_bg))
+            .gauge_style(Style::default().fg(theme.progress).bg(background))
             .ratio(state.progress_ratio())
-            .label(Span::styled(label, theme.body())),
-        area,
+            .label(""),
+        bar_area,
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(label, theme.dim()))),
+        label_area,
     );
 
-    // 点击进度条可跳转：登记命中区，由 app 层按 x 比例换算成目标时间。
-    state.add_hit_zone(area, HitTarget::Progress, 0, 1);
+    // 点击跳转 + 拖动跟随：命中区只覆盖进度条本身，不含右侧时间——
+    // 点在时间上跳进度会让人莫名其妙。
+    state.hit_map.insert_flat(bar_area, HitTarget::Progress);
 }
 
 /// 当前行**未唱部分**的底色，在 `text_dim` 与 `text` 之间的位置。
@@ -223,7 +500,7 @@ fn lerp(from: f32, to: f32, t: f32) -> f32 {
 /// 当前行始终垂直居中——这是卡拉OK式滚动的关键：视线固定屏幕中央，
 /// 而不是跟着文字往下跑。
 pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
-    if area.height < 3 || area.width < 8 {
+    if area.height < 2 || area.width < 8 {
         return;
     }
 
@@ -457,7 +734,7 @@ pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
     let content_rows = viewport.saturating_sub(pad);
     let rows = content_rows.min(display.len().saturating_sub(offset));
     let top = lyric_area.y.saturating_add(pad as u16);
-    state.add_hit_zone(
+    state.hit_map.insert(
         Rect::new(lyric_area.x, top, lyric_area.width, rows as u16),
         HitTarget::LyricLine,
         offset,
@@ -775,7 +1052,7 @@ fn draw_cover_block(
 /// 这里的面板**没有自己的边框**（外层已经由调用方画好了），所以不要在内部
 /// 再套一层 `panel`。
 pub fn render_lyric_panel(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
-    if area.height < 3 || area.width < 8 {
+    if area.height < 2 || area.width < 8 {
         return;
     }
     let rest = draw_cover_block(frame, area, state, CoverPlace::AboveContent);
@@ -797,7 +1074,7 @@ const AVATAR_INITIAL_COLUMNS: u16 = 3;
 /// 首页账号区的高度：边框 2 行 + 内容 6 行（头像要能看清，2 行只能画 4 列宽）。
 ///
 /// 固定值，不能被封面框挤掉——封面用剩下的空间。
-const ACCOUNT_HEIGHT: u16 = 8;
+const ACCOUNT_HEIGHT: u16 = 6;
 
 /// 今天的「概念版」VIP 是否已经领过。
 ///
@@ -860,7 +1137,7 @@ fn render_account(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &T
                 Paragraph::new(Span::styled("点这里重试", theme.key_hint())),
                 Rect::new(inner.x, inner.y + 1, inner.width, 1),
             );
-            state.add_hit_zone(inner, HitTarget::ProfileRetry, 0, 1);
+            state.hit_map.insert(inner, HitTarget::ProfileRetry, 0, 1);
         }
         return;
     };
@@ -959,7 +1236,7 @@ fn render_account(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &T
             style,
         )));
         // 鼠标点这一行也能领（键盘是 V）
-        state.add_hit_zone(
+        state.hit_map.insert(
             Rect::new(text_area.x, row, text_area.width, 1),
             HitTarget::VipClaim,
             0,
@@ -1002,7 +1279,9 @@ fn render_avatar_initial(frame: &mut Frame, area: Rect, nickname: &str, theme: &
 
 /// 首页：正在播放的总览——封面在左，曲目信息与歌词在右。
 pub fn render_home(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
-    let block = panel("正在播放", false, theme);
+    // 首页整块就是「正在播放」的内容本身，不再套一层标题：侧边栏已经写着
+    // 当前在哪个页面，再标一次「正在播放」纯属重复。
+    let block = bare_panel("", false, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -1040,7 +1319,7 @@ pub fn render_home(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &
             Layout::vertical([Constraint::Min(6), Constraint::Length(ACCOUNT_HEIGHT)])
                 .spacing(1)
                 .areas(left);
-        let left_block = panel("封面", false, theme);
+        let left_block = bare_panel("", false, theme);
         let left_inner = left_block.inner(cover_col);
         frame.render_widget(left_block, cover_col);
         draw_cover_block(frame, left_inner, state, CoverPlace::Fill);
@@ -1215,7 +1494,10 @@ mod tests {
         );
     }
 
-    /// 够宽时右侧三段（下一首 · 音量 · 模式）都在。
+    /// 够宽时右侧控制列三段（下一首 · 音量 · 模式）都在。
+    ///
+    /// 音量在控制列里只写百分比（`70%`）不写「音量」二字——那一列只有 22 列，
+    /// 两个字换来的信息量为零。
     #[test]
     fn player_bar_shows_next_up_volume_and_mode_when_wide() {
         let mut state = AppState::new(crate::config::Config::default());
@@ -1241,7 +1523,7 @@ mod tests {
             .expect("渲染播放条");
 
         let text = buffer_text(&terminal);
-        for needle in ["下一首", "音量", "列表循环"] {
+        for needle in ["下一首", "列表循环", "70%"] {
             assert!(text.contains(needle), "宽终端下应显示「{needle}」：{text}");
         }
     }
@@ -1734,9 +2016,17 @@ mod tests {
     /// 那个取整方式只会写出「差一列」的脆弱断言（这条最初就踩了）。
     ///
     /// 只扫内区：最左最右两列是面板边框，边框也有前景色，从 0 扫会先撞上它。
+    /// 这一行第一个「真的画了字」的列。
+    ///
+    /// 跳过边框与 padding：面板只画左右竖线时，第 0 列是边框、第 1 列是
+    /// `Padding::horizontal(1)` 留的空格，两者都有颜色，按「非 Reset」找会落到边框上。
     fn first_text_column(buffer: &ratatui::buffer::Buffer, row: u16, width: u16) -> u16 {
         (1..width.saturating_sub(1))
-            .find(|x| fg_at(buffer, *x, row) != ratatui::style::Color::Reset)
+            .find(|x| {
+                buffer
+                    .cell((*x, row))
+                    .is_some_and(|cell| cell.symbol() != " " && cell.symbol() != "│")
+            })
             .expect("这一行应当有歌词")
     }
 
@@ -1770,8 +2060,17 @@ mod tests {
 
         let buffer = render_lyric_into(&mut state, 40, 9, &theme);
 
-        // 40×9 → 面板内区 (1,1,38,7)；15 行里偏移 4，当前行落在内区第 3 行
-        let row = 1 + 3;
+        // 当前行是第一个字为强调色的那一行。面板现在只画左右竖线，
+        // 上下不再占行，写死行号会随样式变化失效——按颜色认更稳。
+        let row = (0..9)
+            .find(|y| {
+                (0..40).any(|x| {
+                    buffer
+                        .cell((x, *y))
+                        .is_some_and(|cell| cell.symbol() == "一" && cell.fg == theme.accent)
+                })
+            })
+            .expect("总该有一行是当前行");
         let start = first_text_column(&buffer, row, 40);
 
         // 汉字是**双宽**的：每个字占 2 列，紧跟的那一格是续格、前景色是默认值。
@@ -1816,8 +2115,16 @@ mod tests {
 
         let buffer = render_lyric_into(&mut state, 40, 13, &theme);
 
-        // 40×13 → 面板内区 (1,1,38,11)；21 行里偏移 5，当前行落在内区第 5 行
-        let center = 1 + 5;
+        // 当前行是第一个字为强调色的那一行（无上下边框后行号不能写死）
+        let center = (0..13)
+            .find(|y| {
+                (0..40).any(|x| {
+                    buffer
+                        .cell((x, *y))
+                        .is_some_and(|cell| cell.symbol() == "一" && cell.fg == theme.accent)
+                })
+            })
+            .expect("总该有一行是当前行");
         let start = first_text_column(&buffer, center, 40);
         let active = fg_at(&buffer, start, center);
         let near = fg_at(&buffer, start, center + 1);
@@ -1915,7 +2222,9 @@ mod tests {
 
     /// 40×9 的歌词面板：内区 7 行，当前行居中落在内区第 4 行（屏幕第 4 行）。
     /// 显示行 `offset + 3` 对应当前行，所以当前行的屏幕行号恒为 `1 + 3`。
-    const ACTIVE_ROW: u16 = 4;
+    // 标题占第 0 行，歌词内容区从第 1 行起；focus_display=7、offset=3 时
+    // 新行落在 `inner.y(1) + (7 - 3)` = 第 5 行。
+    const ACTIVE_ROW: u16 = 5;
 
     /// 换行过渡必须**两头都对**：旧行变暗、新行变亮。
     ///
@@ -1933,16 +2242,15 @@ mod tests {
         state.lyric.active_line = Some(6);
         state.lyric.retarget(Some(7), 200.0);
         let start = render_lyric_into(&mut state, 40, 9, &theme);
+        // 过渡开始时旧行（第 6 句）最亮、新行（第 7 句）还没亮；
+        // 过渡结束后反过来。用「画了歌词的相邻两行」定位，不写死行号。
+        let anchor = ACTIVE_ROW;
         let old_at_start = fg_at(
             &start,
-            first_text_column(&start, ACTIVE_ROW - 1, 40),
-            ACTIVE_ROW - 1,
+            first_text_column(&start, anchor - 1, 40),
+            anchor - 1,
         );
-        let new_at_start = fg_at(
-            &start,
-            first_text_column(&start, ACTIVE_ROW, 40),
-            ACTIVE_ROW,
-        );
+        let new_at_start = fg_at(&start, first_text_column(&start, anchor, 40), anchor);
 
         // 走完：高亮移到**新**行
         state
@@ -2153,9 +2461,10 @@ mod tests {
         let zone = state
             .hit_test(5, ACTIVE_ROW)
             .expect("歌词区应当登记了命中区");
+        // 视口比改造前多 2 行（无上下边框），max_offset 相应变小
         assert_eq!(
-            zone.first_index, 8,
-            "末屏的 offset 停在 max_offset = 8（内容型对齐），不是 11"
+            zone.first_index, 7,
+            "末屏的 offset 停在 max_offset = 7（内容型对齐）"
         );
         // 屏幕最底那一行（区域 0..7 的第 6 行）显示的是第 14 句，也就是最后一句
         let bottom = zone.rect.bottom() - 1;
@@ -2171,7 +2480,7 @@ mod tests {
             1,
             "区域 y=0、边框 1 行 → 内容区从第 1 行起（`block.inner` 已扣边框）"
         );
-        assert_eq!(zone.rect.bottom(), 8, "命中区覆盖可视的 7 行，不含底部边框");
+        assert_eq!(zone.rect.bottom(), 9, "命中区覆盖可视的 9 行（无上下边框）");
     }
 
     /// 命中区的上沿必须锚在**内容区**：`render_lyric` 自己画边框，所以

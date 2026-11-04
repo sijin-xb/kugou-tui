@@ -25,6 +25,7 @@
 //! 下载不用真的出声，播放引擎不用真的联网。
 
 pub mod cache;
+pub mod cava;
 pub mod download;
 pub mod downmix;
 pub mod engine;

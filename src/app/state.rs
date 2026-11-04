@@ -204,6 +204,24 @@ pub enum HitTarget {
     VipClaim,
     /// 「我的资料」里资料载入失败后的重试提示行。
     ProfileRetry,
+    /// 右键菜单的一项（值是 `ContextMenu::items` 的下标）。
+    MenuItem,
+    /// 音质选择框的一项。
+    QualityItem,
+    /// 确认对话框的「确定」按钮。
+    ConfirmYes,
+    /// 确认对话框的「取消」按钮。
+    ConfirmNo,
+    /// 播放条的「上一首」按钮。
+    PrevTrack,
+    /// 播放条的「播放 / 暂停」按钮。
+    PlayPause,
+    /// 播放条的「下一首」按钮。
+    NextTrack,
+    /// 播放条的音量条：点击 / 拖动改音量。
+    Volume,
+    /// 播放条的循环模式按钮：点一次换一种模式。
+    PlayMode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -985,6 +1003,11 @@ pub struct LyricPane {
     pub instrumental: bool,
     /// 已渲染过的当前行下标，用于只在换行时重新计算居中偏移。
     pub active_line: Option<usize>,
+    /// 拖动歌词时上一次落到的显示行。
+    ///
+    /// 连续拖动会反复落在同一句上，没有这个记号就会对同一行反复 seek，
+    /// 音频线程不停重置缓冲，听起来是断续的。
+    pub drag_line: Option<usize>,
 
     // ---- 换行过渡 ----
     /// 过渡的**旧锚点**（歌词行下标）。`None` 表示这次过渡没有旧行可淡出
@@ -1154,8 +1177,8 @@ pub struct AppState {
     pub playback: PlaybackState,
     pub position_ms: u64,
     pub duration_ms: u64,
-    /// 鼠标当前位置（列, 行）。终端支持鼠标移动上报时才有值，用于悬停反馈。
-    pub hover: Option<(u16, u16)>,
+    /// 鼠标交互状态（悬停 / 按下 / 拖拽）。
+    pub interaction: crate::app::interaction::Interaction,
 
     /// 播放电平（0.0~1.0），来自音频线程的真实采样峰值。会随播放逐帧刷新。
     ///
@@ -1206,8 +1229,8 @@ pub struct AppState {
     /// 二维码过期后连按几次 `L`）会被判为「登录频繁」，手机端直接扫不了——
     /// 实测就是这个提示。用它把申请间隔拉住，别把用户的账号搞限流。
     pub last_qr_key_at: Option<std::time::Instant>,
-    /// 本帧的鼠标命中区，由 ui 层每帧清空后回填。
-    pub hit_zones: Vec<HitZone>,
+    /// 本帧的鼠标命中区与指针位置，由 ui 层每帧清空后回填。
+    pub hit_map: crate::ui::hit::HitMap,
     /// 歌曲列表的排列顺序。
     ///
     /// `true` = 倒序，即**最后一首排在最上面**（`o` 键切换）。之所以把它做成状态而不是
@@ -1490,10 +1513,6 @@ impl ConfirmAction {
             Self::Relogin => "已登录。重新扫码会覆盖当前凭据，确定要重新登录？",
         }
     }
-
-    pub fn hint(self) -> &'static str {
-        "Enter 确认 · Esc 取消"
-    }
 }
 
 /// 文本输入弹窗。用于「新建歌单」这类需要用户输入名字的操作。
@@ -1561,7 +1580,6 @@ impl AppState {
             current_is_trial: false,
             playback: PlaybackState::Stopped,
             position_ms: 0,
-            hover: None,
             levels: Vec::new(),
             spectrum: Vec::new(),
             smooth_spectrum: Vec::new(),
@@ -1581,7 +1599,8 @@ impl AppState {
             download_progress: None,
             cache_bytes: 0,
             ticks: 0,
-            hit_zones: Vec::new(),
+            hit_map: crate::ui::hit::HitMap::default(),
+            interaction: crate::app::interaction::Interaction::default(),
             last_click: None,
             last_click_at: std::time::Instant::now(),
             sort_descending: true,
@@ -1601,8 +1620,9 @@ impl AppState {
 
     /// 供 ui 层在每帧开始时调用：清掉上一帧的命中区。
     pub fn begin_frame(&mut self) {
-        self.hit_zones.clear();
-        // 同 `hit_zones`：本帧的歌词行映射只对「这一帧画出来的东西」有效，
+        self.hit_map.clear();
+        self.hit_map.set_pointer(self.interaction.hover);
+        // 同 `hit_map`：本帧的歌词行映射只对「这一帧画出来的东西」有效，
         // 留着上一帧的会让点击跳到已经滚走的那一句。
         self.lyric.display_line_index.clear();
         // 每帧先当作「没画歌词」，由 `render_lyric` 在真的画出内容时置位。
@@ -1610,23 +1630,18 @@ impl AppState {
         self.lyric_visible = false;
     }
 
-    /// ui 层登记一个可命中区域。
-    pub fn add_hit_zone(&mut self, rect: Rect, target: HitTarget, first_index: usize, len: usize) {
-        self.hit_zones.push(HitZone {
-            rect,
-            target,
-            first_index,
-            len,
-        });
-    }
-
     /// 找出包含指定屏幕坐标的命中区（后登记的优先，这样小区域能覆盖大区域）。
     pub fn hit_test(&self, column: u16, row: u16) -> Option<HitZone> {
-        self.hit_zones
-            .iter()
-            .rev()
-            .find(|zone| zone.contains(column, row))
-            .copied()
+        self.hit_map.at(column, row)
+    }
+
+    /// 并入另一个渲染函数产出的命中区。
+    ///
+    /// 弹窗渲染时 `state.hit_map` 正被 `&` 借着（视图同时要读它算 hover），
+    /// 没法直接往里写。弹窗函数改成返回自己的 `HitMap`，由这里并回主表——
+    /// 顺序上弹窗排在后面，于是它的小区域天然盖住背景里的列表。
+    pub fn merge_hit_zones(&mut self, other: crate::ui::hit::HitMap) {
+        self.hit_map.extend(other);
     }
 
     /// 上一次鼠标点击命中的（区域, 数据下标），用于识别双击。
@@ -1908,18 +1923,11 @@ impl AppState {
 
         // 夹一下：切标签页或卡顿后 elapsed 可能很大，避免一帧跳到底
         let seconds = elapsed.as_secs_f32().clamp(0.0, 0.5);
-        // 起振/回落的时间常数。
-        //
-        // 这两个值要按**帧间隔**来取，不是按 60fps 的习惯：主循环默认 200ms
-        // 一拍（5fps），若沿用 40ms 起振，每拍的系数是 1-exp(-0.2/0.04)≈0.99，
-        // 等于电平每帧直接跳到当前真实值——八级块字符在 ▁ 与 █ 之间剧烈跳变，
-        // 看起来就是侧边栏一直在闪（用户实测反馈）。
-        // 时间常数必须**远大于帧间隔**才平滑：200ms 一帧时，0.45s 的起振每拍只走
-        // 36%，鼓点的瞬时冲击被摊到好几帧里，块字符才是「涨落」而不是「跳变」。
-        // （先前试过 0.15s，每拍仍走 74%，鼓点一响照样整条跳——用户实测反馈
-        // 「鼓点强的地方闪得快」，说的就是这个。）
-        let attack = 1.0 - (-seconds / 0.45).exp();
-        let decay = 1.0 - (-seconds / 1.20).exp();
+        // cava 已经做过三段平滑（回落 / 积分 / autosens），这里只补一层很轻的
+        // 帧间插值。时间常数取 80ms/200ms 而不是旧实现的 450ms/1200ms——
+        // 两层重平滑叠起来，鼓点会被拖成一片模糊的起伏。
+        let attack = 1.0 - (-seconds / 0.08).exp();
+        let decay = 1.0 - (-seconds / 0.20).exp();
         // 峰值刻度每秒下落 50%（约 2 秒落到底），比柱子慢得多，才有频谱仪的余韵
         let peak_fall = seconds * 0.5;
 
@@ -2496,9 +2504,16 @@ mod tests {
         state.smooth_spectrum = vec![0.0; 8];
         state.advance_visualizer(frame);
         let after_one = state.smooth_spectrum[0];
+        // 这一层现在是**轻插值**：cava 已做过三段平滑，这里只补帧间过渡。
+        // 200ms 一帧、80ms 时间常数时一帧走 ~92%，是「跟手」而不是「闪」——
+        // 真正的抗抖交给 cava 的 noise_reduction。
         assert!(
-            after_one < 0.5,
-            "单帧就跳到 {after_one:.2}，太快了，视觉上就是闪"
+            after_one > 0.8,
+            "cava 已平滑过，这一层应当跟手：单帧只走到 {after_one:.2}"
+        );
+        assert!(
+            after_one < 1.0,
+            "再跟手也不该一帧就到位，否则这一层等于不存在"
         );
 
         // 但持续几拍后要能爬到位，不能永远上不去

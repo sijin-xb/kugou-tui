@@ -22,6 +22,7 @@
 //!
 //! 这样一套布局从 80 列的 SSH 窗口到 200 列的宽屏都能用，不需要用户配置。
 
+pub mod hit;
 pub mod icons;
 pub mod theme;
 pub mod views;
@@ -78,11 +79,12 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
 
     let show_sidebar = state.sidebar_visible && content_area.width >= SIDEBAR_MIN_TOTAL_WIDTH;
     let (sidebar_area, main_area) = if show_sidebar {
+        // 两栏之间**不留 spacing**：分隔靠主区自己的左边框画一条竖线。
+        // 留 1 列会变成「竖线-空列-竖线」的断口，整屏被切碎成三段。
         let [sidebar, main] = Layout::horizontal([
             Constraint::Length(views::sidebar_width(content_area.width)),
             Constraint::Min(24),
         ])
-        .spacing(1)
         .areas(content_area);
         (Some(sidebar), main)
     } else {
@@ -107,7 +109,9 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
                 break;
             }
             let rect = Rect::new(sidebar_area.x, y, sidebar_area.width, 1);
-            state.add_hit_zone(rect, HitTarget::Tab(*index), 0, Tab::SIDEBAR_ORDER.len());
+            state
+                .hit_map
+                .insert(rect, HitTarget::Tab(*index), 0, Tab::SIDEBAR_ORDER.len());
         }
     }
 
@@ -142,19 +146,24 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         views::render_prompt(frame, prompt, &theme);
     }
 
-    // 歌曲右键菜单：画在确认框之下（确认框是「要不要做」的最后一道闸）
+    // 歌曲右键菜单：画在确认框之下（确认框是「要不要做」的最后一道闸）。
+    // 弹窗登记命中区不能走 `state.hit_map`（它正被 `&` 借着），所以渲染函数
+    // 返回自己的 `HitMap`，这里再并进去。
     if let Some(menu) = state.context_menu.as_ref() {
-        views::render_context_menu(frame, menu, &theme);
+        let zones = views::render_context_menu(frame, menu, &state.hit_map, &theme);
+        state.merge_hit_zones(zones);
     }
 
     // 下载音质选择框：画在右键菜单之上（它是从菜单里点出来的）
     if let Some(picker) = state.quality_picker.as_ref() {
-        views::render_quality_picker(frame, picker, &theme);
+        let zones = views::render_quality_picker(frame, picker, &state.hit_map, &theme);
+        state.merge_hit_zones(zones);
     }
 
     // 确认对话框优先级最高，画在最上层
     if let Some(action) = state.pending_confirm {
-        views::render_confirm(frame, action, &theme);
+        let zones = views::render_confirm(frame, action, &state.hit_map, &theme);
+        state.merge_hit_zones(zones);
     }
 }
 
@@ -209,8 +218,8 @@ fn render_main(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
     }
 
     let primary_height = match state.tab {
-        // 搜索框：类型标签 1 行 + 输入 1 行，加上边框共 4 行
-        Tab::Search => 4,
+        // 搜索框：类型标签 1 行 + 输入 1 行（无上下边框）
+        Tab::Search => 2,
         // 条目列表占三分之一，但不小于 5 行也不大于 12 行
         _ => (area.height / 3).clamp(5, 12),
     };
@@ -244,7 +253,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
             // 其余页面没有条目列表
             Tab::Search | Tab::Home | Tab::Queue | Tab::Visualizer | Tab::Settings => 0,
         };
-        state.add_hit_zone(
+        state.hit_map.insert(
             Rect::new(
                 primary_area.x + 1,
                 primary_area.y + 1,
@@ -277,7 +286,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
     );
 
     if list_area.height > 3 {
-        state.add_hit_zone(
+        state.hit_map.insert(
             Rect::new(
                 list_area.x + 1,
                 list_area.y + 1,
@@ -310,7 +319,7 @@ fn render_main(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
         );
 
         if queue_area.height > 3 {
-            state.add_hit_zone(
+            state.hit_map.insert(
                 Rect::new(
                     queue_area.x + 1,
                     queue_area.y + 1,
@@ -391,19 +400,44 @@ fn render_primary(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &T
     let focused = state.focus == Focus::Primary;
 
     match state.tab {
+        // 搜索输入框不画竖线：它与下面的结果列表在同一个主区里，
+        // 两条左边框并排会变成双线。输入区靠占位文字和光标辨识就够了。
         Tab::Search => views::render_search_input(frame, area, &state.search, focused, theme),
-        Tab::Playlists => {
-            views::render_playlist_entries(frame, area, &mut state.playlists.list, focused, theme)
-        }
-        Tab::Artists => {
-            views::render_artist_entries(frame, area, &mut state.artists.list, focused, theme)
-        }
-        Tab::Ranks => {
-            views::render_rank_entries(frame, area, &mut state.ranks.list, focused, theme)
-        }
-        Tab::Cloud => {
-            views::render_cloud_entries(frame, area, &mut state.cloud.list, focused, theme)
-        }
+        // `hits` 要在可变借用 state 之前取出来：` &state.hit_map` 与
+        // `&mut state.playlists.list` 是同一个 struct 的两个字段，Rust 允许
+        // 同时借用，但顺序反过来（先 &mut 再 &）就编不过。
+        Tab::Playlists => views::render_playlist_entries(
+            frame,
+            area,
+            &mut state.playlists.list,
+            focused,
+            &state.hit_map,
+            theme,
+        ),
+        Tab::Artists => views::render_artist_entries(
+            frame,
+            area,
+            &mut state.artists.list,
+            focused,
+            &state.hit_map,
+            theme,
+        ),
+        Tab::Ranks => views::render_rank_entries(
+            frame,
+            area,
+            &mut state.ranks.list,
+            focused,
+            &state.hit_map,
+            theme,
+        ),
+        Tab::Cloud => views::render_cloud_entries(
+            frame,
+            area,
+            &mut state.cloud.list,
+            focused,
+            &state.hit_map,
+            theme,
+        ),
         Tab::Sources => views::render_sources(frame, area, state, focused, theme),
         // 这几页都由 render_main 整屏渲染，不会走到这里
         Tab::Home | Tab::Queue | Tab::Visualizer | Tab::Settings => {}
@@ -422,9 +456,6 @@ fn render_song_pane(
 ) {
     // 可视化页没有歌曲列表（它整屏都用来画频谱），这里提前返回。
     // render_main 对它会短路，走到这里只是为其它页兜底。
-    // 先取出鼠标位置：下面 list 会可变借用 state，之后再读就冲突了
-    let pointer = state.hover;
-
     // 搜索页按类型分派：歌手 / 歌单结果区是条目列表，不是歌曲列表。
     // 展开后（`expanded` 有值）则回到歌曲列表，显示该歌手 / 歌单的歌曲。
     if state.tab == Tab::Search {
@@ -436,6 +467,7 @@ fn render_song_pane(
                     &mut state.search.artists,
                     "搜索歌手",
                     focused,
+                    &state.hit_map,
                     theme,
                 );
                 return;
@@ -447,6 +479,7 @@ fn render_song_pane(
                     &mut state.search.playlists,
                     "搜索歌单",
                     focused,
+                    &state.hit_map,
                     theme,
                 );
                 return;
@@ -475,8 +508,8 @@ fn render_song_pane(
             focused,
             current_hash,
             playback,
-            pointer,
         },
+        &state.hit_map,
         theme,
     );
 }
@@ -569,6 +602,118 @@ mod tests {
                         });
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod visual_dump {
+    use super::*;
+    use crate::app::state::Tab;
+    use crate::config::Config;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// 把整帧渲染成纯文本打出来，用于人工检视观感。
+    ///
+    /// 不做断言——它是「截图」而不是测试，加 `--ignored` 平时不跑。
+    #[test]
+    #[ignore = "观感检视用，打印整帧文本"]
+    fn dump_visualizer() {
+        let mut state = AppState::new(Config::default());
+        state.tab = Tab::Visualizer;
+        state.sidebar_visible = false;
+        state.playback = crate::audio::engine::PlaybackState::Playing;
+        state.current = Some(crate::api::model::Song {
+            name: "夜的第七章".to_string(),
+            singers: vec![crate::api::model::Singer {
+                name: "周杰伦".to_string(),
+                ..Default::default()
+            }],
+            duration_ms: 280_000,
+            ..crate::api::model::Song::default()
+        });
+        state.duration_ms = 280_000;
+        state.position_ms = 95_000;
+        // 造一条接近真实音乐的频谱：低频最高，随频率衰减，叠加几个随机峰
+        state.spectrum = (0..128)
+            .map(|index| {
+                let t = index as f32 / 128.0;
+                let base = (1.0 - t).powf(1.4);
+                let bump = 0.25 * (12.0 * t * std::f32::consts::PI).sin().abs();
+                (base * 0.85 + bump).clamp(0.0, 1.0)
+            })
+            .collect();
+        state.smooth_spectrum = state.spectrum.clone();
+        state.peak_spectrum = state.spectrum.iter().map(|value| value * 1.15).collect();
+
+        let (width, height) = (120u16, 30u16);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("建测试终端");
+        terminal
+            .draw(|frame| render(frame, &mut state))
+            .expect("渲染整帧");
+
+        let buffer = terminal.backend().buffer();
+        for y in 0..height {
+            let line: String = (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            println!("|{line}|");
+        }
+    }
+
+    #[test]
+    #[ignore = "观感检视用，打印整帧文本"]
+    fn dump_a_frame() {
+        let mut state = AppState::new(Config::default());
+        state.tab = Tab::Search;
+        state.sidebar_visible = true;
+        state.focus = Focus::Secondary;
+
+        let song = |index: usize, name: &str, singer: &str, album: &str| crate::api::model::Song {
+            name: name.to_string(),
+            hash: format!("h{index}"),
+            singers: vec![crate::api::model::Singer {
+                name: singer.to_string(),
+                ..Default::default()
+            }],
+            album_name: album.to_string(),
+            duration_ms: 180_000 + index as u64 * 7000,
+            ..crate::api::model::Song::default()
+        };
+        state.search.results.replace(
+            "搜索结果",
+            vec![
+                song(0, "夜曲", "周杰伦", "十一月的萧邦"),
+                song(1, "富士山下", "陈奕迅", "What's Going On…?"),
+                song(2, "起风了", "买辣椒也用券", "起风了"),
+                song(3, "Lemon", "米津玄師", "STRAY SHEEP"),
+                song(4, "海阔天空", "Beyond", "乐与怒"),
+            ],
+        );
+        state.search.results.cursor.select(Some(1));
+        state.current = Some(song(0, "夜曲", "周杰伦", "十一月的萧邦"));
+        state
+            .queue
+            .append(song(5, "富士山下", "陈奕迅", "What's Going On…?"));
+        state.playback = crate::audio::engine::PlaybackState::Playing;
+        state.duration_ms = 226_000;
+        state.position_ms = 74_000;
+        state.volume = 0.7;
+        state.status = "已连接 · 内嵌接口".to_string();
+
+        let (width, height) = (120u16, 36u16);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("建测试终端");
+        terminal
+            .draw(|frame| render(frame, &mut state))
+            .expect("渲染整帧");
+
+        let buffer = terminal.backend().buffer();
+        for y in 0..height {
+            let line: String = (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>();
+            println!("|{line}|");
         }
     }
 }

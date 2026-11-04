@@ -95,14 +95,20 @@ pub fn render_sidebar(frame: &mut Frame, area: Rect, state: &AppState, theme: &T
     //
     // 数字键必须留着——显示顺序与 `Tab::ALL`（数字键落点）不同，不标出来的话
     // 用户按 1 却跳到别的页。
-    for row in sidebar_nav_rows() {
+    for (offset, row) in sidebar_nav_rows().into_iter().enumerate() {
         match row {
             SidebarRow::Group(name) => lines.push(section(name, theme)),
             SidebarRow::Tab { tab, .. } => {
                 let selected = tab == state.tab;
                 let pointer = if selected { ">" } else { " " };
+                // 悬停行与选中行的区别只在「有没有指针」：悬停加粗、选中上色，
+                // 同时成立时按选中画——不然鼠标一挪过就把当前位置盖掉了。
+                let row_rect = Rect::new(inner.x, inner.y + offset as u16, inner.width, 1);
+                let hovered = !selected && state.hit_map.is_over(row_rect);
                 let style = if selected {
                     theme.now_playing()
+                } else if hovered {
+                    theme.body().add_modifier(Modifier::BOLD)
                 } else {
                     theme.body()
                 };
@@ -348,24 +354,6 @@ pub fn render_status(
     }
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
-
-    // 右侧快捷键提示靠右对齐，单独画一层，避免和长消息互相挤压
-    let hint = Line::from(vec![
-        Span::styled("[?]", theme.key_hint()),
-        Span::styled(" 帮助 ", theme.dim()),
-        Span::styled("[q]", theme.key_hint()),
-        Span::styled(" 退出 ", theme.dim()),
-    ]);
-    let hint_width = display_width("[?] 帮助 [q] 退出 ");
-    if area.width as usize > hint_width + 20 {
-        let hint_area = Rect {
-            x: area.x + area.width - hint_width as u16,
-            y: area.y,
-            width: hint_width as u16,
-            height: 1,
-        };
-        frame.render_widget(Paragraph::new(hint), hint_area);
-    }
 }
 
 /// 文本输入弹窗（新建歌单等）。
@@ -521,25 +509,70 @@ pub fn render_login(
 ///
 /// 用于清空队列这类破坏性操作。故意做成模态——任何按键都先被它接走，只有确认键才
 /// 生效，这样误按一下不会把整个队列清掉。
-pub fn render_confirm(frame: &mut Frame, action: ConfirmAction, theme: &Theme) {
-    let popup = crate::ui::widgets::centered_rect(frame.area(), 52, 5);
+pub fn render_confirm(
+    frame: &mut Frame,
+    action: ConfirmAction,
+    hits: &crate::ui::hit::HitMap,
+    theme: &Theme,
+) -> crate::ui::hit::HitMap {
+    let popup = crate::ui::widgets::centered_rect(frame.area(), 52, 7);
     frame.render_widget(Clear, popup);
 
     let block = panel("请确认", true, theme);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let text = vec![
-        Line::from(action.question()),
-        Line::from(""),
-        Line::from(Span::styled(action.hint(), theme.dim())),
-    ];
+    if inner.height == 0 {
+        return crate::ui::hit::HitMap::default();
+    }
+
     frame.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(vec![Line::from(action.question())])
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true }),
-        inner,
+        Rect { height: 1, ..inner },
     );
+
+    // 两个按钮并排居中。终端里没有「按钮控件」，所以画成带方括号的文字块，
+    // 靠 hover 反色表达可点——和列表行的反馈保持同一套语言。
+    let mut zones = crate::ui::hit::HitMap::default();
+    let button_row = inner.y + inner.height.saturating_sub(1);
+    let labels = [("  确认  ", true), ("  取消  ", false)];
+    let total: u16 = labels
+        .iter()
+        .map(|(label, _)| label.chars().count() as u16)
+        .sum();
+    let gap = 2u16;
+    let mut x = inner.x + inner.width.saturating_sub(total + gap) / 2;
+    for (label, yes) in labels {
+        let width = label.chars().count() as u16;
+        let rect = Rect::new(x, button_row, width, 1);
+        let hovered = hits.is_over(rect);
+        let style = if yes {
+            if hovered {
+                theme.selection()
+            } else {
+                theme.now_playing()
+            }
+        } else if hovered {
+            theme.body().add_modifier(Modifier::BOLD)
+        } else {
+            theme.dim()
+        };
+        frame.render_widget(Paragraph::new(Line::from(Span::styled(label, style))), rect);
+        zones.insert(
+            rect,
+            if yes {
+                crate::app::state::HitTarget::ConfirmYes
+            } else {
+                crate::app::state::HitTarget::ConfirmNo
+            },
+            0,
+            1,
+        );
+        x += width + gap;
+    }
+    zones
 }
 
 /// 歌曲右键菜单。
@@ -549,8 +582,9 @@ pub fn render_confirm(frame: &mut Frame, action: ConfirmAction, theme: &Theme) {
 pub fn render_context_menu(
     frame: &mut Frame,
     menu: &crate::app::state::ContextMenu,
+    hits: &crate::ui::hit::HitMap,
     theme: &Theme,
-) {
+) -> crate::ui::hit::HitMap {
     use crate::app::state::MenuAction;
 
     let height = (menu.items.len() as u16 + 4).min(frame.area().height);
@@ -564,15 +598,27 @@ pub fn render_context_menu(
     frame.render_widget(block, popup);
 
     if inner.height == 0 {
-        return;
+        return crate::ui::hit::HitMap::default();
     }
 
     let mut lines: Vec<Line> = Vec::new();
+    let mut zones = crate::ui::hit::HitMap::default();
+    // 标题 1 行 + 边框 1 行，菜单项从第 2 行开始
+    let first_item_row = popup.y + 1 + 1;
     for (index, action) in menu.items.iter().enumerate() {
         let selected = index == menu.cursor;
         let pointer = if selected { ">" } else { " " };
+        let rect = Rect::new(
+            popup.x + 1,
+            first_item_row + index as u16,
+            popup.width.saturating_sub(2),
+            1,
+        );
+        let hovered = !selected && hits.is_over(rect);
         let style = if selected {
             theme.selection().add_modifier(Modifier::BOLD)
+        } else if hovered {
+            theme.body().add_modifier(Modifier::BOLD)
         } else {
             theme.body()
         };
@@ -583,6 +629,12 @@ pub fn render_context_menu(
                 if selected { style } else { theme.dim() },
             ),
         ]));
+        zones.insert(
+            rect,
+            crate::app::state::HitTarget::MenuItem,
+            index,
+            menu.items.len(),
+        );
     }
 
     lines.push(Line::from(""));
@@ -594,6 +646,7 @@ pub fn render_context_menu(
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 
     let _ = MenuAction::Play; // 类型已用于 items，这里仅为可读性
+    zones
 }
 
 /// 下载音质选择框：列出可选音质，默认落在当前全局音质上。
@@ -602,8 +655,9 @@ pub fn render_context_menu(
 pub fn render_quality_picker(
     frame: &mut Frame,
     picker: &crate::app::state::QualityPicker,
+    hits: &crate::ui::hit::HitMap,
     theme: &Theme,
-) {
+) -> crate::ui::hit::HitMap {
     let height = (picker.candidates.len() as u16 + 6).min(frame.area().height);
     // 宽度要放得下最长的那一行（「蝰蛇全景声  viper_atmos」），太窄会截断
     let popup = crate::ui::widgets::centered_rect(frame.area(), 46, height);
@@ -614,7 +668,7 @@ pub fn render_quality_picker(
     frame.render_widget(block, popup);
 
     if inner.height == 0 {
-        return;
+        return crate::ui::hit::HitMap::default();
     }
 
     let selected_index = picker.cursor.selected().unwrap_or(0);
@@ -626,14 +680,32 @@ pub fn render_quality_picker(
     )));
     lines.push(Line::from(""));
 
+    let mut zones = crate::ui::hit::HitMap::default();
+    // 片名 1 行 + 空行 1 行 + 边框 1 行 = 第 3 行起是候选
+    let first_item_row = popup.y + 3;
     for (index, quality) in picker.candidates.iter().enumerate() {
         let selected = index == selected_index;
         let pointer = if selected { ">" } else { " " };
+        let rect = Rect::new(
+            popup.x + 1,
+            first_item_row + index as u16,
+            popup.width.saturating_sub(2),
+            1,
+        );
+        let hovered = !selected && hits.is_over(rect);
         let style = if selected {
             theme.selection().add_modifier(Modifier::BOLD)
+        } else if hovered {
+            theme.body().add_modifier(Modifier::BOLD)
         } else {
             theme.body()
         };
+        zones.insert(
+            rect,
+            crate::app::state::HitTarget::QualityItem,
+            index,
+            picker.candidates.len(),
+        );
         let label = crate::app::settings::quality_label(quality);
         lines.push(Line::from(vec![
             Span::styled(
@@ -657,6 +729,7 @@ pub fn render_quality_picker(
     )));
 
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    zones
 }
 
 /// 帮助弹窗。
