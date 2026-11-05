@@ -4,6 +4,13 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
 版本号遵循 [Semantic Versioning](https://semver.org/)。
 
+## [未发布]
+
+### 修复
+
+- 配置里的自定义键位优先于可视化页的页面局部键：`e` / `v` 被改绑给别的动作后不再被调参面板与频谱切换吞掉。
+- `open_cava_settings` 与 `toggle_visualizer_mode` 加入 `[keymap]` 可重绑名单，页面局部键可挪到别的键。
+
 ## [0.8.0] - 2026-11-05
 
 可视化与鼠标交互的完整形态：cava 频谱（柱状 / 瀑布 / 调参面板 / 常驻迷你频谱）、歌词与进度条的鼠标拖拽、睡眠定时、随便听听、本地听歌统计；播放路径稳态零堆分配，静止界面不再重绘。

@@ -163,13 +163,16 @@ pub enum Action {
     RandomListen,
     /// 可视化页局部键：打开 cava 调参面板。
     ///
-    /// 不进 `resolve_normal`，也不在 CHEATSHEET / REBINDABLE 里——`e`/`v`/`V`/`E`
-    /// 在全局键表上已被占用（切音源 / 领 VIP / 设默认音源），而纯函数 `resolve`
-    /// 看不到当前标签页。这族动作由 `App::handle_event` 在可视化页的浏览态下
-    /// 直接按原始按键注入，优先级高于全局键表；已有弹窗仍由 `handle_action`
-    /// 的模态分派吞掉，不会误触。
+    /// 不在 `resolve_normal` 里——`e`/`v`/`V`/`E` 在全局键表上已被占用
+    /// （切音源 / 领 VIP / 设默认音源），而纯函数 `resolve` 看不到当前标签页。
+    /// 这族动作由 `App::handle_event` 在可视化页的浏览态下直接按原始按键注入，
+    /// 优先级高于全局键表；已有弹窗仍由 `handle_action` 的模态分派吞掉，不会误触。
+    ///
+    /// 名字在 `REBINDABLE` 里（`open_cava_settings`），默认键由
+    /// [`resolve_visualizer_local`] 给出；用户把 `e` 改绑给别的动作后页面局部键
+    /// 让路，否则那个动作在可视化页永远按不出来。
     OpenCavaSettings,
-    /// 可视化页局部键：柱状 / 瀑布切换。同上，由事件层注入。
+    /// 可视化页局部键：柱状 / 瀑布切换。同上，由事件层注入，名字 `toggle_visualizer_mode`。
     ToggleVisualizerMode,
     /// 按下了数字 1-9。语义由 App 按当前焦点决定：
     /// 侧边栏 → 切标签页。数字键只做这一件事，不会去选中列表项。
@@ -324,6 +327,9 @@ const REBINDABLE: &[(&str, Action)] = &[
     ("set_default_source", Action::SetDefaultSource),
     ("raise_source_priority", Action::RaiseSourcePriority),
     ("lower_source_priority", Action::LowerSourcePriority),
+    // ---- 可视化页局部键 ----
+    ("open_cava_settings", Action::OpenCavaSettings),
+    ("toggle_visualizer_mode", Action::ToggleVisualizerMode),
 ];
 
 pub fn action_from_name(name: &str) -> Option<Action> {
@@ -576,12 +582,26 @@ pub fn resolve(key: KeyEvent, mode: KeyMode) -> Action {
 /// `App::handle_event` 在可视化页的浏览态下**优先**调用——页面局部语义盖过
 /// 全局键位，其余按键原样落回 [`resolve`]。带 Ctrl/Alt/Super 的组合不拦，
 /// 留给全局组合键。
+///
+/// **配置里的自定义键位优先**：用户把 `e` 改绑给别的动作（如
+/// `move_down = "e"`）之后，这里必须让路（返回 `None`，调用方落回 [`resolve`]），
+/// 否则那个动作在可视化页永远按不出来，界面上还毫无解释。想让调参面板留在
+/// 手边就把 `open_cava_settings` 绑到别的键。
 pub fn resolve_visualizer_local(key: KeyEvent) -> Option<Action> {
     if key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
     {
         return None;
+    }
+    // 配置里显式绑过这个键：绑的是页面局部动作就照办，绑了别的动作则让回
+    // `resolve`（它读同一张表），不能吞掉用户自己的键位。
+    if let Some(action) = custom_action(key) {
+        return matches!(
+            action,
+            Action::OpenCavaSettings | Action::ToggleVisualizerMode
+        )
+        .then_some(action);
     }
     match key.code {
         KeyCode::Char('e' | 'E') => Some(Action::OpenCavaSettings),
@@ -1016,6 +1036,24 @@ mod tests {
             resolve_visualizer_local(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
             None,
             "无关按键原样落回全局键表"
+        );
+    }
+
+    /// 两个页面局部动作必须能用名字重绑。
+    ///
+    /// 用户把 `e` 让给 `move_down` 之后，调参面板与频谱切换得能挪到别的键上，
+    /// 否则这两个功能就再也打不开了。自定义表本身装不进单测（`CUSTOM` 是
+    /// `OnceLock`，见 `display_keys_are_unchanged_without_custom_bindings`），
+    /// 所以这里只钉名字表这一环。
+    #[test]
+    fn visualizer_local_actions_are_rebindable_by_name() {
+        assert_eq!(
+            action_from_name("open_cava_settings"),
+            Some(Action::OpenCavaSettings)
+        );
+        assert_eq!(
+            action_from_name("toggle_visualizer_mode"),
+            Some(Action::ToggleVisualizerMode)
         );
     }
 
