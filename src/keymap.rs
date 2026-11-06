@@ -489,7 +489,11 @@ fn resolve_displayed_token(token: &str) -> Option<Action> {
     let name = display_token_to_key_name(token)?;
     let (code, modifiers) = parse_key(&name)?;
     let action = resolve(KeyEvent::new(code, modifiers), KeyMode::Normal);
-    (action != Action::None).then_some(action)
+    // 可视化页的局部键在 `resolve` 里查不到（它看不到标签页），单独补一次，
+    // 否则面板里那两行会被当成「本来就没绑定」而逃过下面的一致性检查。
+    (action != Action::None)
+        .then_some(action)
+        .or_else(|| default_visualizer_local(code))
 }
 
 /// 按键 → 面板上显示的名字。与 [`display_token_to_key_name`] 是反方向。
@@ -529,7 +533,14 @@ fn render_key_name(code: KeyCode, modifiers: KeyModifiers) -> String {
 
 /// 查自定义键位。未安装或没命中返回 `None`。
 fn custom_action(key: KeyEvent) -> Option<Action> {
-    let table = CUSTOM.get()?;
+    custom_lookup(CUSTOM.get()?, key)
+}
+
+/// [`custom_action`] 的查表本体，键表当参数传。
+fn custom_lookup(
+    table: &HashMap<(KeyCode, KeyModifiers), Action>,
+    key: KeyEvent,
+) -> Option<Action> {
     table
         .get(&(key.code, key.modifiers))
         // 终端对 Shift+字母 通常报「大写 Char + SHIFT」，而配置里写的可能是
@@ -583,27 +594,45 @@ pub fn resolve(key: KeyEvent, mode: KeyMode) -> Action {
 /// 全局键位，其余按键原样落回 [`resolve`]。带 Ctrl/Alt/Super 的组合不拦，
 /// 留给全局组合键。
 ///
-/// **配置里的自定义键位优先**：用户把 `e` 改绑给别的动作（如
-/// `move_down = "e"`）之后，这里必须让路（返回 `None`，调用方落回 [`resolve`]），
-/// 否则那个动作在可视化页永远按不出来，界面上还毫无解释。想让调参面板留在
-/// 手边就把 `open_cava_settings` 绑到别的键。
+/// **自定义键位表里有这个键，就一律让路**（返回 `None`，调用方落回
+/// [`resolve`]，它读同一张表）。理由：`install_custom` 建的是「键 → 动作」
+/// 的一对一表，表里有这个键就说明用户对它有过明确意见，页面局部语义不该
+/// 再盖上去。
+///
+/// 这里**不能**改成「表里的动作是页面局部动作才照办」的白名单写法：那等于
+/// 又立一份要跟 `REBINDABLE` 同步的名单，而「两份名单不同步」这个坑已经
+/// 踩过一次（见 `REBINDABLE` 上 `context_menu` 那段）。
+///
+/// 副作用是：用户把 `open_cava_settings` 绑到别的键之后，默认的 `e` 也要
+/// 一并失效——这正是对的，否则「我改了调参面板的键」和「`e` 还是调参面板」
+/// 同时成立。
 pub fn resolve_visualizer_local(key: KeyEvent) -> Option<Action> {
+    resolve_visualizer_local_with(key, CUSTOM.get())
+}
+
+/// [`resolve_visualizer_local`] 的内部实现：把键表当参数传，便于单测。
+///
+/// 生产侧的 `CUSTOM` 是 `OnceLock`，测试装不进去（同
+/// [`display_keys_with`] 的处理）。`None` 表示用户没写 `[keymap]`。
+fn resolve_visualizer_local_with(
+    key: KeyEvent,
+    table: Option<&HashMap<(KeyCode, KeyModifiers), Action>>,
+) -> Option<Action> {
     if key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
     {
         return None;
     }
-    // 配置里显式绑过这个键：绑的是页面局部动作就照办，绑了别的动作则让回
-    // `resolve`（它读同一张表），不能吞掉用户自己的键位。
-    if let Some(action) = custom_action(key) {
-        return matches!(
-            action,
-            Action::OpenCavaSettings | Action::ToggleVisualizerMode
-        )
-        .then_some(action);
+    if table.is_some_and(|table| custom_lookup(table, key).is_some()) {
+        return None;
     }
-    match key.code {
+    default_visualizer_local(key.code)
+}
+
+/// 可视化页局部键的默认表，与 `[keymap]` 无关。供 [`CHEATSHEET`] 的反向核对用。
+fn default_visualizer_local(code: KeyCode) -> Option<Action> {
+    match code {
         KeyCode::Char('e' | 'E') => Some(Action::OpenCavaSettings),
         KeyCode::Char('v' | 'V') => Some(Action::ToggleVisualizerMode),
         _ => None,
@@ -800,6 +829,8 @@ pub const CHEATSHEET: &[(&str, &str, &str)] = &[
         "播放",
     ),
     ("w", "随便听听：随机歌单抽一页歌，替换队列开播", "播放"),
+    ("e", "cava 调参面板（仅可视化页）", "可视化"),
+    ("v", "柱状 / 瀑布切换（仅可视化页）", "可视化"),
 ];
 
 #[cfg(test)]
@@ -998,7 +1029,12 @@ mod tests {
                     unbound.push(format!("「{token}」({description}) 连写法都不认识"));
                     continue;
                 };
-                if resolve(KeyEvent::new(code, modifiers), KeyMode::Normal) == Action::None {
+                // 可视化页的局部键不走 `resolve`（它看不到标签页），单独认一次，
+                // 否则往 `CHEATSHEET` 里补 `e` / `v` 时这条会误报「没绑定」。
+                let bound = resolve(KeyEvent::new(code, modifiers), KeyMode::Normal)
+                    != Action::None
+                    || default_visualizer_local(code).is_some();
+                if !bound {
                     unbound.push(format!("「{token}」({description})"));
                 }
             }
@@ -1042,9 +1078,7 @@ mod tests {
     /// 两个页面局部动作必须能用名字重绑。
     ///
     /// 用户把 `e` 让给 `move_down` 之后，调参面板与频谱切换得能挪到别的键上，
-    /// 否则这两个功能就再也打不开了。自定义表本身装不进单测（`CUSTOM` 是
-    /// `OnceLock`，见 `display_keys_are_unchanged_without_custom_bindings`），
-    /// 所以这里只钉名字表这一环。
+    /// 否则这两个功能就再也打不开了。
     #[test]
     fn visualizer_local_actions_are_rebindable_by_name() {
         assert_eq!(
@@ -1054,6 +1088,51 @@ mod tests {
         assert_eq!(
             action_from_name("toggle_visualizer_mode"),
             Some(Action::ToggleVisualizerMode)
+        );
+    }
+
+    /// 自定义表里有这个键时，页面局部键一律让路。
+    ///
+    /// 直接喂构造好的键表给内部实现（生产侧 `CUSTOM` 是 `OnceLock`，测试
+    /// 装不进去，同 `display_keys_follow_custom_bindings`）。
+    ///
+    /// 三种情形一起钉住，其中第三种最容易写错：用户把 `open_cava_settings`
+    /// 挪到 `x` 之后，`e` 上的默认语义必须**一并失效**，否则「我改了它的键」
+    /// 和「`e` 还是它」同时成立。
+    #[test]
+    fn custom_bindings_make_visualizer_local_keys_step_aside() {
+        use std::collections::HashMap;
+        let table: HashMap<(KeyCode, KeyModifiers), Action> = [
+            // 用户把 `e` 让给了别的动作
+            ((KeyCode::Char('e'), KeyModifiers::NONE), Action::MoveDown),
+            // 用户把调参面板挪到了 `x`
+            (
+                (KeyCode::Char('x'), KeyModifiers::NONE),
+                Action::OpenCavaSettings,
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE);
+        assert_eq!(
+            resolve_visualizer_local_with(e, Some(&table)),
+            None,
+            "`e` 被用户绑走之后，页面局部键必须让路"
+        );
+
+        let x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(
+            resolve_visualizer_local_with(x, Some(&table)),
+            None,
+            "`x` 绑的是页面局部动作，但解析交给 `resolve`，这里同样让路"
+        );
+
+        let v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE);
+        assert_eq!(
+            resolve_visualizer_local_with(v, Some(&table)),
+            Some(Action::ToggleVisualizerMode),
+            "表里没有的键仍用默认页面局部语义，否则用户挪走一个键就把其余的全废了"
         );
     }
 
