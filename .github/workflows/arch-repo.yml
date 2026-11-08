@@ -105,7 +105,10 @@ jobs:
 
       - name: 把缓存目录交给 builder
         run: |
-          mkdir -p /home/builder/.cache/kugou-tui-cargo-target
+          # 缓存未命中时 actions/cache 不创建目录，builder 也还没跑过 cargo，
+          # 所以两个目录都得先建出来再 chown。
+          mkdir -p /home/builder/.cargo/registry /home/builder/.cargo/git \
+                   /home/builder/.cache/kugou-tui-cargo-target
           chown -R builder:builder /home/builder/.cargo /home/builder/.cache
 
       # --syncdeps 让 makepkg 自己装 depends/makedepends；--cleanbuild 保证不复用
