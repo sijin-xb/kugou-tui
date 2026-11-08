@@ -1,0 +1,181 @@
+name: Arch repo
+
+# 打 tag 时构建 .pkg.tar.zst，更新 pacman 索引，推到 sijin-xb/kugou-tui-repo 的 gh-pages。
+#
+# 与 release.yml 并列而不是合并进去：那边只碰本仓库的 Release，这边要写另一个仓库。
+# 分开之后任何一边失败都不影响另一边，也免得给 release.yml 加跨仓库凭据。
+#
+# 需要的 secret：ARCH_REPO_TOKEN —— 对 sijin-xb/kugou-tui-repo 有 contents:write 的
+# fine-grained PAT。GITHUB_TOKEN 只对当前仓库有效，跨仓库推送用不了。
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要补包的 tag（例如 v0.8.1）'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  REPO_SLUG: sijin-xb/kugou-tui-repo
+  # 保留多少个历史版本。Pages 站点有 1 GB 软限制，单包约 5 MB，
+  # 留 20 个版本约 100 MB，够用且远未触顶。
+  KEEP_VERSIONS: '20'
+
+jobs:
+  build:
+    name: 构建 Arch 包
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+      options: --privileged
+    steps:
+      # tag 名会进 checkout 的 ref。workflow_dispatch 的输入不受控，
+      # 先用一条白名单校验挡住 `refs/heads/../../` 这类路径穿越。
+      - name: 校验 tag
+        env:
+          TAG_IN: ${{ inputs.tag || github.ref_name }}
+        run: |
+          case "$TAG_IN" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "tag 格式不对：$TAG_IN" >&2; exit 1 ;;
+          esac
+          case "$TAG_IN" in
+            *[!A-Za-z0-9._-]*) echo "tag 含非法字符：$TAG_IN" >&2; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      # makepkg 拒绝以 root 运行（它要调 pacman -U 装依赖，root 下会污染构建环境）。
+      # 容器里默认只有 root，所以建一个 builder 用户，构建目录 chown 给它。
+      - name: 准备构建用户
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed base-devel alsa-lib pkgconf cmake cargo git
+          useradd -m builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      # --syncdeps 让 makepkg 自己装 depends/makedepends；--cleanbuild 保证不复用
+      # 上一次的 src/ 与 pkg/；--noconfirm 跳过交互。
+      #
+      # 不传 --skippgpcheck：这个 PKGBUILD 没有 PGP 源。
+      - name: 构建
+        working-directory: packaging/arch
+        run: sudo -u builder makepkg --syncdeps --cleanbuild --noconfirm --force
+
+      # 版本核对。tag 是 v0.8.1，PKGBUILD 里 pkgver 必须也是 0.8.1，
+      # 否则打出来的包名与 tag 对不上，用户装的版本是错的。
+      - name: 核对版本
+        working-directory: packaging/arch
+        run: |
+          expected="${TAG#v}"
+          actual=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          [ "$actual" = "$expected" ] ||
+            { echo "PKGBUILD 是 $actual，tag 是 $expected" >&2; exit 1; }
+          echo "版本核对通过：$actual"
+
+      - name: 收集产物
+        run: |
+          mkdir -p /tmp/out
+          cp packaging/arch/*.pkg.tar.zst /tmp/out/
+          cp packaging/arch/install.sh /tmp/out/
+          ls -lh /tmp/out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-pkg
+          path: /tmp/out/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: 更新仓库索引并推送
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取回产物
+        uses: actions/download-artifact@v4
+        with:
+          name: arch-pkg
+          path: pkg
+
+      # 检出已有的 gh-pages，保留历史包。浅克隆够用：只需要现有文件。
+      #
+      # token 通过环境变量传，不拼进 URL 字面量：拼进去会出现在进程命令行里，
+      # 出错时 git 也可能把整个 remote URL 打进日志。
+      - name: 检出 gh-pages
+        env:
+          ARCH_REPO_TOKEN: ${{ secrets.ARCH_REPO_TOKEN }}
+          REPO_SLUG: ${{ env.REPO_SLUG }}
+        run: |
+          set -euo pipefail
+          remote="https://x-access-token:${ARCH_REPO_TOKEN}@github.com/${REPO_SLUG}.git"
+          # 关掉 credential 回显，避免 token 落进 .git/config 之外的地方
+          export GIT_TERMINAL_PROMPT=0
+          if git clone --depth 1 --branch gh-pages "$remote" site 2>/dev/null; then
+            echo "已检出现有 gh-pages"
+          else
+            # 首次发布时分支还不存在，从空仓库起。
+            rm -rf site
+            git init site
+            git -C site remote add origin "$remote"
+            git -C site checkout -b gh-pages
+          fi
+
+      - name: 更新索引
+        run: |
+          set -euo pipefail
+          cd site
+          mkdir -p x86_64
+          cp ../pkg/*.pkg.tar.zst x86_64/
+          cp ../pkg/install.sh install.sh
+          # .nojekyll 关掉 Jekyll：否则 x86_64 目录与 .pkg.tar.zst 会被它的
+          # 规则过滤掉。
+          touch .nojekyll
+          # repo-add 在 x86_64/ 下运行，索引里的条目是相对文件名，
+          # pacman 用 Server 行拼出来能对上。
+          cd x86_64
+          repo-add --nocolor kugou-tui.db.tar.gz ./*.pkg.tar.zst
+
+      - name: 清理旧版本
+        run: |
+          set -euo pipefail
+          cd site/x86_64
+          # 按版本排序，删掉超出 KEEP_VERSIONS 的最旧包。
+          # 文件名形如 kugou-tui-0.8.1-1-x86_64.pkg.tar.zst。
+          mapfile -t all < <(ls -1 *.pkg.tar.zst 2>/dev/null | sort -V)
+          count=${#all[@]}
+          if [ "$count" -gt "$KEEP_VERSIONS" ]; then
+            remove=$(( count - KEEP_VERSIONS ))
+            printf '删除 %d 个旧包：\n' "$remove"
+            for f in "${all[@]:0:$remove}"; do
+              echo "  $f"
+              rm -f "$f"
+            done
+          fi
+          # 索引要跟着重建，否则 pacman 还能看到已删除的包。
+          rm -f kugou-tui.db.tar.gz kugou-tui.db
+          repo-add --nocolor kugou-tui.db.tar.gz ./*.pkg.tar.zst
+
+      - name: 推送
+        run: |
+          set -euo pipefail
+          cd site
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo "没有变化，跳过提交。"
+            exit 0
+          fi
+          git commit -m "kugou-tui ${TAG#v}"
+          git push origin gh-pages

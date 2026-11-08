@@ -4,6 +4,14 @@
 # Release 用的二进制包（scripts/make-release-tarball 产出）
 /dist
 
+# makepkg 的工作目录与产物（packaging/arch/）
+/packaging/arch/src
+/packaging/arch/pkg
+/packaging/arch/*.pkg.tar.*
+/packaging/arch/*.tar.gz
+/packaging/arch/*.tar.xz
+/packaging/arch/*.tar.zst
+
 # 环境变量（可能含服务端配置）
 .env
 .env.local

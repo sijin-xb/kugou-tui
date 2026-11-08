@@ -12,14 +12,22 @@
 
 ## 安装
 
+**Arch 系（CachyOS / EndeavourOS / Manjaro）**，用预编译包，不需要 Rust 工具链：
+
 ```bash
-cargo install kugou-tui
-kugou-tui
+curl -fsSL https://sijin-xb.github.io/kugou-tui-repo/install.sh | sudo bash
+sudo pacman -Sy && sudo pacman -S kugou-tui
 ```
+
+第一条命令只往 `/etc/pacman.conf` 追加一个仓库段（会先备份原文件），可重复运行。
 
 其他方式：
 
 ```bash
+# crates.io
+cargo install kugou-tui
+kugou-tui
+
 # 从源码构建（需要 Rust 1.90+；Linux 另需 alsa-lib 开发头文件与 pkg-config）
 git clone https://github.com/sijin-xb/kugou-tui && cd kugou-tui
 cargo build --release        # 产物约 12 MiB，在 target/release/kugou-tui
