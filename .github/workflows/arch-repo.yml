@@ -68,15 +68,19 @@ jobs:
       # 上一次的 src/ 与 pkg/；--noconfirm 跳过交互。
       #
       # 不传 --skippgpcheck：这个 PKGBUILD 没有 PGP 源。
+      #
+      # 用 cd 而不是 working-directory：在 container job 里 working-directory 会
+      # 变成容器启动时的 cwd，而那时 checkout 还没跑，目录不存在，容器起不来。
       - name: 构建
-        working-directory: packaging/arch
-        run: sudo -u builder makepkg --syncdeps --cleanbuild --noconfirm --force
+        run: |
+          cd packaging/arch
+          sudo -u builder makepkg --syncdeps --cleanbuild --noconfirm --force
 
       # 版本核对。tag 是 v0.8.1，PKGBUILD 里 pkgver 必须也是 0.8.1，
       # 否则打出来的包名与 tag 对不上，用户装的版本是错的。
       - name: 核对版本
-        working-directory: packaging/arch
         run: |
+          cd packaging/arch
           expected="${TAG#v}"
           actual=$(sed -n 's/^pkgver=//p' PKGBUILD)
           [ "$actual" = "$expected" ] ||
