@@ -84,6 +84,30 @@ jobs:
           echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
           chown -R builder:builder "$GITHUB_WORKSPACE"
 
+      # 缓存 cargo 的 registry 与 target。
+      #
+      # 两个坑：
+      # 1. 构建以 builder 身份跑，缓存路径是 /home/builder/.cargo，不是 /root/.cargo。
+      # 2. makepkg --cleanbuild 会删掉 src/（里面是 target/），所以 CARGO_TARGET_DIR
+      #    必须指到 src/ 之外，否则缓存每轮都被清掉。
+      #
+      # key 里带 Cargo.lock 的哈希：依赖变了就换一份缓存，避免拿到过期产物。
+      - name: 缓存 cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            /home/builder/.cargo/registry
+            /home/builder/.cargo/git
+            /home/builder/.cache/kugou-tui-cargo-target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: 把缓存目录交给 builder
+        run: |
+          mkdir -p /home/builder/.cache/kugou-tui-cargo-target
+          chown -R builder:builder /home/builder/.cargo /home/builder/.cache
+
       # --syncdeps 让 makepkg 自己装 depends/makedepends；--cleanbuild 保证不复用
       # 上一次的 src/ 与 pkg/；--noconfirm 跳过交互。
       #
@@ -93,9 +117,13 @@ jobs:
       # working-directory 会被当成容器启动时的 cwd，而那时 checkout 还没跑，
       # 目录不存在，容器直接 chdir 失败。$GITHUB_WORKSPACE 在 step 执行期才求值。
       - name: 构建
+        env:
+          # 指向 src/ 之外，--cleanbuild 删 src/ 时才不会把编译缓存一起清掉。
+          CARGO_TARGET_DIR: /home/builder/.cache/kugou-tui-cargo-target
         run: |
           cd "$GITHUB_WORKSPACE/packaging/arch"
-          sudo -u builder makepkg --syncdeps --cleanbuild --noconfirm --force
+          # sudo -E 保留 CARGO_TARGET_DIR；makepkg 自身会把它传给 build()。
+          sudo -E -u builder makepkg --syncdeps --cleanbuild --noconfirm --force
 
       # 核对构建出的二进制自报版本，而不是 PKGBUILD 里的字符串——后者是上一步
       # 刚注入的，比对它等于自己跟自己比，抓不到「源码 checkout 错了」这类问题。
