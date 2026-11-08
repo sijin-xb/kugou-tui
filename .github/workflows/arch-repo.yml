@@ -86,10 +86,12 @@ jobs:
 
       # 缓存 cargo 的 registry 与 target。
       #
-      # 两个坑：
-      # 1. 构建以 builder 身份跑，缓存路径是 /home/builder/.cargo，不是 /root/.cargo。
-      # 2. makepkg --cleanbuild 会删掉 src/（里面是 target/），所以 CARGO_TARGET_DIR
-      #    必须指到 src/ 之外，否则缓存每轮都被清掉。
+      # 路径用 /home/builder：sudo -H 会把 HOME 重置成目标用户的家目录，
+      # 所以 cargo 的缓存在那里。不要用 $HOME——容器里它是 /github/home，
+      # 那是 Actions 挂载的，builder 无写权限。
+      #
+      # makepkg --cleanbuild 会删掉 src/（里面是 target/），所以 CARGO_TARGET_DIR
+      # 必须指到 src/ 之外，否则缓存每轮都被清掉。
       #
       # key 里带 Cargo.lock 的哈希：依赖变了就换一份缓存，避免拿到过期产物。
       - name: 缓存 cargo
@@ -125,8 +127,9 @@ jobs:
           CARGO_TARGET_DIR: /home/builder/.cache/kugou-tui-cargo-target
         run: |
           cd "$GITHUB_WORKSPACE/packaging/arch"
-          # sudo -E 保留 CARGO_TARGET_DIR；makepkg 自身会把它传给 build()。
-          sudo -E -u builder makepkg --syncdeps --cleanbuild --noconfirm --force
+          # -H 把 HOME 重置成 /home/builder，否则 cargo 会去写 /github/home/.cargo
+          # （Actions 挂载的目录，builder 无权限）。-E 保留 CARGO_TARGET_DIR。
+          sudo -H -E -u builder makepkg --syncdeps --cleanbuild --noconfirm --force
 
       # 核对构建出的二进制自报版本，而不是 PKGBUILD 里的字符串——后者是上一步
       # 刚注入的，比对它等于自己跟自己比，抓不到「源码 checkout 错了」这类问题。
