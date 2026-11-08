@@ -132,25 +132,37 @@ jobs:
     name: 更新仓库索引并推送
     needs: build
     runs-on: ubuntu-latest
+    # repo-add 是 pacman 自带的工具，ubuntu runner 上没有。整个 job 放进 Arch
+    # 容器，和 build 用同一个镜像，省得去猜别的发行版怎么装 pacman-contrib。
+    container:
+      image: archlinux:latest
     steps:
+      - name: 装 git 与 pacman 工具
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm --needed git pacman
+
       - name: 取回产物
         uses: actions/download-artifact@v4
         with:
           name: arch-pkg
-          path: pkg
+          path: ${{ github.workspace }}/pkg
 
       # 检出已有的 gh-pages，保留历史包。浅克隆够用：只需要现有文件。
       #
       # token 通过环境变量传，不拼进 URL 字面量：拼进去会出现在进程命令行里，
       # 出错时 git 也可能把整个 remote URL 打进日志。
+      #
+      # 容器 job 的 cwd 是 /，所以 site 建在 $GITHUB_WORKSPACE 下，
+      # 后续步骤都用绝对路径进去。
       - name: 检出 gh-pages
         env:
           ARCH_REPO_TOKEN: ${{ secrets.ARCH_REPO_TOKEN }}
           REPO_SLUG: ${{ env.REPO_SLUG }}
         run: |
           set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
           remote="https://x-access-token:${ARCH_REPO_TOKEN}@github.com/${REPO_SLUG}.git"
-          # 关掉 credential 回显，避免 token 落进 .git/config 之外的地方
           export GIT_TERMINAL_PROMPT=0
           if git clone --depth 1 --branch gh-pages "$remote" site 2>/dev/null; then
             echo "已检出现有 gh-pages"
@@ -165,10 +177,10 @@ jobs:
       - name: 更新索引
         run: |
           set -euo pipefail
-          cd site
+          cd "$GITHUB_WORKSPACE/site"
           mkdir -p x86_64
-          cp ../pkg/*.pkg.tar.zst x86_64/
-          cp ../pkg/install.sh install.sh
+          cp "$GITHUB_WORKSPACE"/pkg/*.pkg.tar.zst x86_64/
+          cp "$GITHUB_WORKSPACE"/pkg/install.sh install.sh
           # .nojekyll 关掉 Jekyll：否则 x86_64 目录与 .pkg.tar.zst 会被它的
           # 规则过滤掉。
           touch .nojekyll
@@ -180,7 +192,7 @@ jobs:
       - name: 清理旧版本
         run: |
           set -euo pipefail
-          cd site/x86_64
+          cd "$GITHUB_WORKSPACE/site/x86_64"
           # 按版本排序，删掉超出 KEEP_VERSIONS 的最旧包。
           # 文件名形如 kugou-tui-0.8.1-1-x86_64.pkg.tar.zst。
           mapfile -t all < <(ls -1 *.pkg.tar.zst 2>/dev/null | sort -V)
@@ -200,7 +212,7 @@ jobs:
       - name: 推送
         run: |
           set -euo pipefail
-          cd site
+          cd "$GITHUB_WORKSPACE/site"
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add -A
