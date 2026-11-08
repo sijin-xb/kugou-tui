@@ -50,9 +50,29 @@ jobs:
             *[!A-Za-z0-9._-]*) echo "tag 含非法字符：$TAG_IN" >&2; exit 1 ;;
           esac
 
+      # checkout main 而不是 tag。
+      #
+      # PKGBUILD 是构建脚本，会随打包方式调整而改；它不该被冻结在某个历史 tag 里。
+      # 版本号由下面的「注入 pkgver」从 tag 写进去，所以打出来的包版本仍然正确。
+      # 早先 checkout tag 时，v0.8.1 那次提交里根本没有 packaging/，直接 cd 失败。
+      #
+      # fetch-depth: 0 要完整历史：makepkg 的 source= 用 v$pkgver 拉 tag 归档，
+      # 不需要本地 tag，但 git archive 之外的兜底路径需要。留着更稳。
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref_name }}
+          ref: main
+          fetch-depth: 0
+
+      # 把 tag 的版本号写进 PKGBUILD。tag 是 v0.8.1，pkgver 要变成 0.8.1。
+      - name: 注入 pkgver
+        env:
+          TAG_IN: ${{ inputs.tag || github.ref_name }}
+        run: |
+          cd "$GITHUB_WORKSPACE/packaging/arch"
+          ver="${TAG_IN#v}"
+          sed -i "s/^pkgver=.*/pkgver=$ver/" PKGBUILD
+          echo "pkgver 已设为 $ver"
+          grep '^pkgver=' PKGBUILD
 
       # makepkg 拒绝以 root 运行（它要调 pacman -U 装依赖，root 下会污染构建环境）。
       # 容器里默认只有 root，所以建一个 builder 用户，构建目录 chown 给它。
@@ -77,16 +97,22 @@ jobs:
           cd "$GITHUB_WORKSPACE/packaging/arch"
           sudo -u builder makepkg --syncdeps --cleanbuild --noconfirm --force
 
-      # 版本核对。tag 是 v0.8.1，PKGBUILD 里 pkgver 必须也是 0.8.1，
-      # 否则打出来的包名与 tag 对不上，用户装的版本是错的。
+      # 核对构建出的二进制自报版本，而不是 PKGBUILD 里的字符串——后者是上一步
+      # 刚注入的，比对它等于自己跟自己比，抓不到「源码 checkout 错了」这类问题。
+      #
+      # 从打好的包里取二进制而不是 src/：makepkg 的中间目录结构不是稳定接口，
+      # 而包的布局是。用 bsdtar 直接从 .pkg.tar.zst 里读，不安装。
       - name: 核对版本
         run: |
           cd "$GITHUB_WORKSPACE/packaging/arch"
           expected="${TAG#v}"
-          actual=$(sed -n 's/^pkgver=//p' PKGBUILD)
+          pkgfile=$(ls -1 ./*.pkg.tar.zst | head -1)
+          bsdtar -xOf "$pkgfile" usr/bin/kugou-tui > /tmp/kugou-tui-check
+          chmod +x /tmp/kugou-tui-check
+          actual=$(/tmp/kugou-tui-check --version | awk '{print $NF}')
           [ "$actual" = "$expected" ] ||
-            { echo "PKGBUILD 是 $actual，tag 是 $expected" >&2; exit 1; }
-          echo "版本核对通过：$actual"
+            { echo "包内二进制自报 $actual，tag 是 $expected" >&2; exit 1; }
+          echo "版本核对通过：$actual（来自 $pkgfile）"
 
       - name: 收集产物
         run: |
