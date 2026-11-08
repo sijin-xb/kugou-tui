@@ -229,10 +229,12 @@ jobs:
           # repo-add 在 x86_64/ 下运行，索引里的条目是相对文件名，
           # pacman 用 Server 行拼出来能对上。
           cd x86_64
-          # 清掉上一轮留下的 -debug 包与 repo-add 的 .old 备份。这两个都是
-          # 历史残留，不删会一直挂在仓库里。
-          rm -f -- *-debug-*.pkg.tar.zst *.old
+          # 清掉上一轮留下的 -debug 包。历史残留，不删会一直挂在仓库里。
+          rm -f -- *-debug-*.pkg.tar.zst
           repo-add --nocolor kugou-tui.db.tar.gz ./*.pkg.tar.zst
+          # .old 要放在 repo-add 之后删：它每跑一次就写一份新备份，
+          # 删早了等于没删。
+          rm -f -- *.old
 
       - name: 清理旧版本
         run: |
@@ -254,8 +256,9 @@ jobs:
             done
           fi
           # 索引要跟着重建，否则 pacman 还能看到已删除的包。
-          rm -f kugou-tui.db.tar.gz kugou-tui.db *.old
+          rm -f kugou-tui.db.tar.gz kugou-tui.db
           repo-add --nocolor kugou-tui.db.tar.gz ./*.pkg.tar.zst
+          rm -f -- *.old
 
       - name: 推送
         run: |
