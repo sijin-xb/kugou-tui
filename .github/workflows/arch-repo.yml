@@ -69,18 +69,19 @@ jobs:
       #
       # 不传 --skippgpcheck：这个 PKGBUILD 没有 PGP 源。
       #
-      # 用 cd 而不是 working-directory：在 container job 里 working-directory 会
-      # 变成容器启动时的 cwd，而那时 checkout 还没跑，目录不存在，容器起不来。
+      # 用 cd "$GITHUB_WORKSPACE" 而不是 working-directory：在 container job 里
+      # working-directory 会被当成容器启动时的 cwd，而那时 checkout 还没跑，
+      # 目录不存在，容器直接 chdir 失败。$GITHUB_WORKSPACE 在 step 执行期才求值。
       - name: 构建
         run: |
-          cd packaging/arch
+          cd "$GITHUB_WORKSPACE/packaging/arch"
           sudo -u builder makepkg --syncdeps --cleanbuild --noconfirm --force
 
       # 版本核对。tag 是 v0.8.1，PKGBUILD 里 pkgver 必须也是 0.8.1，
       # 否则打出来的包名与 tag 对不上，用户装的版本是错的。
       - name: 核对版本
         run: |
-          cd packaging/arch
+          cd "$GITHUB_WORKSPACE/packaging/arch"
           expected="${TAG#v}"
           actual=$(sed -n 's/^pkgver=//p' PKGBUILD)
           [ "$actual" = "$expected" ] ||
@@ -90,8 +91,8 @@ jobs:
       - name: 收集产物
         run: |
           mkdir -p /tmp/out
-          cp packaging/arch/*.pkg.tar.zst /tmp/out/
-          cp packaging/arch/install.sh /tmp/out/
+          cp "$GITHUB_WORKSPACE"/packaging/arch/*.pkg.tar.zst /tmp/out/
+          cp "$GITHUB_WORKSPACE"/packaging/arch/install.sh /tmp/out/
           ls -lh /tmp/out
 
       - uses: actions/upload-artifact@v4
