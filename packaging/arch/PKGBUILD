@@ -13,13 +13,16 @@ optdepends=(
 	'nodejs: --api node 回退后端需要'
 	'npm: 同上'
 )
-options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
 # aws-lc-sys 把 AWS-LC 的 C 代码交给 cc 编译，经不起外层 -flto（makepkg.conf 的
 # LTOFLAGS 默认带 -flto=auto）。Rust 侧 Cargo.toml 已开 fat LTO，外面再叠一层
 # 只是多一份风险，没有收益。见 options=('!lto')。
+#
+# !debug 不能省：CI 的 archlinux 镜像用默认 makepkg.conf，那里 debug 是开的，
+# 会多打一个空的 -debug 包（Rust 侧 strip = true，没有调试符号可放）。
+options=('!lto' '!debug')
 
 build() {
 	cd "$pkgname-$pkgver"

@@ -207,7 +207,15 @@ jobs:
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/site"
           mkdir -p x86_64
-          cp "$GITHUB_WORKSPACE"/pkg/*.pkg.tar.zst x86_64/
+          # 只收主包，排除 -debug 与任何附带产物。PKGBUILD 里已加 !debug，
+          # 这里再挡一道：repo-add 一旦收录 -debug，pacman 的 -S kugou-tui
+          # 会连它一起拉，用户多下 4 KB 空包还看到一条莫名其妙的记录。
+          for f in "$GITHUB_WORKSPACE"/pkg/*.pkg.tar.zst; do
+            case "$(basename "$f")" in
+              *-debug-*) echo "跳过 $(basename "$f")"; continue ;;
+            esac
+            cp "$f" x86_64/
+          done
           cp "$GITHUB_WORKSPACE"/pkg/install.sh install.sh
           # .nojekyll 关掉 Jekyll：否则 x86_64 目录与 .pkg.tar.zst 会被它的
           # 规则过滤掉。
@@ -215,6 +223,9 @@ jobs:
           # repo-add 在 x86_64/ 下运行，索引里的条目是相对文件名，
           # pacman 用 Server 行拼出来能对上。
           cd x86_64
+          # 清掉上一轮留下的 -debug 包与 repo-add 的 .old 备份。这两个都是
+          # 历史残留，不删会一直挂在仓库里。
+          rm -f -- *-debug-*.pkg.tar.zst *.old
           repo-add --nocolor kugou-tui.db.tar.gz ./*.pkg.tar.zst
 
       - name: 清理旧版本
@@ -223,7 +234,10 @@ jobs:
           cd "$GITHUB_WORKSPACE/site/x86_64"
           # 按版本排序，删掉超出 KEEP_VERSIONS 的最旧包。
           # 文件名形如 kugou-tui-0.8.1-1-x86_64.pkg.tar.zst。
-          mapfile -t all < <(ls -1 *.pkg.tar.zst 2>/dev/null | sort -V)
+          #
+          # 只数主包：-debug 若混进来会把计数撑大，导致主包被提前删掉。
+          # grep 无匹配时返回 1，在 pipefail 下会让整个 step 失败，所以补 || true。
+          mapfile -t all < <(ls -1 *.pkg.tar.zst 2>/dev/null | grep -v -- '-debug-' | sort -V || true)
           count=${#all[@]}
           if [ "$count" -gt "$KEEP_VERSIONS" ]; then
             remove=$(( count - KEEP_VERSIONS ))
@@ -234,7 +248,7 @@ jobs:
             done
           fi
           # 索引要跟着重建，否则 pacman 还能看到已删除的包。
-          rm -f kugou-tui.db.tar.gz kugou-tui.db
+          rm -f kugou-tui.db.tar.gz kugou-tui.db *.old
           repo-add --nocolor kugou-tui.db.tar.gz ./*.pkg.tar.zst
 
       - name: 推送
