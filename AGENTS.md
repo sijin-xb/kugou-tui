@@ -28,6 +28,7 @@ cargo test
 | `src/app/` | 状态与业务逻辑。`state.rs` 是全局状态，`update.rs` 是事件总线 |
 | `src/ui/` | 渲染。`theme.rs` 配色、`widgets.rs` 原语、`hit.rs` 命中区、`views/` 各页面 |
 | `crates/libresoda/` | 汽水音乐数据层，独立 crate |
+| `docs/` | 使用指南、架构说明与 Arch 仓库维护文档 |
 
 ## 改 UI 前先读这两处
 
@@ -48,7 +49,7 @@ cargo test
 
 注释只写「不写就会有人踩坑」的边角：反直觉的副作用、必须按特定顺序调用的约束、看起来能简化但不能简化的原因。**不写**模块用途、架构分层、复述代码、设计论证。
 
-文档语言：`README.md`、`CHANGELOG.md` 用中文。代码注释能用英文就用英文。
+文档语言：`README.md`、`CHANGELOG.md` 与 `docs/` 用中文。代码注释能用英文就用英文。
 
 `CHANGELOG.md` 用陈述式，只写「改了什么」，不写症状描述与修复过程。按 Keep a Changelog 分类。
 

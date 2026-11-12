@@ -41,5 +41,5 @@ package() {
 	local target_dir="${CARGO_TARGET_DIR:-$PWD/target}"
 	install -Dm755 "$target_dir/release/kugou-tui" "$pkgdir/usr/bin/kugou-tui"
 	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-	install -Dm644 README.md CHANGELOG.md -t "$pkgdir/usr/share/doc/$pkgname/"
+	install -Dm644 README.md CHANGELOG.md docs/*.md -t "$pkgdir/usr/share/doc/$pkgname/"
 }

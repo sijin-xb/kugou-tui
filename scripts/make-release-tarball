@@ -70,10 +70,12 @@ name="kugou-tui-$version-$target"
 stage="dist/$name"
 rm -rf "$stage"
 install -d "$stage/scripts"
+install -d "$stage/docs"
 
 install -m755 "$bin" "$stage/kugou-tui"
 install -m755 scripts/kugou-api scripts/kugou-api-install scripts/kugou-tui "$stage/scripts/"
 install -m644 LICENSE README.md CHANGELOG.md "$stage/"
+install -m644 docs/*.md "$stage/docs/"
 
 tar -czf "dist/$name.tar.gz" -C dist "$name"
 rm -rf "$stage"

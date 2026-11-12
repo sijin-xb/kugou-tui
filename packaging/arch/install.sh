@@ -2,7 +2,10 @@
 #
 # 给 /etc/pacman.conf 追加 kugou-tui 仓库段。幂等，重复运行无副作用。
 #
-# 用法：curl -fsSL https://sijin-xb.github.io/kugou-tui-repo/install.sh | sudo bash
+# 用法：
+#   curl -fsSL https://sijin-xb.github.io/kugou-tui-repo/install.sh -o /tmp/kugou-tui-install.sh
+#   less /tmp/kugou-tui-install.sh
+#   sudo bash /tmp/kugou-tui-install.sh
 #
 # 通过管道执行时 $0 是 bash 而非本文件路径，所以这里不读任何相对路径，
 # 也不做自我更新——URL 只有下面这一处。
@@ -17,7 +20,7 @@ die() {
 	exit 1
 }
 
-[ "$(id -u)" -eq 0 ] || die "需要 root。用：curl -fsSL <url> | sudo bash"
+[ "$(id -u)" -eq 0 ] || die "需要 root。先下载脚本并检查，再用 sudo bash 运行"
 
 [ -r /etc/os-release ] || die "读不到 /etc/os-release，无法判断发行版"
 # shellcheck disable=SC1091
