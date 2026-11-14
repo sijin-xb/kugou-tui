@@ -2,7 +2,7 @@
 
 ## 范围
 
-本文对应 kugou-tui `0.8.1`。
+本文对应 kugou-tui `0.8.2`。
 内容以当前 `src/`、`Cargo.toml` 和 CI 配置为准。
 
 kugou-tui 是 Rust 2024 edition 项目，MSRV 为 1.90。
