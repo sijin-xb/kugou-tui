@@ -70,6 +70,56 @@ impl NativeApi {
     fn kind(&self) -> SourceKind {
         self.transport.kind()
     }
+
+    /// 取流请求用的 `dfid`：登录态 cookie 里带 `dfid` 就用它；否则按上游
+    /// 生成一次性随机串（见 `song_url_endpoint` 的文档）。
+    fn dfid_for_request(&self) -> String {
+        self.transport
+            .cookie_map()
+            .get("dfid")
+            .filter(|value| !value.is_empty() && *value != "-")
+            .cloned()
+            .unwrap_or_else(|| random_string(24, &mut random_f64))
+    }
+
+    /// 诊断探针用（`probe_native_concept_stream`）：带真实 `album_audio_id` /
+    /// `album_id` 的取流，对比「id=0 与 id=真实值」服务端的权限判定差异；
+    /// 以及会员详情 / 领取记录的**原始**响应——解析层只挑第一个在期的
+    /// `busi_vip` 条目，原始数据才能看到「过期的 svip + 在期的 tvip」全貌。
+    #[cfg(test)]
+    pub(crate) async fn song_url_with_ids(
+        &self,
+        hash: &str,
+        quality: &str,
+        free_part: bool,
+        album_audio_id: i64,
+        album_id: &str,
+    ) -> Result<Value> {
+        let endpoint = song_url_endpoint(
+            self.kind(),
+            self.dfid_for_request(),
+            hash,
+            quality,
+            free_part,
+            album_audio_id,
+            album_id,
+        );
+        self.transport.get_json(&endpoint, false).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn raw_vip_detail(&self) -> Result<Value> {
+        self.transport
+            .get_json(&user_vip_detail_endpoint(), false)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn raw_vip_record(&self) -> Result<Value> {
+        self.transport
+            .get_json(&claimed_vip_days_endpoint(), false)
+            .await
+    }
 }
 
 /// 上游 `module/search.js` 的请求规格（路由 `/search`）。
@@ -171,12 +221,18 @@ pub(crate) fn privilege_lite_endpoint(kind: SourceKind, song: &Song) -> Result<E
 /// `dfid` 由调用方给出：上游那一行是
 /// `cookie: Object.assign({}, {dfid: randomString(24)}, params?.cookie)`，
 /// 即**没登录时是每次调用新生成的 24 字符随机串**，不是 `-` 也不是空。
+///
+/// `album_id` / `album_audio_id` 上游写成 `Number(params.x ?? 0)`——调用方
+/// **可以**带真实 id。应用主路径目前不带（见 `StreamSource::song_url` 的
+/// 注释），诊断探针用它做对比实验。
 pub(crate) fn song_url_endpoint(
     kind: SourceKind,
     dfid: String,
     hash: &str,
     quality: &str,
     free_part: bool,
+    album_audio_id: i64,
+    album_id: &str,
 ) -> Endpoint<'static> {
     let (page_id, pid, ppage_id) = match kind {
         SourceKind::KugouConcept => ("967177915", "411", "356753938"),
@@ -186,7 +242,8 @@ pub(crate) fn song_url_endpoint(
     Endpoint::get(GATEWAY_BASE, "/v5/url")
         .header("x-router", "trackercdn.kugou.com")
         .dfid(dfid)
-        .param("album_id", "0")
+        // 上游 `Number(params.album_id ?? 0)`：非数字（含空串）一律 0。
+        .param("album_id", album_id.parse::<i64>().unwrap_or(0).to_string())
         .param("area_code", "1")
         // 上游 `(params?.hash || '').toLowerCase()`。
         .param("hash", hash.to_lowercase())
@@ -195,7 +252,7 @@ pub(crate) fn song_url_endpoint(
         .param("page_id", page_id)
         // 上游 `quality: quality || 128`。
         .param("quality", if quality.is_empty() { "128" } else { quality })
-        .param("album_audio_id", "0")
+        .param("album_audio_id", album_audio_id.to_string())
         .param("behavior", "play")
         .param("pid", pid)
         .param("cmd", "26")
@@ -1115,15 +1172,17 @@ impl StreamSource for NativeApi {
     }
 
     async fn song_url(&self, hash: &str, quality: &str, free_part: bool) -> Result<Value> {
-        // 登录态带 `dfid` 就用它；否则按上游生成一次性随机串。
-        let dfid = self
-            .transport
-            .cookie_map()
-            .get("dfid")
-            .filter(|value| !value.is_empty() && *value != "-")
-            .cloned()
-            .unwrap_or_else(|| random_string(24, &mut random_f64));
-        let endpoint = song_url_endpoint(self.kind(), dfid, hash, quality, free_part);
+        // album ids 恒传 0——是否值得带上歌曲自带的 id，见
+        // `request_song_url_with_hash` 文档里的实测记录与「优先怀疑这里」。
+        let endpoint = song_url_endpoint(
+            self.kind(),
+            self.dfid_for_request(),
+            hash,
+            quality,
+            free_part,
+            0,
+            "",
+        );
         self.transport.get_json(&endpoint, false).await
     }
 }
@@ -1641,7 +1700,9 @@ mod tests {
                     KAT_DFID.to_string(),
                     "6af00fbd4d444a82c005843eef9dc2d4",
                     "128",
-                    false
+                    false,
+                    0,
+                    ""
                 ),
             ),
             "https://gateway.kugou.com/v5/url?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=1005&clientver=11430&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&album_id=0&area_code=1&hash=6af00fbd4d444a82c005843eef9dc2d4&ssa_flag=is_fromtrack&version=11430&page_id=151369488&quality=128&album_audio_id=0&behavior=play&pid=2&cmd=26&pidversion=3001&IsFreePart=0&ppage_id=463467626,350369493,788954147&cdnBackup=1&module=&key=1e5533fbcad17c9aa8935349a8b7c1d3&signature=8128fd5afa89324ac65a4c7b77b270e9"
@@ -1659,7 +1720,9 @@ mod tests {
                     KAT_DFID.to_string(),
                     "6af00fbd4d444a82c005843eef9dc2d4",
                     "128",
-                    false
+                    false,
+                    0,
+                    ""
                 ),
             ),
             "https://gateway.kugou.com/v5/url?dfid=1234567890abcdef12345678&mid=231699103997194646178265604655475531917&uuid=-&appid=3116&clientver=11430&clienttime=1700000000&token=TOKENFIXTURE&userid=10001&album_id=0&area_code=1&hash=6af00fbd4d444a82c005843eef9dc2d4&ssa_flag=is_fromtrack&version=11430&page_id=967177915&quality=128&album_audio_id=0&behavior=play&pid=411&cmd=26&pidversion=3001&IsFreePart=0&ppage_id=356753938&cdnBackup=1&module=&key=7d03ca1bba0d0fa1f5c8d55cdd957b8d&signature=64a711097ebb42883b47892ecec00214"
@@ -1677,6 +1740,8 @@ mod tests {
                 "6af00fbd4d444a82c005843eef9dc2d4",
                 "128",
                 false,
+                0,
+                "",
             ),
         );
         let trial = prepared_url(
@@ -1687,6 +1752,8 @@ mod tests {
                 "6af00fbd4d444a82c005843eef9dc2d4",
                 "128",
                 true,
+                0,
+                "",
             ),
         );
         assert!(full.contains("&IsFreePart=0&"), "{full}");
@@ -1705,6 +1772,8 @@ mod tests {
                 "6AF00FBD4D444A82C005843EEF9DC2D4",
                 "",
                 false,
+                0,
+                "",
             ),
         );
         assert!(url.contains("&quality=128&"), "{url}");

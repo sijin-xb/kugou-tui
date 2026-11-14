@@ -152,7 +152,7 @@ pub enum AudioSource {
 }
 
 /// 主线程 → 音频线程的命令。
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum AudioCmd {
     /// 装载一段音频。`start_at_ms` 用于「恢复上次播放位置」。
     ///
@@ -166,7 +166,6 @@ enum AudioCmd {
     Toggle,
     Stop,
     SeekTo(u64),
-    SeekBy(i64),
     SetVolume(f32),
     /// 换一张声卡输出。`None` 表示回到系统默认。
     UseDevice(Option<String>),
@@ -304,6 +303,16 @@ impl AudioHandle {
         }
     }
 
+    /// 仅供测试：直接改写共享快照里的播放状态。
+    ///
+    /// `detached` 句柄没有音频线程，`state()` 永远返回 `Stopped`，而心跳每拍
+    /// 都会用它覆盖 `state.playback`——要测「Playing 下的位置同步」就必须能
+    /// 预置这个值。
+    #[cfg(test)]
+    pub(crate) fn force_shared_state(&self, state: PlaybackState) {
+        self.shared.set_state(state);
+    }
+
     /// 当前播放电平（0.0 ~ 1.0 的一串格子，旧的在前）。
     pub fn levels(&self) -> Vec<f32> {
         self.levels.snapshot()
@@ -356,10 +365,6 @@ impl AudioHandle {
 
     pub fn seek_to(&self, position_ms: u64) {
         self.send(AudioCmd::SeekTo(position_ms));
-    }
-
-    pub fn seek_by(&self, delta_ms: i64) {
-        self.send(AudioCmd::SeekBy(delta_ms));
     }
 
     pub fn set_volume(&self, volume: f32) {
@@ -764,6 +769,16 @@ fn drain_until_shutdown(rx: Receiver<AudioCmd>) {
     }
 }
 
+/// 把一段连续的 `SeekTo` 命令合并成最终目标：全是绝对定位，**最后一个赢**。
+///
+/// `commands` 由 `handle_batch` 保证只含 `SeekTo`；空队列返回 `None`。
+fn merge_seek_run(commands: &[AudioCmd]) -> Option<u64> {
+    commands.iter().rev().find_map(|command| match command {
+        AudioCmd::SeekTo(position_ms) => Some(*position_ms),
+        _ => None,
+    })
+}
+
 struct Runtime {
     /// 当前输出设备。`None` 表示设备不可用（启动失败，或切换到的那张卡打不开）。
     output: Option<Output>,
@@ -796,7 +811,7 @@ impl Runtime {
         loop {
             match rx.recv_timeout(POLL_INTERVAL) {
                 Ok(AudioCmd::Shutdown) => break,
-                Ok(command) => self.handle(command),
+                Ok(command) => self.handle_batch(command, &rx),
                 // 没有命令时也走一遍同步，让进度条持续前进
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -808,6 +823,43 @@ impl Runtime {
             output.player.stop();
         }
         self.shared.set_state(PlaybackState::Stopped);
+    }
+
+    /// 处理一批命令：刚收到的一条，加上此刻通道里已积压的全部。
+    ///
+    /// 按住方向键快进快退、拖动进度条、MPRIS 客户端刷位置，都会让 seek 命令在
+    /// 通道里排队。逐条执行的话，每次 seek 都要重置解码器定位（没有 seektable
+    /// 的文件向后跳还要重建解码器，几十毫秒起步），积压十条就是几秒——表现是
+    /// 进度条停住、声音断续，等积压的旧目标一条条放完才追上。所以**连续**的
+    /// seek 合并成一个最终目标：中间的都是用户早已放弃的位置，执行它们纯属浪费。
+    /// 中间隔着其它命令的 seek 不合并（`Load` 必须先于 seek 执行，顺序有语义）。
+    fn handle_batch(&mut self, first: AudioCmd, rx: &Receiver<AudioCmd>) {
+        let mut batch = vec![first];
+        while let Ok(command) = rx.try_recv() {
+            batch.push(command);
+        }
+
+        let mut index = 0;
+        while index < batch.len() {
+            if matches!(batch[index], AudioCmd::SeekTo(_)) {
+                let mut end = index;
+                let mut run = Vec::new();
+                while end < batch.len() {
+                    match batch[end] {
+                        AudioCmd::SeekTo(_) => run.push(batch[end].clone()),
+                        _ => break,
+                    }
+                    end += 1;
+                }
+                if let Some(target) = merge_seek_run(&run) {
+                    self.seek_to(target);
+                }
+                index = end;
+            } else {
+                self.handle(batch[index].clone());
+                index += 1;
+            }
+        }
     }
 
     fn handle(&mut self, command: AudioCmd) {
@@ -823,11 +875,6 @@ impl Runtime {
             },
             AudioCmd::Stop => self.stop(),
             AudioCmd::SeekTo(position_ms) => self.seek_to(position_ms),
-            AudioCmd::SeekBy(delta_ms) => {
-                let current = self.shared.position_ms() as i64;
-                let target = current.saturating_add(delta_ms).max(0) as u64;
-                self.seek_to(target);
-            }
             AudioCmd::SetVolume(volume) => {
                 if let Some(output) = self.output.as_mut() {
                     output.player.set_volume(volume);
@@ -1292,6 +1339,32 @@ mod tests {
         stream.push(b"abcd");
         stream.cancel();
         assert_eq!(classify_drain(Some(&stream)), DrainOutcome::Silent);
+    }
+
+    /// 积压的 seek 合并成最后一个目标：按键重复/拖动排队的中间位置全都跳过，
+    /// 只执行用户最终想要的那次。这是「按住方向键进度卡死」的解药之一。
+    #[test]
+    fn queued_seeks_collapse_to_the_last_target() {
+        let run = |targets: &[u64]| -> Vec<AudioCmd> {
+            targets
+                .iter()
+                .map(|&target| AudioCmd::SeekTo(target))
+                .collect()
+        };
+        assert_eq!(
+            merge_seek_run(&run(&[1_000, 6_000, 11_000, 16_000])),
+            Some(16_000),
+            "四个积压目标只留最后一个"
+        );
+        assert_eq!(merge_seek_run(&run(&[])), None, "空队列没有 seek");
+        // run 里混进非 seek 命令时（handle_batch 不该这么切，防御性兜底）
+        // 按「最后一个 seek」算，不能把别的命令误当成目标。
+        let mixed = [
+            AudioCmd::SeekTo(2_000),
+            AudioCmd::Toggle,
+            AudioCmd::SeekTo(9_000),
+        ];
+        assert_eq!(merge_seek_run(&mixed), Some(9_000));
     }
 
     /// 取消优先于失败：网络断和用户切歌可能同时发生，那时候该安静收场

@@ -29,7 +29,7 @@
 //! 回去找那个「按 Tab 分派」的函数。
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use ratatui::crossterm::event::MouseEvent;
 use ratatui::layout::Rect;
@@ -46,6 +46,7 @@ use crate::audio::engine::AudioSource;
 use crate::error::AppError;
 use crate::source::{PlaylistRef, SourceKind};
 
+use super::{SEEK_CONFIRM_EPSILON_MS, SEEK_CONFIRM_TIMEOUT, SEEK_QUIESCENT};
 use crate::audio::download::{Downloader, PREROLL_BYTES, StreamOutcome};
 use crate::audio::engine::{AudioEvent, PlaybackState, SEEK_STEP_MS, VOLUME_STEP};
 use crate::event::{Event, Loaded, LoadingTarget, PlaylistSource, VipClaimOutcome};
@@ -60,24 +61,6 @@ const PROGRESS_STEP_BYTES: u64 = 256 * 1024;
 
 /// 每帧最多处理的事件数，防止事件洪水导致画面完全停止刷新。
 const MAX_EVENTS_PER_FRAME: usize = 64;
-
-/// 拖动进度条期间两次真正 seek 的最小间隔。
-///
-/// 每次 seek 都要让解码器重置定位；鼠标移动事件 60Hz 起步，不节流就是每秒
-/// 几十次重置，声音断续。间隔内界面照常跟手（乐观位置），间隔外的最终位置
-/// 在松开时落实（见 `left_up_at`）。
-const DRAG_SEEK_INTERVAL: Duration = Duration::from_millis(200);
-
-/// 距上次拖拽 seek 是否已经到了下一次的间隔。
-///
-/// 抽成自由函数是为了能直接测——节流窗口的边界（恰好等于间隔）算「到了」，
-/// 这种差一帧的语义靠肉眼盯不出来。
-fn drag_seek_due(last: Option<Instant>, now: Instant) -> bool {
-    match last {
-        None => true,
-        Some(at) => now.duration_since(at) >= DRAG_SEEK_INTERVAL,
-    }
-}
 
 /// 每隔多少拍测量一次缓存占用。
 ///
@@ -193,18 +176,11 @@ impl App {
     // ==================================================================
 
     pub fn handle_event(&mut self, event: Event) {
-        // 渲染按需。非 Tick 事件几乎必然改变画面（按键、鼠标、异步结果、音频
-        // 状态），一律置脏；Tick 只在「真的有东西在动」时值得重画——静止时
-        // 心跳不触发渲染，见 `tick_needs_redraw`。
-        self.dirty = !matches!(event, Event::Tick)
-            || super::tick_needs_redraw(
-                self.state.playback,
-                self.state.busy.is_some(),
-                self.state.lyric.is_transitioning(),
-            )
-            // 过期的状态栏消息在这次心跳里会被清掉，画面得跟着刷一次
-            || self.state.status_expired();
-        match event {
+        // 按键先翻译成动作，再按「有没有动作」决定重不重绘。输入法切换、单独
+        // 的修饰键、未绑定的组合键都会以按键事件到达——这些事件不改变任何
+        // 状态，无条件置脏的话每一下都白刷一整帧，配上输入法候选窗的局部
+        // 重绘就是「打字狂闪 / 切输入法闪一下」。
+        let key_action = match &event {
             Event::Key(key) => {
                 let mode = if self.state.is_editing() {
                     KeyMode::TextInput
@@ -216,20 +192,47 @@ impl App {
                 // 所以在这里按页面上下文先解释一遍；打开的弹窗仍由
                 // `handle_action` 的模态分派吞掉，不会误触全局动作。
                 let action = if mode == KeyMode::Normal && self.state.tab == Tab::Visualizer {
-                    crate::keymap::resolve_visualizer_local(key)
-                        .unwrap_or_else(|| crate::keymap::resolve(key, mode))
+                    crate::keymap::resolve_visualizer_local(*key)
+                        .unwrap_or_else(|| crate::keymap::resolve(*key, mode))
                 } else {
-                    crate::keymap::resolve(key, mode)
+                    crate::keymap::resolve(*key, mode)
                 };
                 // 排查「按键没反应」时这条日志是决定性的：它能区分
                 // 「按键根本没到程序」和「到了但映射成了 None」。
                 // 默认不输出，用 KUGOU_TUI_DEBUG=1 开启。
                 tlog!(
                     crate::logger::LEVEL_DEBUG,
-                    "按键 {:?}（模式 {mode:?}）→ {action:?}",
-                    key
+                    "按键 {key:?}（模式 {mode:?}）→ {action:?}"
                 );
-                self.handle_action(action);
+                // 未绑定键返回的是 `Action::None`（不是 Option::None）：
+                // 它什么都不做，也要把重绘一起免掉。
+                (!matches!(action, Action::None)).then_some(action)
+            }
+            _ => None,
+        };
+
+        // 渲染按需。Tick 只在「真的有东西在动」时值得重画——静止时心跳不触发
+        // 渲染，见 `tick_needs_redraw`；按键只在真有动作时重画；其余事件
+        // （鼠标、异步结果、音频状态）几乎必然改变画面，一律置脏。
+        self.dirty = match &event {
+            Event::Tick => {
+                super::tick_needs_redraw(
+                    self.state.playback,
+                    self.state.busy.is_some(),
+                    self.state.lyric.is_transitioning(),
+                )
+                // 过期的状态栏消息在这次心跳里会被清掉，画面得跟着刷一次
+                || self.state.status_expired()
+            }
+            Event::Key(_) => key_action.is_some(),
+            _ => true,
+        };
+
+        match event {
+            Event::Key(_) => {
+                if let Some(action) = key_action {
+                    self.handle_action(action);
+                }
             }
             // 布局每帧按终端实际尺寸重算，无需额外处理
             Event::Resize => {}
@@ -324,9 +327,9 @@ impl App {
 
     /// 左键松开：清掉 press，并给「拖完才落实」的控件收尾。
     ///
-    /// 进度条拖拽期间的 seek 是节流的（见 [`Self::drag_progress`]），最后一次
-    /// 移动的位置可能还没真正发给音频线程——松开时把乐观位置落实一次，
-    /// 进度条才不会在松手后弹回节流前的旧位置。
+    /// 拖动期间的 seek 已并入统一去抖管线（见 `super::SeekPipeline`，突发进行中
+    /// 不发）。松开时把乐观位置立即落实一次，不等心跳——进度条才不会在
+    /// 松手后还悬在半空。
     fn left_up_at(&mut self, _mouse: &MouseEvent) {
         if let Some(press) = self.state.interaction.end_press()
             && press.target == HitTarget::Progress
@@ -335,7 +338,7 @@ impl App {
             // 走 seek_to 而不是直接发音频命令：停止态下它会把目标记成续播点，
             // 位置钳制也和其它 seek 路径保持一致。
             self.seek_to(self.state.position_ms);
-            self.drag_seek_at = None;
+            self.flush_pending_seek();
         }
     }
 
@@ -364,12 +367,9 @@ impl App {
     /// 按住后鼠标纵移一格就离开了它，重新 `hit_test` 只会命中失败——表现就是
     /// 「拖一下就卡住，动不了」。
     ///
-    /// 两层节流：
-    ///
-    /// * **界面上**每次移动都乐观更新 `position_ms`，进度条跟手；
-    /// * **音频上**seek 按 [`DRAG_SEEK_INTERVAL`] 节流——每次 seek 都要重置
-    ///   解码器，鼠标 60Hz 移动下不节流就是每秒几十次重置，声音断续成锯齿。
-    ///   松开时（[`Self::left_up_at`]）把最后的位置落实一次。
+    /// 界面每次移动都乐观更新 `position_ms`，进度条跟手；音频端落实由统一管线
+    /// 去抖（突发进行中一条都不发，松手立即落实）——每次 seek 都要重置解码器，
+    /// 鼠标 60Hz 移动下不节流就是每秒几十次重置，声音断续成锯齿。
     fn drag_progress(&mut self, mouse: &MouseEvent, bar: Rect) {
         let duration_ms = self.state.duration_ms;
         if duration_ms == 0 || bar.width == 0 {
@@ -380,14 +380,7 @@ impl App {
         let target = ((ratio.clamp(0.0, 1.0) * duration_ms as f64) as u64)
             .min(duration_ms.saturating_sub(1));
 
-        // 界面无条件跟手
-        self.state.position_ms = target;
-        // 音频按节流间隔落实
-        let now = Instant::now();
-        if drag_seek_due(self.drag_seek_at, now) {
-            self.audio.seek_to(target);
-            self.drag_seek_at = Some(now);
-        }
+        self.request_seek(target);
     }
 
     /// 拖动歌词：与点击歌词同一套换算，但只在换行时才真的 seek。
@@ -594,12 +587,9 @@ impl App {
             f64::from(mouse.column.saturating_sub(zone.rect.left())) / f64::from(zone.rect.width);
         let target = (ratio * duration_ms as f64) as u64;
         let target = target.min(duration_ms.saturating_sub(1));
-        self.audio.seek_to(target);
-        // 乐观更新，让进度条立刻响应
-        self.state.position_ms = target;
-        // 这次 seek 也占用拖拽节流窗口：按下即 seek，随后的第一次拖拽若落在
-        // 窗口内就不该连发两次。
-        self.drag_seek_at = Some(Instant::now());
+        // 按下即请求一次：突发首条会立即落实，随后的拖拽进入去抖窗口，
+        // 不会连发两次。
+        self.request_seek(target);
     }
 
     /// 点击歌词行：跳到这一句的起始时间。
@@ -3408,15 +3398,38 @@ impl App {
                 current
             );
         }
-        // 只在音频引擎真的持有曲目时才用它上报的位置。
+        // seek 管线：先确认在途的、再落实静默下来的，最后才考虑位置同步——
+        // 顺序反了的话，刚发出的 seek 会被下面的「跟引擎对齐」冲回旧位置。
+        if let Some((target, sent_at)) = self.seek.in_flight
+            && (sent_at.elapsed() >= SEEK_CONFIRM_TIMEOUT
+                || self.audio.position_ms().abs_diff(target) <= SEEK_CONFIRM_EPSILON_MS)
+        {
+            self.seek.in_flight = None;
+        }
+        if self.seek.pending_ms.is_some()
+            && self
+                .seek
+                .last_request_at
+                .is_some_and(|at| at.elapsed() >= SEEK_QUIESCENT)
+        {
+            // 突发（按住方向键 / 持续拖动）结束了：把最终位置落实给音频线程
+            self.flush_pending_seek();
+        }
+        // 只在音频引擎真的持有曲目、且**没有在途 seek**时才用它上报的位置。
         //
         // 否则（Stopped）`audio.position_ms()` 返回 0，会把会话恢复出来的进度
         // 冲掉——表现是：启动瞬间能看到上次的进度，等别的请求回来刷了一帧就
         // 变回 00:00。按 Space 又回到正确位置，因为那时才重新用 resume 赋值。
-        if matches!(
-            self.state.playback,
-            PlaybackState::Playing | PlaybackState::Paused
-        ) {
+        //
+        // 在途 seek 期间引擎位置还停在跳转前：此时同步等于把界面上的乐观位置
+        // 弹回旧值——「拖进度条看起来卡死」的另一半。引擎跳完后位置贴近目标，
+        // 上面的确认分支放行，同步自动恢复。
+        if self.seek.in_flight.is_none()
+            && matches!(
+                self.state.playback,
+                PlaybackState::Playing | PlaybackState::Paused
+            )
+        {
             self.state.position_ms = self.audio.position_ms();
         }
 
@@ -3742,6 +3755,7 @@ fn auto_skip_next(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     // ================================================================
     // 鼠标交互：按下 / 拖拽 / 松开
@@ -3989,12 +4003,10 @@ mod tests {
         assert_eq!(app.state.position_ms, 199_999, "拖出右缘应钳到最后一毫秒");
     }
 
-    /// 拖动进度条期间音频 seek 按间隔节流，松开时把最后位置落实。
-    ///
-    /// 每次 seek 都要重置解码器；鼠标 60Hz 移动下不节流就是每秒几十次重置，
-    /// 声音断续。界面上位置照常跟手（乐观更新），音频只按间隔落实。
+    /// 拖动进度条：界面每次移动都跟手（乐观更新），音频落实走去抖管线——
+    /// 拖动期间不反复 seek，松开时立即落实最终位置。
     #[test]
-    fn progress_drag_seeks_are_throttled_and_finalized_on_release() {
+    fn progress_drag_updates_optimistically_and_lands_on_release() {
         let mut app = App::for_test();
         app.state.duration_ms = 200_000;
         app.state.current = Some(crate::api::model::Song::default());
@@ -4007,35 +4019,42 @@ mod tests {
             12,
             30,
         )));
-        // 第一次拖拽：没有上次记录，立即 seek
+        // 按下即突发首条：立即落实一次
+        assert!(app.seek.in_flight.is_some(), "按下就该立即 seek 一次");
+        let first_flush = app.seek.last_flush_at.expect("落实应有时刻记录");
+
+        // 拖动中：位置乐观更新，但突发进行中不再追加 seek
         app.handle_event(Event::Mouse(mouse(
             MouseEventKind::Drag(MouseButton::Left),
             52,
             30,
         )));
-        assert_eq!(app.state.position_ms, 100_000);
-        let first_seek_at = app.drag_seek_at.expect("首次拖拽应当记录 seek 时刻");
-
-        // 间隔内的第二次移动：位置乐观更新，但不重复 seek（时刻不变）
         app.handle_event(Event::Mouse(mouse(
             MouseEventKind::Drag(MouseButton::Left),
             62,
             30,
         )));
         assert_eq!(app.state.position_ms, 120_000, "界面照常跟手");
+        assert_eq!(app.seek.pending_ms, Some(120_000), "最终位置压着待落实");
         assert_eq!(
-            app.drag_seek_at,
-            Some(first_seek_at),
-            "节流窗口内不该再次 seek"
+            app.seek.last_flush_at,
+            Some(first_flush),
+            "拖动期间不该再发 seek"
         );
 
-        // 松开：把乐观位置落实一次
+        // 松开：立即落实，不等心跳
         app.handle_event(Event::Mouse(mouse(
             MouseEventKind::Up(MouseButton::Left),
             62,
             30,
         )));
-        assert_eq!(app.drag_seek_at, None, "收尾后清空节流记录");
+        assert_eq!(app.seek.pending_ms, None, "松手后积压清空");
+        assert_eq!(
+            app.seek.in_flight.map(|(target, _)| target),
+            Some(120_000),
+            "松手落实的是最终位置"
+        );
+        assert!(app.seek.last_flush_at.unwrap() > first_flush);
         assert!(app.state.interaction.press.is_none());
     }
 
@@ -4207,20 +4226,95 @@ mod tests {
         );
     }
 
-    /// 节流窗口的边界语义：恰好等于间隔算「到了」，没有上次记录立即算到。
+    /// 按住方向键快进：突发首条立即落实，突发期间不再发 seek，静默后由心跳
+    /// 把最终位置补发。每次 seek 都要重置解码器定位，按住期间每秒几十个重复键
+    /// 逐个落实的话就是「声音断续、进度卡死」——这是它的解药。
     #[test]
-    fn drag_seek_throttle_boundary() {
-        let now = Instant::now();
-        assert!(drag_seek_due(None, now), "没有上次记录应立即 seek");
-        assert!(!drag_seek_due(Some(now), now), "窗口内不该 seek");
-        assert!(
-            drag_seek_due(Some(now - DRAG_SEEK_INTERVAL), now),
-            "恰好等于间隔就算到了"
+    fn keyboard_seek_burst_flushes_first_and_lands_after_quiescence() {
+        let mut app = App::for_test();
+        app.state.duration_ms = 300_000;
+        app.state.current = Some(crate::api::model::Song::default());
+        app.state.playback = PlaybackState::Playing;
+
+        let key = |code: KeyCode| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        app.handle_event(key(KeyCode::Right));
+        assert_eq!(app.state.position_ms, SEEK_STEP_MS as u64);
+        assert!(app.seek.in_flight.is_some(), "突发首条应立即落实");
+        assert_eq!(app.seek.pending_ms, None);
+
+        // 连按（模拟按键重复）：乐观位置跟手，但都压着不发
+        app.handle_event(key(KeyCode::Right));
+        app.handle_event(key(KeyCode::Right));
+        assert_eq!(app.state.position_ms, 3 * SEEK_STEP_MS as u64);
+        assert_eq!(app.seek.pending_ms, Some(3 * SEEK_STEP_MS as u64));
+        assert_eq!(
+            app.seek.in_flight.map(|(target, _)| target),
+            Some(SEEK_STEP_MS as u64),
+            "只有首条落实了"
         );
-        assert!(!drag_seek_due(
-            Some(now - DRAG_SEEK_INTERVAL + Duration::from_millis(1)),
-            now
-        ));
+
+        // 静默 250ms 后的心跳：把最终位置补发出去
+        app.seek.last_request_at = Some(Instant::now() - SEEK_QUIESCENT);
+        app.handle_event(Event::Tick);
+        assert_eq!(app.seek.pending_ms, None, "心跳补发积压的目标");
+        assert_eq!(
+            app.seek.in_flight.map(|(target, _)| target),
+            Some(3 * SEEK_STEP_MS as u64)
+        );
+    }
+
+    /// 不产生动作的按键（输入法切换的 Shift、修饰键、未绑定的组合键）不置脏。
+    /// 无条件置脏的话，这些「什么都不做」的事件每下白刷一整帧，输入法候选窗
+    /// 跟着反复重绘就是「打字狂闪 / 切中英文闪一下」。
+    #[test]
+    fn unmapped_keys_do_not_trigger_a_redraw() {
+        let mut app = App::for_test();
+        app.dirty = false;
+
+        // 修饰类按键：输入法切换 chord 会以此形式到达（CapsLock / Fn 等）
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::CapsLock,
+            KeyModifiers::NONE,
+        )));
+        assert!(!app.dirty, "无绑定的修饰类按键不该触发重绘");
+
+        // 绑定了动作的键照常置脏
+        app.dirty = false;
+        app.handle_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.dirty, "有动作的键要触发重绘");
+    }
+
+    /// 在途 seek 期间，心跳不得用引擎的旧位置冲掉界面上的乐观位置——否则
+    /// seek 完的下一拍进度条就弹回跳转前，看起来像没跳。超时（引擎 seek
+    /// 失败 / 丢失）后恢复同步。
+    #[test]
+    fn tick_does_not_clobber_the_position_while_a_seek_is_in_flight() {
+        let mut app = App::for_test();
+        app.state.duration_ms = 300_000;
+        app.state.current = Some(crate::api::model::Song::default());
+        // detached 引擎没有音频线程，心跳每拍都会用它覆盖 playback——
+        // 两次心跳前都要预置成 Playing，位置同步分支才会走
+        app.audio.force_shared_state(PlaybackState::Playing);
+        // detached 引擎的位置恒为 0；界面刚乐观跳到 60s
+        app.state.position_ms = 60_000;
+        app.seek.in_flight = Some((60_000, Instant::now()));
+
+        app.handle_event(Event::Tick);
+        assert_eq!(app.state.position_ms, 60_000, "在途期间不许弹回引擎旧位置");
+
+        // 超时兜底：引擎始终没确认，界面重新跟随引擎
+        app.audio.force_shared_state(PlaybackState::Playing);
+        app.seek.in_flight = Some((60_000, Instant::now() - SEEK_CONFIRM_TIMEOUT));
+        app.handle_event(Event::Tick);
+        assert_eq!(
+            app.state.position_ms,
+            app.audio.position_ms(),
+            "超时后恢复同步"
+        );
+        assert_eq!(app.seek.in_flight, None, "超时后在途标记清掉");
     }
 
     /// 状态栏消息按级别过期：提示 8 秒、告警 30 秒、错误 60 秒。

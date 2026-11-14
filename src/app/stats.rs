@@ -128,6 +128,21 @@ impl ListeningStats {
         self.summary_line_on(week_start_key().as_deref())
     }
 
+    /// 今天听了多久、几首；今天还没有记录时返回 `None`。
+    ///
+    /// 播放条的上下文行用它兜底：这首歌没歌词可显示的时候，那行也有内容可看。
+    pub fn today_summary(&self) -> Option<String> {
+        let stat = self.days.get(&crate::util::today_local()?)?;
+        if stat.listen_ms == 0 {
+            return None;
+        }
+        Some(format!(
+            "今天已听 {} · {} 首",
+            format_listen(stat.listen_ms),
+            stat.plays
+        ))
+    }
+
     pub(crate) fn summary_line_on(&self, week_start: Option<&str>) -> Option<String> {
         let (week_plays, week_listen_ms) = self.week_stats_on(week_start)?;
         if week_plays == 0 && week_listen_ms == 0 {

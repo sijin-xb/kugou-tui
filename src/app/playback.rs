@@ -33,7 +33,9 @@ use crate::app::update::describe_song;
 use crate::audio::engine::{AudioSource, PlaybackState};
 use crate::event::Loaded;
 use crate::logger::tlog;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use super::SEEK_BURST_GAP;
 
 /// 「上一首」在播放超过这个时长后，先回到本曲开头而不是切歌。
 ///
@@ -145,8 +147,7 @@ impl App {
         self.reset_auto_skip();
         // 播放超过 3 秒时先回到本曲开头，这是主流播放器的通用行为
         if self.state.position_ms > RESTART_THRESHOLD_MS {
-            self.audio.seek_to(0);
-            self.state.position_ms = 0;
+            self.request_seek(0);
             return;
         }
 
@@ -183,22 +184,64 @@ impl App {
             self.state.resume = Some((song.hash.clone(), target));
         }
 
-        self.audio.seek_to(target);
-        // 乐观更新，让进度条立刻响应；音频线程随后给出真实位置
-        self.state.position_ms = target;
+        self.request_seek(target);
     }
 
     pub(super) fn seek_by(&mut self, delta_ms: i64) {
         if self.state.current.is_none() {
             return;
         }
-        self.audio.seek_by(delta_ms);
-        // 乐观更新，让进度条立刻响应；音频线程随后会给出真实位置
-        let next = (self.state.position_ms as i64 + delta_ms).max(0) as u64;
-        self.state.position_ms = match self.state.duration_ms {
-            0 => next,
-            duration => next.min(duration),
+        // 相对步进以**界面上的乐观位置**为基准：连按多次时每次都从上一次的
+        // 结果出发，和用户看到的进度条一致。钳制与终局语义统一走 `seek_to`。
+        let target = (self.state.position_ms as i64 + delta_ms).max(0) as u64;
+        self.seek_to(target);
+    }
+
+    /// 把一个目标位置交给 seek 管线（见 `super::SeekPipeline` 的文档）。
+    ///
+    /// 界面立即乐观跳过去；音频端的落实按突发去抖。所有 seek 入口——方向键、
+    /// 点击/拖动进度条、歌词跳转、MPRIS——都汇到这里，行为一致。
+    pub(super) fn request_seek(&mut self, target_ms: u64) {
+        let now = Instant::now();
+        // 乐观更新：进度条、歌词立刻跟手，不等音频线程
+        self.state.position_ms = target_ms;
+
+        let new_burst = self
+            .seek
+            .last_request_at
+            .is_none_or(|at| now.duration_since(at) >= SEEK_BURST_GAP);
+        self.seek.last_request_at = Some(now);
+        self.seek.pending_ms = Some(target_ms);
+
+        // 突发首条立即落实（单击立刻出声）；突发进行中一律压着，等静默判定。
+        if new_burst
+            && self
+                .seek
+                .last_flush_at
+                .is_none_or(|at| now.duration_since(at) >= SEEK_BURST_GAP)
+        {
+            self.flush_pending_seek();
+        }
+    }
+
+    /// 把积压的目标真正发给音频线程。
+    ///
+    /// 心跳在突发静默后调用；拖拽松手也调用（立即落位，不等心跳）。
+    pub(super) fn flush_pending_seek(&mut self) {
+        let Some(target) = self.seek.pending_ms.take() else {
+            return;
         };
+        self.audio.seek_to(target);
+        let now = Instant::now();
+        self.seek.last_flush_at = Some(now);
+        self.seek.in_flight = Some((target, now));
+    }
+
+    /// 换歌 / 停止时作废一切在途的 seek：积压的目标是为**上一首**算的，
+    /// 补发出去会把新歌跳到旧歌的位置上。
+    pub(super) fn reset_seek_pipeline(&mut self) {
+        self.seek.pending_ms = None;
+        self.seek.in_flight = None;
     }
 
     pub(super) fn adjust_volume(&mut self, delta: f32) {
@@ -324,6 +367,7 @@ impl App {
     /// 光调 `audio.stop()` 会漏掉流式下载：音频线程停了，后台任务还在把整首
     /// 往缓冲和 `.part` 文件里灌，谁也不回收它。
     pub(super) fn stop_playback(&mut self) {
+        self.reset_seek_pipeline();
         self.reset_auto_skip();
         if let Some(stream) = self.active_stream.take() {
             stream.cancel();
@@ -343,6 +387,7 @@ impl App {
     /// 忽略 `Loading`，用户按 Space 毫无反应，看起来就是卡死。显式停一下让引擎
     /// 把状态落回 `Stopped`。
     pub(super) fn abort_loading(&mut self) {
+        self.reset_seek_pipeline();
         self.audio.stop();
         self.state.playback = PlaybackState::Stopped;
         self.state.busy = None;
@@ -351,6 +396,9 @@ impl App {
 
     /// 起播一首歌：先查缓存，未命中则解析直链 → 下载 → 播放。
     pub(super) fn start_playback(&mut self, song: Song, start_at_ms: u64) {
+        // 上一首的在途 seek 一并作废：积压的目标是为上一首算的，补发出去会把
+        // 新歌跳到旧歌的位置上。
+        self.reset_seek_pipeline();
         // 上一首如果还在边下边播，通知后台任务收工：任务退出、内存窗口和
         // 文件句柄一起释放。频繁切歌时这一步很关键——否则每个被丢下的下载
         // 任务都会继续把数据往它的缓冲里堆，谁也回收不了。

@@ -8,7 +8,7 @@
 //! │  Sidebar ├───────────────────────┬──────────────────────┤
 //! │          │  Secondary：歌曲列表   │  Lyrics：歌词面板      │
 //! ├──────────┴───────────────────────┴──────────────────────┤
-//! │  Player：曲目 + 进度条                                    │
+//! │  Player：曲目 + 进度条 + 歌词上下文 + 迷你频谱              │
 //! ├─────────────────────────────────────────────────────────┤
 //! │  Status：消息 + 忙碌指示                                  │
 //! └─────────────────────────────────────────────────────────┘
@@ -40,8 +40,11 @@ use views::player::PLAYER_HEIGHT;
 /// 状态栏占 1 行。
 const STATUS_HEIGHT: u16 = 1;
 /// 终端小于这个尺寸时只显示提示。
+///
+/// 高度下限按最紧凑的可用布局算：播放条 6 行 + 状态栏 1 行 + 两段间距 2 行，
+/// 内容区至少还要 4 行才画得下一块面板（`render_main` 的下限）。
 const MIN_WIDTH: u16 = 30;
-const MIN_HEIGHT: u16 = 8;
+const MIN_HEIGHT: u16 = 13;
 /// 侧边栏低于这个宽度就隐藏，把空间让给内容。
 const SIDEBAR_MIN_TOTAL_WIDTH: u16 = 56;
 /// 内容区达到这个宽度时，歌词改为右侧独立列。
@@ -116,7 +119,6 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     }
 
     render_main(frame, main_area, state, &theme);
-    render_mini_spectrum(frame, player_area, state, &theme);
     views::render_player(frame, player_area, state, &theme);
     views::render_status(frame, status_area, state, busy, &theme);
 
@@ -173,6 +175,86 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
     }
 }
 
+/// 队列页与音源页：一列列表 + （宽终端）右侧的「封面 + 歌词 / 接下来」。
+///
+/// 两个页面都只有一份列表，列表短的时候整页大半是空白。rmpc 的队列页把
+/// 当前曲目面板摆在列表旁边，这里同样：宽终端左右分栏；窄终端没有分栏
+/// 余地，列表整块铺满。
+///
+/// 两页的命中区在这里登记而不是渲染函数里：`render_queue` / `render_sources`
+/// 是被两处共用的（各列表页底部还嵌着一块队列面板），命中区的行号换算依赖
+/// 每帧的真实布局，只能由掌握布局的这一层回填。
+fn render_single_list_page(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    let focused = state.focus == Focus::Primary;
+    let playback = state.playback;
+    // 先取出 hash：下面要可变借用 state，不能再持有它的引用
+    let current_hash = state.current.as_ref().map(|song| song.hash.clone());
+
+    let list_area = if area.width >= 60 {
+        // 音源行的地址段很长（api_base 21 列起），列表给宽一点，URL 不至于
+        // 整段被裁；队列行相对短，把更多的宽度让给右侧面板。
+        let ratio = if state.tab == Tab::Sources { 64 } else { 56 };
+        let [list_area, lyric_area] =
+            Layout::horizontal([Constraint::Percentage(ratio), Constraint::Min(20)])
+                .spacing(1)
+                .areas(area);
+        views::render_lyric_panel(frame, lyric_area, state, theme);
+        list_area
+    } else {
+        area
+    };
+
+    match state.tab {
+        Tab::Queue => {
+            views::render_queue(
+                frame,
+                list_area,
+                &state.queue,
+                &mut state.queue_cursor,
+                views::QueueView {
+                    focused,
+                    current_hash: current_hash.as_deref(),
+                    playback,
+                },
+                theme,
+            );
+            // 整页队列此前**没有**命中区：点行 / 拖行 / 滚轮全都没反应——
+            // 只有其它页面里嵌着的那块队列面板登记过。
+            if list_area.height > 3 {
+                state.hit_map.insert(
+                    Rect::new(
+                        list_area.x + 1,
+                        list_area.y + 1,
+                        list_area.width.max(1).saturating_sub(2),
+                        list_area.height.saturating_sub(2),
+                    ),
+                    HitTarget::Queue,
+                    state.queue_cursor.offset(),
+                    state.queue.len(),
+                );
+            }
+        }
+        Tab::Sources => {
+            views::render_sources(frame, list_area, state, focused, theme);
+            if list_area.height > 3 {
+                state.hit_map.insert(
+                    Rect::new(
+                        list_area.x + 1,
+                        list_area.y + 1,
+                        list_area.width.max(1).saturating_sub(2),
+                        list_area.height.saturating_sub(2),
+                    ),
+                    HitTarget::Entries,
+                    state.sources_cursor.offset(),
+                    state.config.sources.ordered().len(),
+                );
+            }
+        }
+        // 调用方只在这两个标签页进来
+        _ => {}
+    }
+}
+
 /// 主内容区：Primary（输入/条目）+ Secondary（歌曲）+ 歌词 + 队列。
 fn render_main(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     if area.height < 4 || area.width < 16 {
@@ -187,8 +269,8 @@ fn render_main(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
         return;
     }
 
-    // 首页 / 队列 / 设置都是单一用途的页面，整块主区都给它——
-    // 塞进下面那套「条目 + 歌曲 + 队列」的分割里，每块都会小到没法用。
+    // 首页 / 队列 / 设置 / 音源都是单一用途的页面——塞进下面那套
+    // 「条目 + 歌曲 + 队列」的分割里，每块都会小到没法用。
     match state.tab {
         Tab::Home => {
             views::render_home(frame, area, state, theme);
@@ -201,23 +283,11 @@ fn render_main(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
             views::render_settings(frame, area, state, &values, focused, theme);
             return;
         }
-        Tab::Queue => {
-            let focused = state.focus == Focus::Primary;
-            let playback = state.playback;
-            // 先取出 hash：下面要可变借用 queue_cursor，不能再持有 state 的引用
-            let current_hash = state.current.as_ref().map(|song| song.hash.clone());
-            views::render_queue(
-                frame,
-                area,
-                &state.queue,
-                &mut state.queue_cursor,
-                views::QueueView {
-                    focused,
-                    current_hash: current_hash.as_deref(),
-                    playback,
-                },
-                theme,
-            );
+        // 队列与音源：宽终端把「封面 + 歌词 / 接下来」摆在列表右边。队列短
+        // 的时候一整列空白，看着像面板坏了；音源页此前更糟——中区左半没有
+        // 歌曲列表（音源页没有歌），歌词面板悬在右半的空地上。
+        Tab::Queue | Tab::Sources => {
+            render_single_list_page(frame, area, state, theme);
             return;
         }
         _ => {}
@@ -254,11 +324,9 @@ fn render_main(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Them
             Tab::Artists => state.artists.list.len(),
             Tab::Ranks => state.ranks.list.len(),
             Tab::Cloud => state.cloud.list.len(),
-            // 音源页的「条目列表」就是音源本身——不返回真实长度的话，
-            // 鼠标命中区长度为 0，点上去不会有任何反应
-            Tab::Sources => state.config.sources.ordered().len(),
-            // 其余页面没有条目列表
+            // 其余页面没有条目列表（音源页与队列页走 render_single_list_page）
             Tab::Search | Tab::Home | Tab::Queue | Tab::Visualizer | Tab::Settings => 0,
+            Tab::Sources => unreachable!("音源页走 render_single_list_page"),
         };
         state.hit_map.insert(
             Rect::new(
@@ -349,13 +417,13 @@ impl AppState {
             Tab::Artists => self.artists.list.cursor.offset(),
             Tab::Ranks => self.ranks.list.cursor.offset(),
             Tab::Cloud => self.cloud.list.cursor.offset(),
-            // 搜索页、可视化页、音源页都没有条目列表
+            // 搜索页、可视化页没有条目列表；音源页走 render_single_list_page
             Tab::Search
             | Tab::Home
             | Tab::Queue
             | Tab::Visualizer
-            | Tab::Sources
-            | Tab::Settings => 0,
+            | Tab::Settings
+            | Tab::Sources => 0,
         }
     }
 
@@ -445,9 +513,8 @@ fn render_primary(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &T
             &state.hit_map,
             theme,
         ),
-        Tab::Sources => views::render_sources(frame, area, state, focused, theme),
-        // 这几页都由 render_main 整屏渲染，不会走到这里
-        Tab::Home | Tab::Queue | Tab::Visualizer | Tab::Settings => {}
+        // 这几页都由 render_main 的单页分支或整页渲染处理，不会走到这里
+        Tab::Home | Tab::Queue | Tab::Visualizer | Tab::Settings | Tab::Sources => {}
     }
 }
 
@@ -529,95 +596,135 @@ fn render_too_small(frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(text).alignment(Alignment::Center), area);
 }
 
-/// 播放条上方那条空白间隔里的单行迷你频谱。
-///
-/// 不占额外高度——用的是布局本来就会留的 1 行 spacing。任何页面播放时都能看到
-/// 音乐在跳，比只看进度条有生命感；可视化页本身已经整屏频谱，这里就不重复画。
-///
-/// 两个观感要点：
-///
-/// * **每一列都画**。频段数（128）通常多于列数，把频段按列聚合（取组内最大值，
-///   鼓点尖峰不被平均掉）。此前按柱状图的 `bar_stride` 跳着画，列数只有宽度
-///   的一半——那行看起来稀稀拉拉，也不随终端宽度伸缩。
-/// * **振幅编码进字符本身**。只有一行可用，靠 `▁▂▃▄▅▆▇█` 八档表示强弱，
-///   而不是「超过阈值画同一个点」。两层平滑之后大部分电平落在 0.1~0.4，
-///   再用 `γ < 1` 抬高中低段，不然安静段落整行都贴在最低档，看不出起伏。
-fn render_mini_spectrum(frame: &mut Frame, player_area: Rect, state: &AppState, theme: &Theme) {
-    if state.tab == Tab::Visualizer || player_area.y == 0 {
-        return;
-    }
-    if state.playback != PlaybackState::Playing || state.smooth_spectrum.is_empty() {
-        return;
-    }
-
-    let area = Rect::new(player_area.x, player_area.y - 1, player_area.width, 1);
-    let width = area.width as usize;
-    if width == 0 {
-        return;
-    }
-
-    let levels = &state.smooth_spectrum;
-    let bands = levels.len();
-
-    let mut spans: Vec<ratatui::text::Span> = Vec::with_capacity(width / 4 + 2);
-    let mut run = String::with_capacity(width);
-    let mut run_style = ratatui::style::Style::default();
-    let mut have_run = false;
-    for column in 0..width {
-        let start = column * bands / width;
-        let end = ((column + 1) * bands / width).max(start + 1);
-        let value = levels[start..end.min(bands)]
-            .iter()
-            .fold(0.0f32, |max, &level| max.max(level))
-            .clamp(0.0, 1.0);
-
-        let (glyph, style) = {
-            let scaled = value.powf(0.55);
-            if scaled < 0.03 {
-                (' ', ratatui::style::Style::default())
-            } else {
-                let eighth = (scaled * 8.0).ceil().clamp(1.0, 8.0) as usize;
-                (
-                    views::visualizer::sub_block_glyph(eighth),
-                    ratatui::style::Style::default().fg(crate::ui::theme::mix(
-                        theme.progress_bg,
-                        theme.accent,
-                        scaled,
-                    )),
-                )
-            }
-        };
-
-        // 相邻同款格子并进同一个 Span，一行通常只有几个 Span
-        if have_run && style == run_style {
-            run.push(glyph);
-            continue;
-        }
-        if have_run && !run.is_empty() {
-            spans.push(ratatui::text::Span::styled(
-                std::mem::take(&mut run),
-                run_style,
-            ));
-        }
-        run.push(glyph);
-        run_style = style;
-        have_run = true;
-    }
-    if !run.is_empty() {
-        spans.push(ratatui::text::Span::styled(run, run_style));
-    }
-    frame.render_widget(
-        ratatui::widgets::Paragraph::new(ratatui::text::Line::from(spans)),
-        area,
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+
+    fn playing_state() -> AppState {
+        let song = |name: &str| crate::api::model::Song {
+            name: name.to_string(),
+            hash: format!("h{}", name.len()),
+            singers: vec![crate::api::model::Singer {
+                name: "周杰伦".to_string(),
+                ..Default::default()
+            }],
+            album_name: "十一月的萧邦".to_string(),
+            duration_ms: 226_000,
+            ..Default::default()
+        };
+        let mut state = AppState::new(Config::default());
+        state.playback = PlaybackState::Playing;
+        state.current = Some(song("夜曲"));
+        state.duration_ms = 226_000;
+        state.position_ms = 74_000;
+        state
+            .queue
+            .replace_with(vec![song("夜曲"), song("富士山下"), song("起风了")], 0);
+        state
+    }
+
+    fn frame_text(state: &mut AppState, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("建测试终端");
+        terminal
+            .draw(|frame| render(frame, state))
+            .expect("渲染整帧");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect()
+    }
+
+    /// 队列页的行必须有命中区：此前整页队列没登记过命中区，点行 / 拖行 /
+    /// 滚轮全都没反应——只有其它页面里嵌的那块队列面板可点。
+    #[test]
+    fn queue_tab_rows_are_clickable() {
+        let mut state = playing_state();
+        state.tab = Tab::Queue;
+        let mut terminal = Terminal::new(TestBackend::new(120, 36)).expect("建测试终端");
+        terminal
+            .draw(|frame| render(frame, &mut state))
+            .expect("渲染整帧");
+
+        // 在内容区里探出一处队列命中区：命中区的行数应覆盖队列长度
+        let mut found = None;
+        'outer: for y in 1..30u16 {
+            for x in 1..60u16 {
+                if let Some(zone) = state.hit_test(x, y)
+                    && zone.target == HitTarget::Queue
+                {
+                    found = Some(zone);
+                    break 'outer;
+                }
+            }
+        }
+        let zone = found.expect("队列页上应有 HitTarget::Queue 命中区");
+        assert_eq!(zone.len, 3, "命中区覆盖整个队列");
+    }
+
+    /// 音源页此前把歌词面板悬在「中区右半」的空地上——音源页没有歌曲列表，
+    /// 中区左半整块是空的，封面缩略图 + 歌词面板浮在半空，看着像渲染坏了。
+    /// 现在音源列表在左、面板在右，且没歌词时右侧是「接下来」而不是歌词。
+    #[test]
+    fn sources_tab_never_floats_the_lyric_panel() {
+        let mut state = playing_state();
+        state.tab = Tab::Sources;
+        let text = frame_text(&mut state, 120, 36);
+        assert!(text.contains("音源管理"), "音源列表在左：{text}");
+        assert!(
+            text.contains("接下来"),
+            "右侧应是「接下来」面板（当前曲无歌词）：{text}"
+        );
+        assert!(
+            // 操作说明里本来就有「词=歌词」这种字样，所以只查面板标题：
+            // 悬空的那块面板标题是「歌词 · 夜曲」
+            !text.contains("歌词·夜曲"),
+            "音源页不该再出现悬空的歌词面板：{text}"
+        );
+    }
+
+    /// 首页的「我的资料」面板按内容收紧：未登录时只有一行字，不该给一块
+    /// 半栏高的空面板（160×48 下此前是 14 行面板装 1 行字）。
+    #[test]
+    fn home_account_panel_hugs_its_content() {
+        // 未登录：面板总高应为 4 行（标题行 + 1 行内容 + 上下边框）
+        let mut state = playing_state();
+        state.tab = Tab::Home;
+        let height = 36u16;
+        let mut terminal = Terminal::new(TestBackend::new(120, height)).expect("建测试终端");
+        terminal
+            .draw(|frame| render(frame, &mut state))
+            .expect("渲染整帧");
+
+        // 找到「我的资料」标题行，向下找面板下边框，量出面板高度
+        let buffer = terminal.backend().buffer();
+        let row_text = |y: u16| -> String {
+            (0..120u16)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect()
+        };
+        let title_y = (0..height)
+            .find(|&y| row_text(y).contains("我的资料"))
+            .expect("账号面板应有标题");
+        let bottom_y = (title_y..height)
+            .find(|&y| y > title_y && row_text(y).contains('╰'))
+            .expect("账号面板应有下边框");
+        assert!(
+            bottom_y - title_y <= 4,
+            "未登录时账号面板应贴着内容，不该撑成空板（标题行 {title_y}，底 {bottom_y}）"
+        );
+    }
 
     /// 侧边栏每个标签的鼠标命中区，必须落在它**渲染时**的那一行上。
     ///
@@ -664,7 +771,7 @@ mod tests {
     /// 迷你频谱要**铺满整行**：频段重采样到每一列，而不是按柱状图的步长
     /// 只画半行——空半行就是用户说的「没有自适应长度」。
     #[test]
-    fn mini_spectrum_fills_the_row_above_the_player() {
+    fn mini_spectrum_fills_its_row_inside_the_player() {
         let mut state = AppState::new(Config::default());
         state.playback = PlaybackState::Playing;
         state.smooth_spectrum = vec![1.0; 128];
@@ -675,16 +782,17 @@ mod tests {
             .draw(|frame| render(frame, &mut state))
             .expect("渲染整帧");
 
-        // 布局：content | 空1行 | player | 空1行 | status。迷你频谱画在
-        // player 上方那行 spacing 里。
+        // 布局：content | 空1行 | player(6) | 空1行 | status。频谱是播放条
+        // 边框内第 4 行内容行。面板左右各占 2 列（边框 + 内边距），频谱
+        // 铺满的是去掉这 4 列之后的内区。
         let player_y = height - PLAYER_HEIGHT - STATUS_HEIGHT - 1;
-        let row = player_y - 1;
-        let line: String = (0..width)
+        let row = player_y + 4;
+        let line: String = (2..width - 2)
             .map(|x| terminal.backend().buffer()[(x, row)].symbol())
             .collect();
         assert!(
             line.chars().all(|character| character == '█'),
-            "满格频谱应铺满整行：|{line}|"
+            "满格频谱应铺满内区整行：|{line}|"
         );
     }
 
@@ -703,8 +811,8 @@ mod tests {
             .expect("渲染整帧");
 
         let player_y = height - PLAYER_HEIGHT - STATUS_HEIGHT - 1;
-        let row = player_y - 1;
-        let line: String = (0..width)
+        let row = player_y + 4;
+        let line: String = (2..width - 2)
             .map(|x| terminal.backend().buffer()[(x, row)].symbol())
             .collect();
         assert!(
@@ -727,8 +835,8 @@ mod tests {
             .expect("渲染整帧");
 
         let player_y = height - PLAYER_HEIGHT - STATUS_HEIGHT - 1;
-        let row = player_y - 1;
-        let line: String = (0..width)
+        let row = player_y + 4;
+        let line: String = (2..width - 2)
             .map(|x| terminal.backend().buffer()[(x, row)].symbol())
             .collect();
         assert!(line.chars().all(|character| character == ' '), "|{line}|");
@@ -864,6 +972,25 @@ mod visual_dump {
         state.position_ms = 74_000;
         state.volume = 0.7;
         state.status = "已连接 · 内嵌接口".to_string();
+        // 歌词与频谱：让播放条新加的两行（歌词上下文 / 迷你频谱）有内容可看
+        state.lyric.lyric = crate::api::model::Lyric {
+            text: String::new(),
+            lines: (0..40)
+                .map(|index| crate::api::model::LyricLine {
+                    time_ms: index as u64 * 4_000,
+                    text: format!("漆黑的夜里滑过一道微光{index}"),
+                    ..crate::api::model::LyricLine::default()
+                })
+                .collect(),
+        };
+        state.lyric.active_line = Some(18);
+        state.lyric.load.succeed();
+        state.smooth_spectrum = (0..128)
+            .map(|index| {
+                let t = index as f32 / 128.0;
+                ((1.0 - t).powf(1.4) * 0.9).clamp(0.0, 1.0)
+            })
+            .collect();
 
         let (width, height) = (120u16, 36u16);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("建测试终端");
@@ -877,6 +1004,98 @@ mod visual_dump {
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>();
             println!("|{line}|");
+        }
+    }
+
+    /// 布局矩阵：所有标签页 × 常见终端尺寸，逐帧打印。
+    ///
+    /// 排查「某页在某尺寸下空间浪费 / 面板挤压 / 折行难看」用。每帧前打印
+    /// `== {tab:?} {width}x{height} ==` 头，方便在输出里定位。
+    #[test]
+    #[ignore = "布局矩阵检视用，打印多帧文本"]
+    fn dump_layout_matrix() {
+        let song = |name: &str| crate::api::model::Song {
+            name: name.to_string(),
+            hash: format!("h{}", name.len()),
+            singers: vec![crate::api::model::Singer {
+                name: "周杰伦".to_string(),
+                ..Default::default()
+            }],
+            album_name: "十一月的萧邦".to_string(),
+            duration_ms: 226_000,
+            ..crate::api::model::Song::default()
+        };
+        let base = || {
+            let mut state = AppState::new(Config::default());
+            state.sidebar_visible = true;
+            state.playback = crate::audio::engine::PlaybackState::Playing;
+            state.current = Some(song("夜曲"));
+            state.duration_ms = 226_000;
+            state.position_ms = 74_000;
+            state.volume = 0.7;
+            // 封面要在 dump 里出现，得给 picker 与一张渐变图——真机走的是
+            // 自动探测的协议（kitty/sixel），这里用半块字符模拟。
+            state.picker = Some(ratatui_image::picker::Picker::halfblocks());
+            let mut pixels = image::RgbImage::new(64, 64);
+            for (x, y, pixel) in pixels.enumerate_pixels_mut() {
+                *pixel = image::Rgb([(x * 4) as u8, (y * 4) as u8, 128]);
+            }
+            state.cover.set_image(
+                "h2".to_string(),
+                image::DynamicImage::ImageRgb8(pixels),
+                1.0,
+            );
+            state.search.results.replace(
+                "搜索结果",
+                vec![
+                    song("夜曲"),
+                    song("富士山下"),
+                    song("起风了"),
+                    song("Lemon"),
+                    song("海阔天空"),
+                ],
+            );
+            state
+                .playlists
+                .list
+                .replace(vec![crate::api::model::Playlist::default(); 6]);
+            state
+                .queue
+                .replace_with(vec![song("夜曲"), song("富士山下"), song("起风了")], 0);
+            state
+        };
+
+        let sizes = [(80u16, 24u16), (120, 30), (120, 36), (160, 48)];
+        let tabs = [
+            Tab::Home,
+            Tab::Search,
+            Tab::Playlists,
+            Tab::Artists,
+            Tab::Ranks,
+            Tab::Cloud,
+            Tab::Queue,
+            Tab::Sources,
+            Tab::Visualizer,
+            Tab::Settings,
+        ];
+        for &(width, height) in &sizes {
+            for &tab in &tabs {
+                let mut state = base();
+                state.tab = tab;
+                let mut terminal =
+                    Terminal::new(TestBackend::new(width, height)).expect("建测试终端");
+                terminal
+                    .draw(|frame| render(frame, &mut state))
+                    .expect("渲染整帧");
+                println!("== {tab:?} {width}x{height} ==");
+                let buffer = terminal.backend().buffer();
+                for y in 0..height {
+                    let line: String = (0..width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>();
+                    println!("|{line}|");
+                }
+            }
         }
     }
 
@@ -954,12 +1173,11 @@ mod visual_dump {
             .config
             .switch_source(crate::source::SourceKind::KugouConcept);
         state.config.cache_dir = std::path::PathBuf::from("/home/xibie/kugou-proxy-cache");
-        state
-            .stats
-            .record_complete_on(Some("2026-11-05".to_string()), "Josh Vietti");
-        state
-            .stats
-            .add_listen_on(Some("2026-11-05".to_string()), 145_000);
+        // 统计按「今天」喂：资料区的本周摘要只看最近 7 天，写死的日期
+        // 过了窗口就显示不出来，dump 也跟着失真。
+        let today = crate::util::today_local();
+        state.stats.record_complete_on(today.clone(), "Josh Vietti");
+        state.stats.add_listen_on(today, 145_000);
         // 渐变而不是纯色：半块字符在上下同色时会退化成空格（用底色表示），
         // 纯色图整片空白，看不出贴顶效果。
         let mut pixels = image::RgbImage::new(64, 64);

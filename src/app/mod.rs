@@ -204,8 +204,8 @@ pub struct App {
     /// 同一个源失败一次就够了：后面同源的歌直接跳过，不再逐个发必然失败的请求。
     failed_sources: Vec<crate::source::SourceKind>,
 
-    /// 上一次拖拽进度条时真正发给音频线程的 seek 时刻（节流用）。
-    drag_seek_at: Option<Instant>,
+    /// seek 去抖管线（见 [`SeekPipeline`]）。
+    seek: SeekPipeline,
 
     /// 画面是否脏（自上次渲染以来状态有没有变）。
     ///
@@ -214,6 +214,46 @@ pub struct App {
     /// Tick 只在「真的有东西在动」时置脏（见 [`tick_needs_redraw`]）。
     dirty: bool,
 }
+
+/// 一次用户 seek 从「请求」到「落实」到「确认」的全程状态。
+///
+/// 点击进度条、按住方向键、拖进度条、MPRIS 拖动，全部走同一条管线：
+///
+/// * 界面**每次请求都乐观更新**位置（进度条/歌词立即跟手）；
+/// * 音频端的落实按突发去抖：突发首条立即发（单击立刻出声），突发进行中
+///   （按键重复 ~30ms 一次、拖动 ~60Hz 一次）一条都不发——每次 seek 都要
+///   重置解码器定位，连续发就是「声音断续、进度卡死」；突发结束 250ms 后
+///   由心跳把最后的目标补发出去，拖拽松手则立即补发。
+/// * 补发之后引擎还要等一个轮询周期才真正跳完；确认之前（位置贴近目标，
+///   或超时兜底）心跳不拿引擎的旧位置冲掉界面上的乐观位置——否则进度条
+///   会在 seek 后弹回旧位置，看起来像没跳。
+#[derive(Default)]
+pub(super) struct SeekPipeline {
+    /// 用户最近请求、尚未落实的目标位置（毫秒）。
+    pending_ms: Option<u64>,
+    /// 最近一次用户发起 seek 的时刻。
+    last_request_at: Option<Instant>,
+    /// 最近一次真正发给音频线程的时刻。
+    last_flush_at: Option<Instant>,
+    /// 已发出、等待引擎确认的 seek：`(目标, 发出时刻)`。
+    in_flight: Option<(u64, Instant)>,
+}
+
+/// 突发结束判定：距上次请求超过这个时长，就把积压的最终位置落实给音频线程。
+const SEEK_QUIESCENT: Duration = Duration::from_millis(250);
+
+/// 突发的界定间隔：距上次请求超过它才算一次**新的**突发（首条立即落实）。
+/// 按住方向键时按键重复远快于它，所以按住期间只有第一条立即落实，其余
+/// 交给静默判定——这是「按住快进时声音断续」的解药。
+const SEEK_BURST_GAP: Duration = Duration::from_millis(200);
+
+/// 已发出的 seek 超过这个时长还没确认（引擎位置没贴近目标），视为失败或
+/// 丢失：界面位置重新跟随引擎，别把乐观值挂一辈子。
+const SEEK_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 引擎位置与目标差不超过这个值就认为 seek 已落实。正常播放每拍前进约
+/// `tick_ms`（200ms），1.5s 的窗口足以无歧义地识别「跳到了目标附近」。
+const SEEK_CONFIRM_EPSILON_MS: u64 = 1_500;
 
 /// 动画帧间隔（约 30fps）。终端里再往上（60fps）看不出差别，但重绘成本是线性的，
 /// 白白吃掉「低资源占用」这个卖点，所以取这个折中值。
@@ -333,7 +373,7 @@ impl App {
             pending_stream_retry: None,
             auto_skip_count: 0,
             failed_sources: Vec::new(),
-            drag_seek_at: None,
+            seek: SeekPipeline::default(),
             dirty: true,
             #[cfg(unix)]
             mpris,
@@ -500,9 +540,26 @@ impl App {
             // 渲染按需：静止（暂停/停止、无忙碌、无动画）时跳过整帧重绘。
             // 要不要重绘由 `handle_event` 置脏标记决定，这里只看标记。
             if self.dirty {
+                // 同步渲染（DEC 2026）：整帧的输出一次性呈现，终端不再逐行
+                // 重画——输入法候选窗跟着每帧输出反复重绘就是「打字狂闪」。
+                // 不支持这个模式的终端会忽略未知 DEC 私有模式，无害。
+                //
+                // 注意收尾只能刷 **Backend 的 io::Write**（把滞留在行缓冲里的
+                // END 序列送出去），绝不能调 `Terminal::flush`——那是个语义完全
+                // 不同的东西：它把当前缓冲 diff 应用到后端。draw 已经交换过
+                // 双缓冲，再来一次 diff 等于「把整屏擦成空」，每帧渲染完立刻
+                // 被清空，表现就是界面全空、音频照放。
+                use ratatui::crossterm::terminal::{
+                    BeginSynchronizedUpdate, EndSynchronizedUpdate,
+                };
+                ratatui::crossterm::queue!(terminal.backend_mut(), BeginSynchronizedUpdate)
+                    .context("开启同步渲染失败")?;
                 terminal
                     .draw(|frame| crate::ui::render(frame, &mut self.state))
                     .context("渲染失败")?;
+                ratatui::crossterm::queue!(terminal.backend_mut(), EndSynchronizedUpdate)
+                    .context("结束同步渲染失败")?;
+                std::io::Write::flush(&mut *terminal.backend_mut()).context("刷新输出缓冲失败")?;
                 self.dirty = false;
             }
 
@@ -756,7 +813,7 @@ impl App {
             pending_stream_retry: None,
             auto_skip_count: 0,
             failed_sources: Vec::new(),
-            drag_seek_at: None,
+            seek: SeekPipeline::default(),
             dirty: true,
             #[cfg(unix)]
             mpris: None,

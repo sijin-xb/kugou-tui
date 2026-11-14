@@ -611,7 +611,9 @@ fn render_buffering(frame: &mut Frame, area: Rect, state: &AppState, theme: &The
 }
 
 /// 缓冲进度条：填充段用强调色、空槽用暗色，末尾跟百分比。
-fn progress_spans(percent: u64, theme: &Theme) -> Vec<Span<'static>> {
+///
+/// 可视化页与播放条第 5 行共用（后者在边下边播缓冲时显示）。
+pub(crate) fn progress_spans(percent: u64, theme: &Theme) -> Vec<Span<'static>> {
     const WIDTH: usize = 24;
     let filled = ((percent.min(100) as usize) * WIDTH / 100).min(WIDTH);
 

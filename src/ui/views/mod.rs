@@ -890,8 +890,14 @@ pub fn loading_placeholder(theme: &Theme) -> Paragraph<'static> {
 }
 
 /// 供视图复用的空列表占位。
+///
+/// 提示文案常常比窄面板宽（「选中歌单后按 Enter 载入歌曲」在 80 列终端的
+/// 歌曲面板里就放不下），不折行的话会被齐边裁掉——与 `failed_placeholder`
+/// 一样开折行，宁折不断。
 pub fn empty_placeholder(text: &str, theme: &Theme) -> Paragraph<'static> {
-    placeholder(text, theme).alignment(Alignment::Center)
+    placeholder(text, theme)
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
 }
 
 /// 载入失败的占位。

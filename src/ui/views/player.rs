@@ -14,27 +14,31 @@ use ratatui_image::{FontSize, Resize, StatefulImage};
 
 use crate::api::model::format_duration_ms;
 use crate::app::queue::PlayQueue;
-use crate::app::state::{AppState, HitTarget};
+use crate::app::settings::quality_label;
+use crate::app::state::{AppState, HitTarget, Tab};
 use crate::audio::engine::PlaybackState;
 use crate::config::CoverFill;
 use crate::keymap::key_hint_for;
 use crate::ui::theme::{Theme, mix};
+use crate::ui::views::visualizer::{progress_spans, sub_block_glyph};
 use crate::ui::views::{empty_placeholder, failed_placeholder, loading_placeholder};
 use crate::ui::widgets::{
     RowContext, display_width, panel, row_is_visible, selection_list, song_row, truncate_to_width,
     wrap_to_width,
 };
 
-/// 播放条高度：2 行内容 + 上下边框。
+/// 播放条高度：4 行内容 + 上下边框。
 ///
-/// 2 行 = 曲目信息 / 进度条。
+/// 4 行 = 曲目信息 / 进度条 / 上下文（歌词当前句 · 队列位置）/ 迷你频谱。
+/// 后两行是「听歌时有东西看」的那部分：宽终端里只有曲目和进度两行的话，
+/// 播放条大半是空白。
 ///
-/// 这里**刻意不放封面**：播放条总共才 4 行，给封面最多 8×4 格——那个尺寸下
+/// 这里**刻意不放封面**：播放条总共 6 行，给封面最多 8×4 格——那个尺寸下
 /// 专辑图只是一团糊色，既看不清又白占宽度。封面挪到「首页」和「歌词」页，
 /// 那里有整块区域可以按真实比例放大（见 `draw_cover_block`）。
-pub const PLAYER_HEIGHT: u16 = 4;
+pub const PLAYER_HEIGHT: u16 = 6;
 
-/// 播放条：封面 + 曲目信息 + 进度条 + 下一首。
+/// 播放条：曲目信息 + 进度条 + 歌词/队列上下文 + 迷你频谱。
 pub fn render_player(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
     if area.height < 3 || area.width < 20 {
         return;
@@ -48,8 +52,21 @@ pub fn render_player(frame: &mut Frame, area: Rect, state: &mut AppState, theme:
         return;
     }
 
-    // 两行：曲目信息 / 进度条。高度只有 1 行时（极端窄终端）只给进度条。
-    if inner.height >= 2 {
+    // 四行齐全时自上而下排；高度不足时从底部开始裁——上下文与频谱是
+    // 「锦上添花」，曲目信息与进度条无论如何要留。
+    if inner.height >= 4 {
+        let [info_area, gauge_area, context_area, spectrum_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .areas(inner);
+        render_song_info(frame, info_area, state, theme);
+        render_progress(frame, gauge_area, state, theme);
+        render_context_row(frame, context_area, state, theme);
+        render_spectrum_strip(frame, spectrum_area, state, theme);
+    } else if inner.height >= 2 {
         let [info_area, gauge_area] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
         render_song_info(frame, info_area, state, theme);
@@ -242,6 +259,167 @@ fn render_progress(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &
     state.hit_map.insert_flat(area, HitTarget::Progress);
 }
 
+/// 第 4 行：歌词当前句（左）与队列位置 · 音质（右）。
+///
+/// 播放条原本只有曲目与进度两行，宽终端里大半是空白。这行把「听歌时有东西
+/// 看」的信息放进来：有歌词就跟读——歌词面板只在首页/歌词页出现，这条让
+/// **任何页面**都能看到唱到哪了；没歌词（纯音乐/没取到）就看今天的听歌统计。
+/// 右侧平时是「第几首 / 什么音质」，边下边播还没攒够开声的数据时换成下载
+/// 进度——用户此刻正盯着它等出声。
+///
+/// 本行是**只读信息**，不登记命中区：可点的东西（模式 / 音量 / 下一首）都在
+/// 第 1 行的右段。
+fn render_context_row(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    let left_text = match state
+        .lyric
+        .active_line
+        .and_then(|index| state.lyric.lyric.lines.get(index))
+    {
+        Some(line) if !line.text.trim().is_empty() => line.text.clone(),
+        _ if state.lyric.instrumental => "纯音乐，请欣赏".to_string(),
+        _ => state.stats.today_summary().unwrap_or_default(),
+    };
+
+    let right_text = match state.download_progress {
+        // 只知道收了多少、不知道总量时不给百分比：宁可不画，也不给个假分母
+        Some((received, Some(total))) if total > 0 => {
+            format!("边下边播 {}%", received * 100 / total)
+        }
+        _ => {
+            let position = state
+                .queue
+                .cursor()
+                .map(|index| format!("第 {}/{} 首", index + 1, state.queue.len()));
+            let quality = quality_label(&state.config.quality);
+            match (position, state.current_is_trial) {
+                (Some(position), true) => format!("{position} · {quality} · 试听"),
+                (Some(position), false) => format!("{position} · {quality}"),
+                (None, true) => format!("{quality} · 试听"),
+                (None, false) => quality,
+            }
+        }
+    };
+
+    let right_width = (display_width(&right_text) as u16).min(area.width);
+    let (left_area, right_area) = if right_width > 0 {
+        let [left, right] =
+            Layout::horizontal([Constraint::Min(8), Constraint::Length(right_width)])
+                .spacing(1)
+                .areas(area);
+        (left, Some(right))
+    } else {
+        (area, None)
+    };
+
+    // 没有可显示的内容时不画前缀图标——孤零零一个音符挂在空行上反而扎眼
+    if !left_text.is_empty() {
+        let spans = vec![
+            Span::styled(format!("{} ", crate::ui::icons::lyric_note()), theme.dim()),
+            Span::styled(
+                truncate_to_width(&left_text, left_area.width.saturating_sub(3) as usize),
+                theme.body(),
+            ),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)), left_area);
+    }
+
+    if let Some(right_area) = right_area {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                truncate_to_width(&right_text, right_area.width as usize),
+                theme.dim(),
+            )))
+            .alignment(Alignment::Right),
+            right_area,
+        );
+    }
+}
+
+/// 第 5 行：迷你频谱（播放中）或下载进度（缓冲中）。
+///
+/// 原本画在播放条**上方**的间隔行里（布局 spacing 白捡的一行）。挪进播放条：
+/// 一行太细、又悬在面板外面，观感上是「有一搭没一搭的噪音」；贴着进度条放在
+/// 面板里，才是播放条的「心跳」。可视化页整屏都是频谱，这里就不重复画。
+fn render_spectrum_strip(frame: &mut Frame, area: Rect, state: &AppState, theme: &Theme) {
+    if state.tab == Tab::Visualizer {
+        return;
+    }
+    if state.playback == PlaybackState::Playing && !state.smooth_spectrum.is_empty() {
+        render_spectrum_line(frame, area, &state.smooth_spectrum, theme);
+        return;
+    }
+    // 缓冲中（边下边播还没攒够开声的数据量）：给一行下载进度。只在真的知道
+    // 总量时画百分比。
+    if let Some((received, Some(total))) = state.download_progress
+        && total > 0
+    {
+        let percent = (received * 100 / total).min(100);
+        frame.render_widget(
+            Paragraph::new(Line::from(progress_spans(percent, theme))).alignment(Alignment::Center),
+            area,
+        );
+    }
+}
+
+/// 一行的频谱：频段按列聚合取最大值，振幅编码进块字符的档位。
+///
+/// 两个观感要点：
+///
+/// * **每一列都画**。频段数（128）通常多于列数，把频段按列聚合（取组内最大值，
+///   鼓点尖峰不被平均掉）。
+/// * **振幅编码进字符本身**。只有一行可用，靠 `▁▂▃▄▅▆▇█` 八档表示强弱。
+///   两层平滑之后大部分电平落在 0.1~0.4，再用 `γ < 1` 抬高中低段，不然安静
+///   段落整行都贴在最低档，看不出起伏。
+fn render_spectrum_line(frame: &mut Frame, area: Rect, levels: &[f32], theme: &Theme) {
+    let width = area.width as usize;
+    if width == 0 {
+        return;
+    }
+    let bands = levels.len();
+
+    let mut spans: Vec<Span> = Vec::with_capacity(width / 4 + 2);
+    let mut run = String::with_capacity(width);
+    let mut run_style = Style::default();
+    let mut have_run = false;
+    for column in 0..width {
+        let start = column * bands / width;
+        let end = ((column + 1) * bands / width).max(start + 1);
+        let value = levels[start..end.min(bands)]
+            .iter()
+            .fold(0.0f32, |max, &level| max.max(level))
+            .clamp(0.0, 1.0);
+
+        let (glyph, style) = {
+            let scaled = value.powf(0.55);
+            if scaled < 0.03 {
+                (' ', Style::default())
+            } else {
+                let eighth = (scaled * 8.0).ceil().clamp(1.0, 8.0) as usize;
+                (
+                    sub_block_glyph(eighth),
+                    Style::default().fg(mix(theme.progress_bg, theme.accent, scaled)),
+                )
+            }
+        };
+
+        // 相邻同款格子并进同一个 Span，一行通常只有几个 Span
+        if have_run && style == run_style {
+            run.push(glyph);
+            continue;
+        }
+        if have_run && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), run_style));
+        }
+        run.push(glyph);
+        run_style = style;
+        have_run = true;
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, run_style));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 /// 当前行**未唱部分**的底色，在 `text_dim` 与 `text` 之间的位置。
 ///
 /// 取 0.3：比别的行亮一档，整行才压得住上下两行；再亮就会让还没唱的字抢戏，
@@ -289,6 +467,20 @@ pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
         return;
     }
 
+    // 取回了「确实没有歌词」（非暂态）、又真的在播一首歌：这块面板改画
+    // 「接下来」——队列里排在当前曲之后的歌。歌词面板散布在各页右侧，
+    // 没词可唱时整块常常一屏空白，而听歌时用户最想看的下一件事就是
+    // 「待会儿放什么」。正在取词 / 取失败保持「歌词」身份，那些是暂态。
+    if state.lyric.lyric.is_empty()
+        && !state.lyric.load.is_loading()
+        && state.lyric.load.error().is_none()
+        && state.current.is_some()
+        && !state.lyric.instrumental
+    {
+        render_up_next(frame, area, state, theme);
+        return;
+    }
+
     let title = match state.current.as_ref() {
         Some(song) => format!("歌词 · {}", song.name),
         None => "歌词".to_string(),
@@ -318,12 +510,10 @@ pub fn render_lyric(frame: &mut Frame, area: Rect, state: &mut AppState, theme: 
         return;
     }
     if state.lyric.lyric.is_empty() {
-        // 三种「没有歌词」要分开说：纯音乐（接口明确回没有）/ 这首歌确实没词 /
-        // 还没开始播。混成一句会让用户以为放错了歌，或者以为面板坏了。
+        // 走到这里只剩两种情况：「纯音乐」（接口明确回没有）与还没开播——
+        // 「有歌、取词有结果、确实没词」的那条在函数开头已经改画「接下来」。
         let hint = if state.lyric.instrumental {
             "纯音乐，请欣赏"
-        } else if state.current.is_some() {
-            "暂无歌词"
         } else {
             "播放歌曲后显示歌词"
         };
@@ -854,6 +1044,60 @@ pub fn render_lyric_panel(frame: &mut Frame, area: Rect, state: &mut AppState, t
     render_lyric(frame, rest, state, theme);
 }
 
+/// 歌词面板在「确实没有歌词」时的兜底：接下来要放的歌。
+///
+/// 面板标题也从「歌词」换成「接下来」——挂着歌词的名字画队列是撒谎。
+/// 队列取当前曲之后的项（游标未知就从头取）；没有下一首时给一行说明，
+/// 不给一整块空白。
+fn render_up_next(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &Theme) {
+    const UP_NEXT_LIMIT: usize = 8;
+
+    let title = match state.current.as_ref() {
+        Some(song) => format!("接下来 · {}", song.name),
+        None => "接下来".to_string(),
+    };
+    let block = panel(title, false, theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    let start = state.queue.cursor().map_or(0, |index| index + 1);
+    // 说明 + 标题 + 空行占掉 3 行，剩下的给歌；超出上限截断（队列可能上百首）
+    let rows = inner.height.saturating_sub(3) as usize;
+    let upcoming: Vec<&crate::api::model::Song> = state
+        .queue
+        .items()
+        .iter()
+        .skip(start)
+        .take(rows.min(UP_NEXT_LIMIT))
+        .collect();
+
+    let mut lines = vec![Line::from(Span::styled("接下来", theme.title()))];
+    if upcoming.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!("队列到头了 · 在列表里按 {} 把歌加进来", key_hint_for("a")),
+            theme.dim(),
+        )));
+    }
+    for (offset, song) in upcoming.iter().enumerate() {
+        let label = format!(
+            "{} {} · {}  {}",
+            start + offset + 1,
+            song.name,
+            song.singer_text(),
+            format_duration_ms(song.duration_ms)
+        );
+        lines.push(Line::from(Span::styled(
+            truncate_to_width(&label, inner.width as usize),
+            theme.body(),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 /// 头像占的列数：6 行内容 × 字符高宽比 2 = 12 列。
 ///
 /// 这是给**真图片**的：12 列 × 6 行在支持 kitty / sixel / iTerm2 的终端上是
@@ -866,13 +1110,87 @@ const AVATAR_COLUMNS: u16 = 12;
 /// ——实测 12 列时「概念版 TVIP · 至 09-28」会被截成「至 09…」，日期等于没写。
 const AVATAR_INITIAL_COLUMNS: u16 = 3;
 
-/// 首页账号区的高度：边框 2 行 + 内容 6 行（头像要能看清，2 行只能画 4 列宽）。
-///
-/// 这是**下限**，不能被封面框挤掉——封面用剩下的空间。左栏宽裕时账号区最多
-/// 给到 [`ACCOUNT_MAX_HEIGHT`]：长行折行（见 `render_account`）需要行数，
-/// 封面在 Tall 面板里反正贴顶显示，多出来的高度给文字更值。
-const ACCOUNT_HEIGHT: u16 = 8;
+/// 首页账号区的高度上限：左栏宽裕时账号区最多给到这个行数，长行折行
+/// （见 `render_account`）才有地方落——封面在 Tall 面板里反正贴顶显示，
+/// 多出来的高度给文字比给空白值。下限按内容收紧（见 `account_panel_rows`）。
 const ACCOUNT_MAX_HEIGHT: u16 = 14;
+
+/// 「我的资料」面板按内容收紧后的总高度（含上下边框）。
+///
+/// 固定给半栏高的话，资料只有一两行时边框里全是空白，看着像面板坏了。
+/// 行数 = 文字行数（按面板宽度折行，与 `render_account` 同序）与头像需要的
+/// 行数取大者，再加边框；上下都钳住，窄面板不至于挤成一条，高面板不至于
+/// 撑成一块空板。
+fn account_panel_rows(state: &AppState, panel_width: u16) -> u16 {
+    // panel()：边框 2 列 + 左右内边距各 1 列
+    let inner_width = panel_width.saturating_sub(4).max(1);
+    let text_only = state
+        .picker
+        .as_ref()
+        .is_none_or(|picker| picker.protocol_type() == ProtocolType::Halfblocks);
+    let avatar_columns = if text_only {
+        AVATAR_INITIAL_COLUMNS
+    } else {
+        AVATAR_COLUMNS
+    };
+    // 与 render_account 的分栏判定一致：放得下头像才分头像列
+    let text_width = if inner_width >= avatar_columns + 14 {
+        inner_width - avatar_columns - 1
+    } else {
+        inner_width
+    } as usize;
+    let text_rows = account_text_rows(state, text_width);
+    // 真图片头像要 6 行内容才认得出来；没资料（未登录等）只画一行文字
+    let avatar_rows = if state.user_info.is_some() && !text_only {
+        6
+    } else {
+        1
+    };
+    (text_rows.max(avatar_rows) as u16 + 2).clamp(4, ACCOUNT_MAX_HEIGHT)
+}
+
+/// 「我的资料」的文字行数（按 `width` 折行后）。
+///
+/// **与 `render_account` 的行构建保持同一顺序同一内容**——那边加一行，这里
+/// 就得跟着改，否则量出来的高度和画出来的对不上。两边不能合并成一份：那边
+/// 要边渲染边登记命中区（折行续行也在命中区内），这边只要行数。
+fn account_text_rows(state: &AppState, width: usize) -> usize {
+    let Some(info) = state.user_info.as_ref() else {
+        // 未登录 / 加载中是一行；取失败多一行「点这里重试」
+        return if state.user_info_load.error().is_some() {
+            2
+        } else {
+            1
+        };
+    };
+    let wrap =
+        |text: &str| crate::ui::widgets::wrap_to_width(text, width, width.saturating_sub(2)).len();
+    let mut rows = 1; // 昵称 · 等级
+    if let Some(label) = state
+        .vip_info
+        .as_ref()
+        .map(crate::api::cloud::VipInfo::label)
+    {
+        rows += wrap(&label);
+    }
+    if state.config.active_source_kind() == crate::source::SourceKind::KugouConcept {
+        let text = if state.vip_claiming {
+            "领取中…"
+        } else if claimed_today(state) {
+            "今日 VIP 已领取"
+        } else {
+            "领取今日 VIP"
+        };
+        rows += wrap(text);
+    }
+    if let Some(duration) = info.duration_text() {
+        rows += wrap(&format!("听过 {duration}"));
+    }
+    if let Some(summary) = state.stats.summary_line() {
+        rows += wrap(&summary);
+    }
+    rows
+}
 
 /// 今天的「概念版」VIP 是否已经领过。
 ///
@@ -1126,14 +1444,17 @@ pub fn render_home(frame: &mut Frame, area: Rect, state: &mut AppState, theme: &
             .spacing(1)
             .areas(inner);
 
-        // 左栏竖着切：上方封面（贴顶显示）、下方账号信息（自适应高度）。
+        // 左栏竖着切：上方封面（贴顶显示）、下方账号信息（按内容收紧，贴底）。
         //
         // 之前让封面框按图片比例自己算高度，结果框能把整个左栏吃掉，
         // 账号区高度变成 0 —— 用户看到「个人信息被挤掉了」。所以账号区
-        // 有 8 行的硬下限；左栏高的时候账号区最多到 [`ACCOUNT_MAX_HEIGHT`]，
+        // 有下限；左栏高的时候账号区最多到 [`ACCOUNT_MAX_HEIGHT`]，
         // 长行折行才有地方落——封面在 Tall 面板里反正贴顶（`fit_box`），
-        // 多出的高度给文字比给空白值。栏与栏之间同样留一空行/一列。
-        let account_rows = (left.height / 2).clamp(ACCOUNT_HEIGHT, ACCOUNT_MAX_HEIGHT);
+        // 多出的高度给文字比给空白值。
+        //
+        // 高度按**内容**量（见 `account_panel_rows`）而不是固定给半栏：资料
+        // 只有一两行时给一块半栏高的面板，边框里全是空白，看着像面板坏了。
+        let account_rows = account_panel_rows(state, left.width);
         let [cover_col, account_col] =
             Layout::vertical([Constraint::Min(6), Constraint::Length(account_rows)])
                 .spacing(1)
@@ -1240,25 +1561,65 @@ mod tests {
         );
     }
 
-    /// 真的没有歌词（请求成功但内容为空）时，仍然显示「暂无歌词」。
+    /// 真的没有歌词（请求成功但内容为空）时，面板改画「接下来」——空着
+    /// 就是一整块留白，而队列里排在后面的歌正是此刻最值得看的内容。标题
+    /// 也跟着换成「接下来 · 当前曲目」，别让一块队列顶着歌词的名字。
     #[test]
-    fn an_empty_lyric_still_reads_as_no_lyrics() {
-        let mut state = AppState::new(crate::config::Config::default());
-        // 有当前曲目才会落到「暂无歌词」；没有曲目时是「播放歌曲后显示歌词」
-        state.current = Some(crate::api::model::Song::default());
-        state.lyric.hash = Some("h".to_string());
-        state.lyric.load.succeed();
-        state.lyric.lyric = crate::api::model::Lyric::default();
-
-        let mut terminal = Terminal::new(TestBackend::new(40, 8)).expect("建测试终端");
+    fn an_empty_lyric_shows_the_upcoming_queue_instead() {
         let theme = Theme::for_config(ThemeName::Default, false);
-        terminal
-            .draw(|frame| render_lyric(frame, Rect::new(0, 0, 40, 8), &mut state, &theme))
-            .expect("渲染歌词面板");
+        let song = |name: &str| crate::api::model::Song {
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let lyric_state = |current: crate::api::model::Song,
+                           queue: Vec<crate::api::model::Song>,
+                           cursor: usize| {
+            let mut state = AppState::new(crate::config::Config::default());
+            state.current = Some(current);
+            state.lyric.hash = Some("h".to_string());
+            state.lyric.load.succeed();
+            state.lyric.lyric = crate::api::model::Lyric::default();
+            state.queue.replace_with(queue, cursor);
+            state
+        };
 
+        // 队列里还有下一首：标题带当前曲目，列出排在后面的歌
+        let mut state = lyric_state(
+            song("夜曲"),
+            vec![song("夜曲"), song("富士山下"), song("起风了")],
+            0,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("建测试终端");
+        terminal
+            .draw(|frame| render_lyric(frame, Rect::new(0, 0, 40, 12), &mut state, &theme))
+            .expect("渲染歌词面板");
         let text = buffer_text(&terminal);
-        assert!(text.contains("暂无歌词"), "确实没有歌词时应照常说：{text}");
+        assert!(
+            text.contains("接下来"),
+            "没词可唱时应改画「接下来」：{text}"
+        );
+        assert!(
+            text.contains("富士山下"),
+            "队列里排在后面的歌应显示：{text}"
+        );
+        assert!(text.contains("起风了"), "多首也要列出：{text}");
+        assert!(text.contains("夜曲"), "面板标题带上当前曲目：{text}");
         assert!(!text.contains("载入失败"), "这不是失败：{text}");
+
+        // 当前曲已是队列末尾：说清楚「没有下一首」，不留一块空白
+        let mut state = lyric_state(
+            song("起风了"),
+            vec![song("夜曲"), song("富士山下"), song("起风了")],
+            2,
+        );
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("建测试终端");
+        terminal
+            .draw(|frame| render_lyric(frame, Rect::new(0, 0, 40, 12), &mut state, &theme))
+            .expect("渲染歌词面板");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("队列到头了"), "没有下一首时要说清楚：{text}");
+        assert!(text.contains("起风了"), "面板标题带上当前曲目：{text}");
+        assert!(!text.contains("富士山下"), "前面的歌不该再列出来：{text}");
     }
 
     /// 纯音乐（接口明确回「找不到歌词」）要说「纯音乐，请欣赏」——既不是
@@ -1342,6 +1703,60 @@ mod tests {
         for needle in ["下一首", "音量", "列表循环"] {
             assert!(text.contains(needle), "宽终端下应显示「{needle}」：{text}");
         }
+    }
+
+    /// 播放条上下文行：有歌词跟歌词、右侧「队列位置 · 音质」；
+    /// 边下边播缓冲时右侧换成下载进度。
+    #[test]
+    fn context_row_shows_lyric_queue_quality_or_download() {
+        let theme = Theme::for_config(ThemeName::Default, false);
+
+        // 有歌词：显示当前句；右侧队列位置 + 音质
+        let mut state = AppState::new(crate::config::Config::default());
+        state.current = Some(crate::api::model::Song::default());
+        state
+            .queue
+            .replace_with(vec![crate::api::model::Song::default(); 12], 2);
+        state.config.quality = "flac".to_string();
+        state.lyric.lyric = crate::api::model::Lyric {
+            text: String::new(),
+            lines: vec![
+                crate::api::model::LyricLine {
+                    text: "第一句".to_string(),
+                    ..Default::default()
+                },
+                crate::api::model::LyricLine {
+                    text: "第二句".to_string(),
+                    ..Default::default()
+                },
+                crate::api::model::LyricLine {
+                    text: "第三句".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+        state.lyric.active_line = Some(1);
+        state.lyric.load.succeed();
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 6)).expect("建测试终端");
+        terminal
+            .draw(|frame| render_player(frame, Rect::new(0, 0, 120, 6), &mut state, &theme))
+            .expect("渲染播放条");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("第二句"), "歌词当前句应显示：{text}");
+        assert!(text.contains("第3/12首"), "队列位置应显示：{text}");
+        assert!(text.contains("无损FLAC"), "音质应显示：{text}");
+
+        // 缓冲中且知道总量：右侧换成下载进度
+        let mut state = AppState::new(crate::config::Config::default());
+        state.current = Some(crate::api::model::Song::default());
+        state.download_progress = Some((50, Some(100)));
+        let mut terminal = Terminal::new(TestBackend::new(120, 6)).expect("建测试终端");
+        terminal
+            .draw(|frame| render_player(frame, Rect::new(0, 0, 120, 6), &mut state, &theme))
+            .expect("渲染播放条");
+        let text = buffer_text(&terminal);
+        assert!(text.contains("边下边播50%"), "下载进度应显示：{text}");
     }
 
     /// 睡眠定时激活时右侧出现倒计时（分:秒），未激活时不出现。
@@ -1547,12 +1962,11 @@ mod tests {
             product: "svip".to_string(),
             end_time: "2026-11-06 12:00:00".to_string(),
         });
-        state
-            .stats
-            .record_complete_on(Some("2026-11-05".to_string()), "周杰伦");
-        state
-            .stats
-            .add_listen_on(Some("2026-11-05".into()), 90 * 60_000);
+        // 统计摘要只统计最近 7 天，日期不能写死：写死的日期过了这个窗口，
+        // 测试就会在某一天开始集体失败。用「今天」喂。
+        let today = crate::util::today_local();
+        state.stats.record_complete_on(today.clone(), "周杰伦");
+        state.stats.add_listen_on(today, 90 * 60_000);
 
         // 22 列的内区逼出折行（完整会员形态有 22 列宽）
         let area = Rect::new(0, 0, 24, 14);

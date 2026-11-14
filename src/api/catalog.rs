@@ -528,6 +528,10 @@ pub(crate) async fn resolve_stream_url<S: StreamSource>(
     }
 
     let mut last_full = None;
+    // 逐档记录「试过但服务端没给」的档位。用户看到「已降级到 128」时最常见的
+    // 疑问就是「为什么不一档一档降」——答案要在文案里：中间那些档**试过了**，
+    // 是服务端按会员权益逐个拒掉的（实测 TVIP 账号连 320 都拿不到）。
+    let mut refused: Vec<&str> = Vec::new();
     for (hash, q) in &candidates {
         // 单个候选失败（比如服务端对某个组合直接 502）**不能**中断整个流程
         // ——我们要的是「试出第一个能用的组合」，不是「第一个组合必须成功」。
@@ -539,6 +543,7 @@ pub(crate) async fn resolve_stream_url<S: StreamSource>(
                     "/song/url 候选失败（hash={hash} quality={q}）：{}，继续下一个",
                     error.user_hint()
                 );
+                refused.push(q);
                 continue;
             }
         };
@@ -550,6 +555,7 @@ pub(crate) async fn resolve_stream_url<S: StreamSource>(
                 crate::logger::LEVEL_DEBUG,
                 "/song/url 候选是 mp4 容器，跳过试下一档（hash={hash} quality={q}）"
             );
+            refused.push(q);
             continue;
         }
         if let Some(url) = extract_stream_url(&response) {
@@ -559,9 +565,10 @@ pub(crate) async fn resolve_stream_url<S: StreamSource>(
             let (ext_name, bit_rate) = actual_audio_format(&response);
             let mut notes = Vec::new();
             if q != quality && VIPER_QUALITIES.contains(&quality) {
-                notes.push(format!(
-                    "{quality} 不可用（需要蝰蛇 VIP），已降级到标准 {q}"
-                ));
+                notes.push(format!("{quality} 不可用（需要蝰蛇 VIP），已降级到 {q}"));
+            }
+            if !refused.is_empty() {
+                notes.push(format!("{} 已被服务端拒绝", refused.join("/")));
             }
             if let Some(note) = downgrade_note(quality, ext_name.as_deref(), bit_rate) {
                 notes.push(note);
@@ -572,6 +579,7 @@ pub(crate) async fn resolve_stream_url<S: StreamSource>(
                 reason: (!notes.is_empty()).then(|| notes.join("；")),
             });
         }
+        refused.push(q);
         last_full = Some(response);
     }
 
@@ -872,6 +880,13 @@ const PRIVILEGE_FALLBACK_CHAIN: &[&str] = &[
     "320",
     "flac",
     "high",
+    // KuGouMusicApi 支持、MoeKoeMusic 没有的档位。实测（2026-11-14，
+    // `/privilege/lite` 的 relate_goods）服务端的档位序是 128(2) → 320(4) →
+    // flac(5) → high(6)，`super` 没在那首歌上出现过；两个上游文档都把它排在
+    // high 之后，按同序插到这里。**少了它不行**：设置里选「超高」时
+    // `fallback_chain` 认不出这个档，会整条链退化成 [128]——既不试高档，
+    // 也不给降级说明，用户听着 128 还以为自己在听超高。
+    "super",
     "viper_atmos",
     "viper_clear",
     "viper_tape",
@@ -1228,7 +1243,10 @@ fn requested_tier(requested: &str) -> Option<u8> {
     match requested {
         "128" => Some(1),
         "320" => Some(2),
-        "flac" | "high" => Some(4),
+        // flac / high / super 都在「无损及以上」这一档：服务端的 relate_goods
+        // 序（128→320→flac→high）里 high 在 flac 之上，但我们拿不到 high 的
+        // 实际码率样本，无法与 flac 细分，先并作一档。
+        "flac" | "high" | "super" => Some(4),
         _ => None,
     }
 }
@@ -1409,6 +1427,195 @@ mod tests {
                     stream.is_trial,
                     stream.reason,
                     &stream.url[..stream.url.len().min(60)]
+                );
+            }
+            Err(error) => println!("应用取流失败：{}", error.user_hint()),
+        }
+    }
+
+    /// 概念版（native 后端）取流诊断：搜索 → /privilege/lite → 各档 /song/url。
+    ///
+    /// [`Self::probe_real_song_stream`] 打的是 Node 后端；概念版走内嵌实现，
+    /// 签名、appid、dfid 全在 native 传输层里，两边**不是**同一条链。排查
+    /// 「手机上能听无损、TUI 拿不到」这类账号侧差异用它——先看服务端到底
+    /// 给了哪些档、每一档实际回了什么文件，再谈程序解析得对不对。
+    ///
+    ///   cargo test probe_native_concept_stream -- --ignored --nocapture
+    ///   （KUGOU_TUI_PROBE_KEYWORD 换歌，KUGOU_TUI_PROBE_QUALITY 换请求档）
+    #[tokio::test]
+    #[ignore = "诊断工具：读真实配置打真实请求"]
+    async fn probe_native_concept_stream() {
+        use crate::api::native::NativeApi;
+        use crate::api::traits::MusicApi as _;
+
+        let config = crate::config::Config::load();
+        let client = NativeApi::new(
+            crate::source::SourceKind::KugouConcept,
+            config.cookie_header(),
+            config.proxy.as_deref(),
+        )
+        .expect("构造 native 客户端");
+
+        let keyword =
+            std::env::var("KUGOU_TUI_PROBE_KEYWORD").unwrap_or_else(|_| "Duvet".to_string());
+        let songs = client.search_songs(&keyword, 1, 5).await.expect("搜索");
+        let Some(song) = songs.iter().find(|song| !song.hash.is_empty()) else {
+            println!("搜索没有可用结果：{keyword}");
+            return;
+        };
+        println!(
+            "== {} · {} · hash={} ==",
+            song.name,
+            song.singer_text(),
+            song.hash
+        );
+
+        // ---- 账号与会员状态：token 是否有效、SVIP 是否还在期 ----
+        match client.user_vip_detail().await {
+            Ok(info) => println!(
+                "会员状态：kind={:?} product={} 到期 {}",
+                info.kind, info.product, info.end_time
+            ),
+            Err(error) => println!(
+                "会员状态查询失败：{}（多半是 cookie 失效）",
+                error.user_hint()
+            ),
+        }
+        // 原始详情：busi_vip 里可能有多个条目（过期的 svip + 在期的 tvip），
+        // 解析层只挑了第一个 is_vip==1 的，原始数据才看得到全貌。
+        if let Ok(root) = client.raw_vip_detail().await {
+            println!("---- /user/vip/detail 原始 ----");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&root).unwrap_or_default()
+            );
+        }
+        if let Ok(root) = client.raw_vip_record().await {
+            println!("---- /youth/month/vip/record 原始（最近几天）----");
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&root).unwrap_or_default()
+            );
+        }
+
+        let quality = std::env::var("KUGOU_TUI_PROBE_QUALITY").unwrap_or(config.quality);
+
+        // ---- privilege 候选表：这个账号到底有哪些档 ----
+        let candidates = match client.privilege_lite(song).await {
+            Ok(response) => {
+                println!("---- /privilege/lite 原始 ----");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response).unwrap_or_default()
+                );
+                for (index, item) in collect_privilege_items(&response).iter().enumerate() {
+                    println!(
+                        "item[{index}] hash={}… album_audio_id={}",
+                        &item.hash[..item.hash.len().min(10)],
+                        item.album_audio_id
+                    );
+                    for (variant_quality, variant_hash) in &item.variants {
+                        println!(
+                            "    {variant_quality:>12}  {}…",
+                            &variant_hash[..variant_hash.len().min(16)]
+                        );
+                    }
+                }
+                let candidates = parse_quality_candidates(&response, &quality, &song.hash);
+                println!("---- 候选链（请求 {quality}，{} 条）----", candidates.len());
+                for candidate in &candidates {
+                    println!(
+                        "    {} {}",
+                        candidate.quality,
+                        &candidate.hash[..candidate.hash.len().min(16)]
+                    );
+                }
+                candidates
+            }
+            Err(error) => {
+                println!("privilege 失败：{}（走原 hash 兜底）", error.user_hint());
+                Vec::new()
+            }
+        };
+
+        // ---- 降级链逐档 /song/url：每档实际回什么文件 ----
+        // 与 resolve_stream_url 同一口径：优先用候选链里该档的 hash
+        for tier in fallback_chain(&quality) {
+            let hash = candidates
+                .iter()
+                .find(|candidate| candidate.quality == tier)
+                .map(|candidate| candidate.hash.clone())
+                .unwrap_or_else(|| song.hash.clone());
+            let response = match client.song_url(&hash, tier, false).await {
+                Ok(response) => response,
+                Err(error) => {
+                    println!("{tier:>6}: 请求失败 {}", error.user_hint());
+                    continue;
+                }
+            };
+            let status = response.get("status").and_then(Value::as_i64).unwrap_or(0);
+            let error_code = response.get("error_code").and_then(Value::as_i64);
+            let (ext, bit_rate) = actual_audio_format(&response);
+            let has_url = extract_stream_url(&response).is_some();
+            println!(
+                "{tier:>6} (hash {}…): status={status} error_code={error_code:?} ext={ext:?} kbps={:?} url={}",
+                &hash[..hash.len().min(10)],
+                bit_rate.map(|rate| rate / 1000),
+                if has_url { "有" } else { "无" }
+            );
+            if !has_url {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&response).unwrap_or_default()
+                );
+            }
+        }
+
+        // ---- album id 对比实验：上游调用方可以带真实 id，看它是否影响权限判定 ----
+        // 手机客户端（KuGouMusicApi 的调用方）会传真实的 album_audio_id /
+        // album_id，应用主路径目前恒传 0——如果真实 id 能解开 pkg/buy，
+        // 那就是主路径缺参数。
+        let probe_tier = candidates
+            .iter()
+            .find(|candidate| candidate.quality == quality)
+            .or_else(|| candidates.first());
+        if let Some(candidate) = probe_tier {
+            let priv_audio_id = candidate.album_audio_id.parse::<i64>().unwrap_or(0);
+            println!(
+                "---- album id 对比（hash {}…，请求 {quality}；歌曲自带 audio_id={} album_id={}）----",
+                &candidate.hash[..candidate.hash.len().min(10)],
+                song.album_audio_id,
+                song.album_id
+            );
+            for (name, audio_id, album) in [
+                ("应用现状 id=0", 0i64, String::new()),
+                ("歌曲自带 id", song.album_audio_id, song.album_id.clone()),
+                ("privilege 给的 id", priv_audio_id, String::new()),
+            ] {
+                match client
+                    .song_url_with_ids(&candidate.hash, &quality, false, audio_id, &album)
+                    .await
+                {
+                    Ok(response) => {
+                        let status = response.get("status").and_then(Value::as_i64).unwrap_or(0);
+                        let fail = fail_reason(&response).unwrap_or_default();
+                        let has = extract_stream_url(&response).is_some();
+                        println!(
+                            "    [{name}] status={status} fail={fail:?} url={}",
+                            if has { "有" } else { "无" }
+                        );
+                    }
+                    Err(error) => println!("    [{name}] 请求失败 {}", error.user_hint()),
+                }
+            }
+        }
+
+        // ---- 走一遍应用的真实路径 ----
+        match client.song_stream_url(song, &quality).await {
+            Ok(stream) => {
+                println!(
+                    "应用最终选择：trial={} reason={:?}",
+                    stream.is_trial, stream.reason
                 );
             }
             Err(error) => println!("应用取流失败：{}", error.user_hint()),
@@ -1640,6 +1847,22 @@ mod tests {
             extract_stream_url(&root).as_deref(),
             Some("https://fsmobile.kugou.com/a.mp3")
         );
+    }
+
+    /// 「超高」(super) 必须在降级链里：此前它不在链上，`fallback_chain` 把它
+    /// 当成未知档归一到 128——设置里选了超高，实际只试 128，一档高音质都
+    /// 不碰，也不报降级。
+    #[test]
+    fn super_quality_has_a_real_fallback_chain() {
+        assert_eq!(
+            fallback_chain("super"),
+            vec!["super", "high", "flac", "320", "128"],
+            "选超高应从 super 一路往下试，而不是只剩 128"
+        );
+        // 请求 super、实际给了 320 mp3：必须报降级，不能一声不响
+        let note = downgrade_note("super", Some("mp3"), Some(320_000)).expect("应报出降级");
+        assert!(note.contains("super"), "{note}");
+        assert!(note.contains("320 kbps"), "{note}");
     }
 
     /// 用户选了 flac 但账号只有 320 / 128 权限——这种情况之前会拿不到 URL
@@ -2122,12 +2345,12 @@ mod tests {
 
     /// 判据不参与比较的档位要一律返回 `None`，不能猜。
     ///
-    /// `super` / 蝰蛇系列在接口层没有可对照的容器与码率；mp3 不报码率时分不清
+    /// 蝰蛇系列在接口层没有可对照的容器与码率；mp3 不报码率时分不清
     /// 128 与 320；没见过的容器（这里用 wav 举例）也不下结论。
-    /// 这几种情况都必须**什么都不说**。
+    /// 这几种情况都必须**什么都不说**。`super` 现在参与判级（见
+    /// [`Self::super_quality_has_a_real_fallback_chain`]），不在此列。
     #[test]
     fn unknown_tiers_are_never_guessed() {
-        assert_eq!(downgrade_note("super", Some("mp3"), Some(128_000)), None);
         assert_eq!(
             downgrade_note("viper_clear", Some("mp3"), Some(128_000)),
             None
@@ -2278,6 +2501,94 @@ mod tests {
                         "fileSize": 3749296,
                         "url": ["http://example.invalid/downgraded.mp3"]
                     })
+                };
+                let payload = body.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = stream.flush();
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
+    /// **端到端**：中间档被服务端逐个拒绝时，降级说明必须把「试过哪些、
+    /// 被拒了哪些」说全——只说「已降级到 128」会让用户以为程序跳层了
+    /// （2026-11-14 用户实测反馈）。请求蝰蛇档：账号没有蝰蛇权益，
+    /// high/flac/320 逐个被拒，最后落到 128。
+    #[tokio::test]
+    async fn song_stream_url_reports_refused_intermediate_tiers() {
+        let base = spawn_refusing_server();
+        let client = NodeApi::new(&base, None, None).expect("构造客户端");
+        let song = Song {
+            hash: "AAAA".to_string(),
+            name: "测试曲".to_string(),
+            ..Default::default()
+        };
+
+        let stream = client
+            .song_stream_url(&song, "viper_clear")
+            .await
+            .expect("最终应落到 128");
+        assert!(!stream.is_trial);
+        let reason = stream.reason.expect("拒绝链必须带出来，不能静默");
+        assert!(reason.contains("viper_clear 不可用"), "{reason}");
+        assert!(reason.contains("high/flac/320 已被服务端拒绝"), "{reason}");
+        assert!(reason.contains("已降级到 128"), "{reason}");
+    }
+
+    fn spawn_refusing_server() -> String {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+        let addr = listener.local_addr().expect("取本地地址");
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().expect("克隆流"));
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                loop {
+                    let mut header = String::new();
+                    match reader.read_line(&mut header) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) if header.trim().is_empty() => break,
+                        Ok(_) => {}
+                    }
+                }
+
+                let body = if request_line.contains("/privilege/lite") {
+                    // 权限服务说 320/flac/high 都有权限（TVIP 账号实测就是
+                    // 这样——权限服务给档，tracker 按权益逐个拒）
+                    json!({
+                        "status": 1,
+                        "data": [{
+                            "hash": "AAAA", "quality": "128", "level": 2, "album_audio_id": 7,
+                            "relate_goods": [
+                                {"hash": "HHHH", "quality": "high", "level": 6, "album_audio_id": 7},
+                                {"hash": "FFFF", "quality": "flac", "level": 5, "album_audio_id": 7},
+                                {"hash": "SSSS", "quality": "320", "level": 4, "album_audio_id": 7}
+                            ]
+                        }]
+                    })
+                } else if request_line.contains("quality=128") {
+                    json!({
+                        "status": 1,
+                        "extName": "mp3",
+                        "bitRate": 128000,
+                        "url": ["http://example.invalid/128.mp3"]
+                    })
+                } else {
+                    // 320/flac/high 一律按权益拒绝：status=2、无 url
+                    json!({ "status": 2, "fail_process": ["pkg", "buy"] })
                 };
                 let payload = body.to_string();
                 let _ = write!(

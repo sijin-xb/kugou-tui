@@ -78,6 +78,11 @@ pub fn next_up() -> &'static str {
     icon("\u{f064}", ">")
 }
 
+/// 播放条歌词预览的前缀。
+pub fn lyric_note() -> &'static str {
+    icon("\u{f001}", "♪")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
