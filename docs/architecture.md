@@ -458,6 +458,11 @@ Native 后端只实现酷狗标准版和概念版。
 汽水扫码登录需要本机 Chrome、Chromium 或 Edge。
 公共签名服务不可用时，VIP 整曲和无损可能无法获取。
 
+汽水请求的签名由外部签名服务计算，签名的输入是 `SignRequest` 的 `url`、`method`、`body` 与 `headers`，其中 `headers` 含登录 Cookie。
+默认服务为 libresoda 内置的公网地址 `http://222.186.10.201:8921/sign`，明文 HTTP。
+签名服务只在选中汽水音源时启用；默认音源是酷狗，不使用汽水时不发起任何签名请求。
+替换或关闭见 [使用指南](usage.md#汽水音乐签名)。
+
 封面协议探测不识别 sixel。
 tmux 与 screen 一律使用半块字符。
 

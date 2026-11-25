@@ -207,8 +207,13 @@ kugou-tui 不会自动下载或托管 NeteaseCloudMusicApi。
 
 ## 汽水音乐签名
 
-汽水完整曲目和无损依赖应用签名。
-默认使用 libresoda 内置的公共签名服务。
+汽水完整曲目和无损依赖应用签名。签名覆盖 URL、请求头和 body，所以签名服务会收到这三项的全部内容，包括登录 Cookie。
+
+默认签名服务是 libresoda 内置的 `http://222.186.10.201:8921/sign`，取自上游 SodaM。这是公网明文 HTTP 地址，收到的内容可被链路上任何一方读取。
+
+签名服务只在选中汽水音源时启用。默认音源是酷狗，不看汽水就不会发送任何内容。
+
+改用自建签名服务：
 
 ```bash
 kugou-tui \
@@ -216,8 +221,14 @@ kugou-tui \
   --sodam-signer-token TOKEN
 ```
 
-指向自建签名服务时使用以上参数。
-传入 `--sodam-signer-url none` 会关闭签名，只保留试听和免费曲目。
+关闭签名：
+
+```bash
+kugou-tui --sodam-signer-url none
+```
+
+关闭后只能播放试听和免费曲目。
+这两个参数也可以写进配置文件的 `[sources.sodam_app]` 段，对应键为 `signer_url` 与 `signer_token`。
 
 ## 配置文件
 
